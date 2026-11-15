@@ -1,0 +1,4 @@
+order_id,client,required_qty,deadline_label,hours_remaining,sla_penalty_inr,partial_delay_penalty_inr,status
+EV-402,Ather-Grid Mobility Corp,500,Friday 17:00 IST,38,2500000,500000,ON_TRACK
+EV-405,Ola Electric Technologies,350,Saturday 12:00 IST,55,1800000,350000,ON_TRACK
+EV-408,Simple Energy Private Ltd,200,Sunday 18:00 IST,80,1000000,200000,ON_TRACK
