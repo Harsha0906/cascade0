@@ -1,6 +1,9 @@
 """
-CascadeZero — Shop-Floor Industrial PLC Telemetry Emulator
-Simulates live MQTT/Modbus/OPC-UA telemetry streams from factory floor machines:
+CascadeZero — Simulated PLC Telemetry (HTTP JSON)
+Generates synthetic machine ticks and POSTs them as JSON to the backend.
+It does NOT speak Modbus, OPC-UA or MQTT; a real deployment needs an edge collector
+(e.g. pymodbus / asyncua) that reads the PLC and posts the same payload.
+Lines simulated:
 - Line 2: Robotic Welding Line 2 (LINE-2)
 - Line 1: Automated Stamping Press 1 (LINE-1)
 - Line 3: Ultrasonic Cell Pack Assembler (LINE-3)
@@ -15,6 +18,8 @@ import random
 import sys
 import time
 from datetime import datetime, timezone
+
+import os
 
 import httpx
 
@@ -36,8 +41,9 @@ def send_telemetry(api_base: str, line_id: str, speed_pct: int, temp_c: float, s
     }
 
     try:
+        headers = {"X-API-Key": os.environ["CASCADE_API_KEY"]} if os.environ.get("CASCADE_API_KEY") else {}
         with httpx.Client(timeout=4.0) as client:
-            res = client.post(url, json=payload)
+            res = client.post(url, json=payload, headers=headers)
             if res.status_code == 200:
                 return True
             else:
@@ -54,7 +60,7 @@ def run_continuous_stream(api_base: str, interval_sec: float = 2.0):
     Starts normal, then after 5 ticks begins an thermal anomaly ramp.
     """
     print("=" * 72)
-    print(" 🏭 CASCADEZERO SHOP-FLOOR PLC TELEMETRY STREAMER (OPC-UA / MODBUS)")
+    print(" 🏭 CASCADEZERO SIMULATED PLC TELEMETRY (synthetic data over HTTP)")
     print(f" Target Endpoint: {api_base}/api/v1/ingest/plc-telemetry")
     print(f" Telemetry Interval: {interval_sec}s | Press Ctrl+C to stop")
     print("=" * 72)
@@ -112,7 +118,7 @@ def run_instant_crisis(api_base: str):
         api_base=api_base,
         line_id="LINE-2",
         speed_pct=50,
-        temp_celsius=89.2,
+        temp_c=89.2,
         status="OVERHEATING_THROTTLED",
     )
     if ok:
@@ -129,7 +135,7 @@ def run_restore_normal(api_base: str):
         api_base=api_base,
         line_id="LINE-2",
         speed_pct=100,
-        temp_celsius=62.0,
+        temp_c=62.0,
         status="NORMAL",
     )
     if ok:

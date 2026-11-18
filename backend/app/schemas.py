@@ -68,6 +68,7 @@ class VendorAllocation(BaseModel):
     total_cost_inr: int
     lead_time_hours: int
     route: str
+    confirmed: bool = False   # True when the vendor confirmed this offer to the Sourcing Agent
 
 
 class PlaybookOption(BaseModel):
@@ -84,6 +85,12 @@ class PlaybookOption(BaseModel):
     net_sla_saved_inr: int
     roi_multiplier: float
     confidence_pct: float
+    confidence_ci_low_pct: Optional[float] = None   # 95% Wilson interval on the Monte Carlo estimate
+    confidence_ci_high_pct: Optional[float] = None
+    p90_finish_hours: Optional[float] = None
+    expected_cost_inr: int = 0                       # cost + (1 - P_on_time) * SLA penalty (ranking key)
+    feasible: bool = True                            # False when capacity cannot cover the shortfall
+    uncovered_units: int = 0
     recommended: bool = False
     badge_label: str = ""
     description: str = ""
@@ -104,6 +111,10 @@ class SolverResult(BaseModel):
     solve_duration_ms: float
     lp_status: str
     monte_carlo_iterations: int = 1000
+    deadline_hours: float = 38.0
+    line2_throughput_gap_units: int = 0
+    ranking_rule: str = ""
+    capacity_exhausted: bool = False
 
 
 # ─── 3. Agent Log Schemas ────────────────────────────────────────────────────
@@ -127,26 +138,26 @@ class AgentLogEntry(BaseModel):
 
 class SimulateCrisisRequest(BaseModel):
     """Payload to trigger crisis simulation."""
-    scenario_id: Optional[int] = Field(default=None, description="1, 2, or 3")
-    raw_message: Optional[str] = Field(default=None, description="Custom crisis alert text")
-    source_channel: str = Field(default="WEB_DASHBOARD", description="Channel origin")
-    override_delay_hours: Optional[int] = None
-    override_shortfall_units: Optional[int] = None
-    override_line2_speed_pct: Optional[int] = None
+    scenario_id: Optional[int] = Field(default=None, ge=1, le=3, description="1, 2, or 3")
+    raw_message: Optional[str] = Field(default=None, max_length=2000, description="Custom crisis alert text")
+    source_channel: str = Field(default="WEB_DASHBOARD", max_length=64, description="Channel origin")
+    override_delay_hours: Optional[int] = Field(default=None, ge=0, le=720)
+    override_shortfall_units: Optional[int] = Field(default=None, ge=0, le=100_000)
+    override_line2_speed_pct: Optional[int] = Field(default=None, ge=0, le=100)
 
 
 class PlcTelemetryRequest(BaseModel):
     """Shop-floor machine tick from simulator_plc.py."""
-    line_id: str = "LINE-2"
-    speed_pct: int = 50
-    temp_celsius: float = 89.0
-    status: str = "OVERHEATING_THROTTLED"
+    line_id: str = Field(default="LINE-2", max_length=32)
+    speed_pct: int = Field(default=50, ge=0, le=100)
+    temp_celsius: float = Field(default=89.0, ge=-50, le=400)
+    status: str = Field(default="OVERHEATING_THROTTLED", max_length=64)
 
 
 class ErpCsvSyncRequest(BaseModel):
     """File upload from legacy Tally or Excel drop folder."""
-    filename: str
-    csv_content: str
+    filename: str = Field(max_length=255)
+    csv_content: str = Field(max_length=2_000_000)
 
 
 class LiveHighwayCheckRequest(BaseModel):
@@ -156,28 +167,46 @@ class LiveHighwayCheckRequest(BaseModel):
 
 
 class ExecutePlanRequest(BaseModel):
-    """HITL Execution approval request."""
-    po_number: str
+    """
+    HITL execution approval. The server executes the playbook it computed for `run_id`;
+    costs and allocations are never accepted from the client.
+    """
+    run_id: str
     playbook_id: str
-    order_id: str = "EV-402"
-    allocations: List[VendorAllocation] = []
-    overtime_hours: int = 4
-    total_cost_inr: int
-    net_sla_saved_inr: int
-    confidence_pct: float
-    client: str = "Ather-Grid Mobility Corp"
+    approved_by: str = Field(default="dashboard-operator", max_length=120)
 
 
 class ExecutionReceiptResponse(BaseModel):
-    """Full execution receipt with downloadable PO & notices."""
+    """Execution receipt with draft PO & notices (nothing is sent to suppliers automatically)."""
     success: bool
+    run_id: str
     po_number: str
     playbook_id: str
     order_id: str
-    total_cost_inr: int = 180000
-    net_sla_saved_inr: int = 2320000
+    approved_by: str
+    total_cost_inr: int
+    net_sla_saved_inr: int
+    confidence_pct: float
     tally_xml_payload: str
     tally_json_payload: dict[str, Any]
     shift_broadcast_msg: str
     client_sla_notice: str
     executed_at: str
+    already_executed: bool = False
+    dispatch_note: str = (
+        "Drafts generated. Supplier POs, shift notices and client notices are NOT sent automatically; "
+        "import the Tally XML and send notices through your normal channels."
+    )
+
+
+class SourcingStartRequest(BaseModel):
+    """Start the Sourcing Agent on a computed run (defaults to the recommended playbook)."""
+    run_id: str = Field(max_length=64)
+    playbook_id: Optional[str] = Field(default=None, max_length=16)
+
+
+class SourcingReplyRequest(BaseModel):
+    """A vendor's reply, entered by an operator (e.g. after a phone call) or a simulated vendor."""
+    supplier_id: str = Field(max_length=32)
+    text: str = Field(min_length=1, max_length=1000)
+    entered_by: str = Field(default="dashboard-operator", max_length=120)

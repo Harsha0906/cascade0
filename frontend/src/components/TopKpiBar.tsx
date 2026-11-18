@@ -43,12 +43,25 @@ export function TopKpiBar() {
     if (!file) return;
     const text = await file.text();
     const API_BASE = typeof window !== "undefined" ? "" : (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000");
-    await fetch(`${API_BASE}/api/v1/ingest/erp-csv`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename: file.name, csv_content: text }),
-    });
-    alert(`✅ Legacy ERP File "${file.name}" synchronized into Supabase!`);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/ingest/erp-csv`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name, csv_content: text }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(`⚠️ Import failed: ${data.detail || `HTTP ${res.status}`}`);
+      } else if (data.errors?.length) {
+        alert(`⚠️ Imported ${data.imported_count} orders; ${data.errors.length} rows rejected (first: line ${data.errors[0].line} — ${data.errors[0].error}).`);
+      } else {
+        alert(`✅ Imported ${data.imported_count} orders from "${file.name}".`);
+      }
+    } catch {
+      alert("⚠️ Could not reach the backend.");
+    } finally {
+      e.target.value = "";
+    }
   };
 
   return (
@@ -96,7 +109,7 @@ export function TopKpiBar() {
               {isCrisis
                 ? "CRISIS: COMPOUND DISRUPTION"
                 : isProtected
-                ? `PROTECTED: ${selectedPlan?.id || "PLAN B"} DISPATCHED`
+                ? `APPROVED: ${selectedPlan?.id ?? "PLAN"} — DRAFTS READY`
                 : "STATUS: NOMINAL OPERATIONS"}
             </span>
           </div>
@@ -141,9 +154,11 @@ export function TopKpiBar() {
               }`}
             >
               {isCrisis
-                ? "-₹25,00,000"
+                ? `-₹${(ev402?.sla_penalty_inr ?? 0).toLocaleString("en-IN")}`
                 : isProtected
-                ? `₹0 (Saved ₹${((selectedPlan?.net_sla_saved_inr || 2320000) / 100000).toFixed(1)}L)`
+                ? selectedPlan
+                  ? `Plan approved (₹${(selectedPlan.total_mitigation_cost_inr / 100000).toFixed(2)}L)`
+                  : "Plan approved"
                 : "₹0 Exposure"}
             </span>
           </div>
@@ -158,14 +173,14 @@ export function TopKpiBar() {
             <span>Crisis Studio</span>
           </button>
 
-          {/* View Dispatched PO Button (When Protected) */}
+          {/* View Draft PO Button (When Approved) */}
           {(isProtected || executionReceipt) && (
             <button
               onClick={openReceiptModal}
               className="flex items-center gap-1.5 px-4 py-2 rounded-full text-xs font-bold bg-white text-charcoal-900 hover:bg-white/90 border border-white/80 shadow-island transition-all active:scale-95"
             >
               <FileText className="w-3.5 h-3.5 text-emerald-600" />
-              <span>View Dispatched PO</span>
+              <span>View Draft PO</span>
             </button>
           )}
 

@@ -102,7 +102,7 @@ export function PlaybookSidebar() {
                 </span>
 
                 <span className="text-xs font-mono font-extrabold text-forest-deep px-2 py-0.5 rounded-full bg-white/40 border border-white/60">
-                  {plan.roi_multiplier}x ROI
+                  E[cost] ₹{(plan.expected_cost_inr / 100000).toFixed(2)}L
                 </span>
               </div>
 
@@ -172,17 +172,17 @@ export function PlaybookSidebar() {
                   {isProtected ? (
                     <>
                       <ShieldCheck className="w-4 h-4 text-acid" />
-                      <span>APPROVED & DISPATCHED TO TALLY</span>
+                      <span>APPROVED — DRAFTS READY</span>
                     </>
                   ) : isExecuting ? (
                     <>
                       <Sparkles className="w-4 h-4 animate-spin" />
-                      <span>COMMITTING TO ERP & WHATSAPP...</span>
+                      <span>GENERATING DRAFTS...</span>
                     </>
                   ) : (
                     <>
                       <CheckCircle2 className="w-4 h-4" />
-                      <span>⚡ [APPROVE & DISPATCH PLAN B]</span>
+                      <span>⚡ APPROVE {plan.id.replace("_", " ")}</span>
                     </>
                   )}
                 </button>

@@ -38,6 +38,7 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "weather_risk_pct": 0.0,
         "status": "ON_TIME",
         "delay_hours": 0,
+        "whatsapp_number": "",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
     {
@@ -55,6 +56,7 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "weather_risk_pct": 0.0,
         "status": "STANDBY",
         "delay_hours": 0,
+        "whatsapp_number": "",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
     {
@@ -72,6 +74,7 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "weather_risk_pct": 0.0,
         "status": "STANDBY",
         "delay_hours": 0,
+        "whatsapp_number": "",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
     {
@@ -89,6 +92,7 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "weather_risk_pct": 2.0,
         "status": "STANDBY",
         "delay_hours": 0,
+        "whatsapp_number": "",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
 ]
@@ -213,6 +217,7 @@ class InMemoryMirror:
         self.disruption_events: list[dict[str, Any]] = []
         self.agent_logs: list[dict[str, Any]] = []
         self.purchase_orders: list[dict[str, Any]] = []
+        self.sourcing_rfqs: list[dict[str, Any]] = []
 
     def get_table(self, table_name: str) -> list[dict[str, Any]]:
         """Return reference to an in-memory table by name."""
@@ -237,7 +242,7 @@ def _get_supabase():
     try:
         from supabase import create_client
 
-        _supabase_client = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
+        _supabase_client = create_client(settings.SUPABASE_URL, settings.supabase_server_key)
         logger.info("✅ Supabase client connected to %s", settings.SUPABASE_URL)
         return _supabase_client
     except Exception as exc:
@@ -504,6 +509,10 @@ def reset_to_seed() -> dict[str, str]:
                         client.table(tbl).delete().neq("po_number", "___none___").execute()
                     except Exception:
                         pass
+            try:
+                client.table("sourcing_rfqs").delete().neq("id", "").execute()
+            except Exception as exc:
+                logger.warning("⚠ Could not clear sourcing_rfqs: %s", exc)
 
             # Reset suppliers to seed state
             for sup in _SEED_SUPPLIERS:

@@ -1,18 +1,17 @@
 import { createClient, RealtimeChannel } from "@supabase/supabase-js";
 
-const supabaseUrl =
-  process.env.NEXT_PUBLIC_SUPABASE_URL || "https://vomjhhpmppqmbldbzper.supabase.co";
-const supabaseAnonKey =
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZvbWpoaHBtcHBxbWJsZGJ6cGVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQwMzQxMDEsImV4cCI6MjEwOTYxMDEwMX0.2v0rZPasgpp0c3pYdeenf5X2nO-Boo7gSByTgKYQwzI";
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+// The anon key is a public, read-only key once RLS is enabled (supabase/migrations/001_rls_and_audit.sql).
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-  realtime: {
-    params: {
-      eventsPerSecond: 10,
-    },
-  },
-});
+export const supabase =
+  supabaseUrl && supabaseAnonKey
+    ? createClient(supabaseUrl, supabaseAnonKey, { realtime: { params: { eventsPerSecond: 10 } } })
+    : null;
+
+if (!supabase && typeof window !== "undefined") {
+  console.warn("Supabase env vars missing — realtime updates disabled; the dashboard will poll the API instead.");
+}
 
 /**
  * Subscribe to realtime changes on a Supabase table.
@@ -23,7 +22,10 @@ export function subscribeToTable(
   onInsert?: (row: any) => void,
   onUpdate?: (row: any) => void,
   onDelete?: (row: any) => void
-): RealtimeChannel {
+): Pick<RealtimeChannel, "unsubscribe"> {
+  if (!supabase) {
+    return { unsubscribe: async () => "ok" as const };
+  }
   const channel = supabase
     .channel(`realtime_${tableName}_${Math.random().toString(36).substring(7)}`)
     .on(

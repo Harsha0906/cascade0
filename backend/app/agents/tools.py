@@ -1,7 +1,7 @@
 """
 CascadeZero — Autonomous Agent Tools
 Defines tools bound to the 4 LangGraph agents:
-  1. extract_disruption_entities (Gemini 3.8 Flash structured extraction + fallback)
+  1. extract_disruption_entities (Gemini structured extraction + regex fallback; reports which ran)
   2. query_blast_radius_sql (Supabase blast-radius calculation & state updates)
   3. check_air_charter_and_max_overtime (Ops Hawk air & overtime capacity query)
   4. query_regional_vendors_and_memory (CFO Watchdog regional vendors + episodic memory)
@@ -35,11 +35,14 @@ logger = logging.getLogger("cascadezero.tools")
 
 # ─── 1. Disruption Entity Extraction (Gemini Structured Outputs) ─────────────
 
-def extract_disruption_entities(raw_text: str) -> DisruptionExtraction:
+def extract_disruption_entities(raw_text: str) -> tuple[DisruptionExtraction, str]:
     """
     Extract structured disruption metrics from raw text (English/Hinglish/alerts)
-    using Gemini 3.8 Flash with Pydantic Structured Outputs (response_schema).
-    Falls back to deterministic rule-based extraction if network/API is unavailable.
+    using Gemini with Pydantic Structured Outputs (response_schema).
+    Falls back to deterministic regex extraction if the API is unavailable.
+
+    Returns (extraction, source) where source is "gemini:<model>" or "regex-fallback",
+    so callers can show users which path actually produced the numbers.
     """
     if settings.has_gemini:
         try:
@@ -69,7 +72,7 @@ def extract_disruption_entities(raw_text: str) -> DisruptionExtraction:
 
             if response.text:
                 data = json.loads(response.text)
-                return DisruptionExtraction(**data)
+                return DisruptionExtraction(**data), f"gemini:{settings.GEMINI_MODEL}"
         except Exception as exc:
             logger.warning("⚠ Gemini structured extraction failed (%s) — using deterministic fail-safe", exc)
 
@@ -91,8 +94,10 @@ def extract_disruption_entities(raw_text: str) -> DisruptionExtraction:
         line2_speed = int(speed_match.group(1))
 
     # Parse temp
-    temp_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:°?c|deg|degrees)", text, re.I)
-    if temp_match:
+    # Require a real temperature unit ("89°C", "89 deg", "89 celsius", "89c") so that
+    # "350 casings" is not misread as 350°C; ignore implausible readings.
+    temp_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:°\s*c\b|deg(?:rees)?\b|celsius\b|c\b)", text, re.I)
+    if temp_match and 0 < float(temp_match.group(1)) < 200:
         temp_c = float(temp_match.group(1))
 
     # Parse shortfall
@@ -117,7 +122,7 @@ def extract_disruption_entities(raw_text: str) -> DisruptionExtraction:
         affected_order_id=order_id,
         crisis_headline=f"Compound Crisis: NH48 Delay (+{delay_hours}h) + Line 2 Throttle ({line2_speed}%)",
         raw_summary=raw_text[:200],
-    )
+    ), "regex-fallback"
 
 
 # ─── 2. Blast-Radius SQL Query & Realtime State Updater ──────────────────────
@@ -127,6 +132,7 @@ def query_blast_radius_sql(
     delay_hours: int,
     line2_speed_pct: int,
     order_id: str = "EV-402",
+    line2_temp_celsius: float | None = None,
 ) -> Dict[str, Any]:
     """
     Computes blast radius across suppliers, lines, and client SLA contracts.
@@ -140,7 +146,7 @@ def query_blast_radius_sql(
     })
 
     # 2. Update Welding Line 2 status
-    temp_val = 89.0 if line2_speed_pct <= 50 else 74.0
+    temp_val = line2_temp_celsius if line2_temp_celsius else (89.0 if line2_speed_pct <= 50 else 74.0)
     update_rows("production_lines", "line_id", "LINE-2", {
         "status": "OVERHEATING_THROTTLED",
         "speed_pct": line2_speed_pct,
@@ -165,6 +171,8 @@ def query_blast_radius_sql(
         "client": order.get("client", "Ather-Grid Mobility Corp"),
         "shortfall_units": shortfall_units,
         "sla_penalty_inr": sla_penalty,
+        "partial_delay_penalty_inr": order.get("partial_delay_penalty_inr", 500000),
+        "hours_remaining": order.get("hours_remaining", 38),
         "inbound_delay_hours": delay_hours,
         "affected_supplier": "SUP-CHN-01 (Chennai Precision Casings)",
         "line2_speed_pct": line2_speed_pct,
@@ -279,15 +287,19 @@ def run_pulp_milp_and_monte_carlo(
     delay_hours: int,
     line2_speed_pct: int,
     order_id: str = "EV-402",
+    **solver_kwargs: Any,
 ) -> Dict[str, Any]:
     """
-    Invokes the Python PuLP Mixed-Integer Linear Program optimizer and
-    1,000-iteration Monte Carlo simulation. Returns all 3 audited playbooks.
+    Invokes the PuLP mixed-integer program and Monte Carlo simulation and
+    returns all 3 playbooks ranked by risk-adjusted expected cost.
+    Extra keyword arguments (sla_penalty_inr, deadline_hours, client,
+    cfo_min_vendor_reliability_pct, ...) are passed through to generate_playbooks.
     """
     result = generate_playbooks(
         shortfall_units=shortfall_units,
         delay_hours=delay_hours,
         line2_speed_pct=line2_speed_pct,
         order_id=order_id,
+        **solver_kwargs,
     )
     return result.model_dump()

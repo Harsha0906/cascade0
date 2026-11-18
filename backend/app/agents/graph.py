@@ -1,11 +1,24 @@
 """
-CascadeZero — God-Level 4-Agent LangGraph Cyclic StateGraph
-Architecture:
-  - Agent 1: 🕵️‍♂️ Blast-Radius Detective (extracts entities, computes blast radius, sets crimson state)
-  - Agent 2: ⚙️ Operations Hawk (demands air charter + overtime for zero line starvation)
-  - Agent 3: 💰 CFO Watchdog (queries regional vendors + episodic memory, challenges air spend)
-  - Conditional Edge: should_rebuttal_continue (triggers stress-test rebuttal loop if shortfall > 200u)
-  - Agent 4: ⚖️ Neuro-Symbolic Arbitrator (runs PuLP MILP + 1,000-run Monte Carlo, ranks 3 playbooks)
+CascadeZero — 4-node LangGraph StateGraph (Detective → Ops ⇄ CFO → Arbitrator)
+
+What each node actually does:
+  - Detective:   structured extraction (Gemini, or regex fallback), blast-radius DB update.
+  - Ops Hawk:    its proposal is the MILP solved with the air charter forced on
+                 (maximum-speed position), scored by Monte Carlo.
+  - CFO Watchdog: its proposal is the unconstrained cost-minimal MILP, scored by Monte Carlo.
+  - Rebuttal:    triggered by *computed* risk, not a fixed threshold — when the CFO plan
+                 depends on a vendor below RELIABILITY_FLOOR_PCT, is infeasible, or has a
+                 materially lower on-time probability than the Ops plan. Ops challenges;
+                 the CFO re-solves with low-reliability vendors excluded and keeps whichever
+                 version has the lower risk-adjusted expected cost (concede or hold).
+                 At most one rebuttal round.
+  - Arbitrator:  generates and ranks all playbooks by
+                 E[cost] = mitigation_cost + (1 − P_on_time) × SLA_penalty.
+
+The LLM's role is limited and stated plainly: it extracts parameters from free text and
+writes the narration for each step. Every number and every decision comes from the
+solver/simulation. When Gemini is not used, the narration is a template filled with the
+computed numbers, and `llm_trace` records that so the UI can say so.
 """
 
 from __future__ import annotations
@@ -13,7 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -26,8 +39,31 @@ from app.agents.tools import (
     run_pulp_milp_and_monte_carlo,
 )
 from app.db import log_agent_step
+from app.solver import (
+    VENDORS,
+    simulate_monte_carlo,
+    solve_pulp_milp,
+)
 
 logger = logging.getLogger("cascadezero.graph")
+
+RELIABILITY_FLOOR_PCT = 85.0          # Ops challenges CFO plans that rely on vendors below this
+CONFIDENCE_GAP_TRIGGER_PCT = 2.0      # ...or whose P(on-time) trails the Ops plan by more than this
+MAX_REBUTTAL_ROUNDS = 1
+
+_VENDOR_BY_ID = {v.supplier_id: v for v in VENDORS}
+_genai_client = None
+_gemini_failure_logged = False
+
+
+# ─── LLM narration (optional) ────────────────────────────────────────────────
+
+def _get_genai_client():
+    global _genai_client
+    if _genai_client is None:
+        from google import genai
+        _genai_client = genai.Client(api_key=settings.GEMINI_API_KEY, http_options={"timeout": 12000})
+    return _genai_client
 
 
 def _llm_agent_reason(
@@ -35,552 +71,425 @@ def _llm_agent_reason(
     agent_role: str,
     objective: str,
     context: dict[str, Any],
-    tool_summary: str,
     fallback_message: str,
-) -> str:
+) -> Tuple[str, str]:
     """
-    Invokes Gemini to generate authentic, context-specific AI reasoning in character.
-    Gracefully falls back to deterministic template if Gemini is slow or offline.
+    Ask Gemini to narrate a decision that has already been computed.
+    Returns (text, mode) where mode is "gemini" or "template".
     """
+    global _gemini_failure_logged
     if not settings.has_gemini:
-        return fallback_message
-
+        return fallback_message, "template"
     try:
-        from google import genai
-
-        client = genai.Client(
-            api_key=settings.GEMINI_API_KEY,
-            http_options={"timeout": 12000},
-        )
-
         prompt = (
-            f"You are {agent_name} ({agent_role}) in CascadeZero at Apex Volt EV Battery Plant.\n"
+            f"You are {agent_name} ({agent_role}) in a factory crisis-response workflow.\n"
             f"OBJECTIVE: {objective}\n"
-            f"CRISIS STATE: {json.dumps(context, default=str)}\n"
-            f"TOOL DATA: {tool_summary}\n\n"
-            f"TASK: Provide your executive, sharp analysis in 2 sentences in the first person. "
-            f"Be quantitative with exact costs (₹ INR), hours, and vendor names from tool data. "
-            f"End with your operational stance."
+            f"COMPUTED FACTS (from a MILP solver and Monte Carlo simulation — do not change any number): "
+            f"{json.dumps(context, default=str)}\n\n"
+            f"Write 2 sentences in the first person stating your position. Quote only numbers "
+            f"present in COMPUTED FACTS. Do not invent figures."
         )
-
-        resp = client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
-        )
+        resp = _get_genai_client().models.generate_content(model=settings.GEMINI_MODEL, contents=prompt)
         if resp.text and len(resp.text.strip()) > 15:
-            return resp.text.strip()
+            return resp.text.strip(), "gemini"
     except Exception as exc:
-        logger.debug("Gemini dynamic thought bypassed: %s", exc)
+        if not _gemini_failure_logged:
+            logger.warning("Gemini narration unavailable (%s) — using templated narration", exc)
+            _gemini_failure_logged = True
+    return fallback_message, "template"
 
-    return fallback_message
+
+def _trace(state: Dict[str, Any], node: str, mode: str) -> List[Dict[str, str]]:
+    return list(state.get("llm_trace", [])) + [{"node": node, "mode": mode}]
 
 
-# ─── Graph State Definition ──────────────────────────────────────────────────
+# ─── Proposal helpers (numbers come from the solver) ─────────────────────────
 
-class CascadeGraphState(TypedDict):
+def _score_proposal(lp: Dict[str, Any], deadline: float, delay: int, penalty: int) -> Dict[str, Any]:
+    mc = simulate_monte_carlo(
+        "PROPOSAL", lp["units_by_vendor"], lp["overtime_hours"],
+        deadline_hours=deadline, fully_covered=lp["feasible"], delay_hours=delay,
+    )
+    p = mc["confidence_pct"] / 100.0
+    return {
+        **lp,
+        "confidence_pct": mc["confidence_pct"],
+        "expected_cost_inr": int(round(lp["total_cost_inr"] + (1 - p) * penalty)),
+    }
+
+
+def _fmt_units(units_by_vendor: Dict[str, int]) -> str:
+    parts = [f"{n}u {_VENDOR_BY_ID[sid].name.split(' (')[0]}" for sid, n in units_by_vendor.items()]
+    return ", ".join(parts) or "no vendors"
+
+
+def _weak_vendors(units_by_vendor: Dict[str, int]) -> List[str]:
+    return [
+        f"{_VENDOR_BY_ID[sid].name.split(' (')[0]} ({_VENDOR_BY_ID[sid].reliability_pct}%)"
+        for sid in units_by_vendor
+        if _VENDOR_BY_ID[sid].reliability_pct < RELIABILITY_FLOOR_PCT
+    ]
+
+
+# ─── Graph State ─────────────────────────────────────────────────────────────
+
+class CascadeGraphState(TypedDict, total=False):
     run_id: str
     raw_message: str
     source_channel: str
 
-    # Extracted crisis metrics
     delay_hours: int
     line2_speed_pct: int
     line2_temp_celsius: float
     shortfall_units: int
     order_id: str
     crisis_headline: str
+    extraction_source: str
 
-    # Blast radius calculation
     blast_radius: Dict[str, Any]
 
-    # Agent proposals & rebuttal loop
     ops_proposal: Dict[str, Any]
     cfo_proposal: Dict[str, Any]
     rebuttal_count: int
+    rebuttal_pending: bool
     rebuttal_notes: List[str]
+    cfo_reliability_floor_pct: float
 
-    # Math solver output
     solver_result: Dict[str, Any]
     playbooks: List[Dict[str, Any]]
     recommended_plan_id: str
 
-    # Execution logs
-    logs: List[Dict[str, Any]]
+    llm_trace: List[Dict[str, str]]
 
 
-# ─── Node 1: Blast-Radius Detective ──────────────────────────────────────────
+def _default(value: Any, fallback: Any) -> Any:
+    """Use `fallback` only when `value` is missing (None) — never for a legitimate 0."""
+    return fallback if value is None else value
+
+
+def _ctx(state: CascadeGraphState) -> Tuple[float, int, int]:
+    br = state.get("blast_radius", {})
+    return (
+        float(_default(br.get("hours_remaining"), 38)),
+        int(state.get("delay_hours", 0)),
+        int(_default(br.get("sla_penalty_inr"), 2_500_000)),
+    )
+
+
+# ─── Node 1: Detective ───────────────────────────────────────────────────────
 
 def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
-    """
-    Agent 1 (Amber Badge):
-      1. Parses unstructured disruption text via Gemini structured outputs.
-      2. Computes blast-radius impact on suppliers, lines, and SLA exposure in Supabase.
-      3. Flips Supabase state to CRITICAL/BREACH_RISK (turns React Flow nodes crimson).
-    """
     run_id = state["run_id"]
+    extraction, source = extract_disruption_entities(state["raw_message"])
 
-    # 1. Structured extraction
-    extraction = extract_disruption_entities(state["raw_message"])
-    delay_hours = state.get("delay_hours") or extraction.delay_hours
-    line2_speed = state.get("line2_speed_pct") or extraction.line2_speed_pct
-    line2_temp = state.get("line2_temp_celsius") or extraction.line2_temp_celsius
-    shortfall = state.get("shortfall_units") or extraction.shortfall_units
+    # Explicit overrides (scenario presets / sliders) win over extraction, and we say so.
+    # None means "not overridden"; an explicit 0 is a real value and must win.
+    delay_hours = _default(state.get("delay_hours"), extraction.delay_hours)
+    line2_speed = _default(state.get("line2_speed_pct"), extraction.line2_speed_pct)
+    line2_temp = _default(state.get("line2_temp_celsius"), extraction.line2_temp_celsius)
+    shortfall = _default(state.get("shortfall_units"), extraction.shortfall_units)
     order_id = state.get("order_id") or extraction.affected_order_id or "EV-402"
-    headline = extraction.crisis_headline
+    overridden = any(state.get(k) is not None for k in ("delay_hours", "line2_speed_pct", "shortfall_units"))
 
     log_agent_step(
-        run_id=run_id,
-        step_order=1,
-        agent_name="Blast-Radius Detective",
-        agent_role="Disruption Entity Extractor",
-        badge_color="amber",
-        tool_called="extract_disruption_entities(gemini-3.8-flash)",
+        run_id=run_id, step_order=1,
+        agent_name="Blast-Radius Detective", agent_role="Disruption Entity Extractor", badge_color="amber",
+        tool_called=f"extract_disruption_entities({source})",
         tool_output_summary=(
-            f"Extracted: Delay +{delay_hours}h | Line 2 {line2_speed}% ({line2_temp}°C) | "
-            f"Shortfall {shortfall} units on #{order_id}"
+            f"Delay +{delay_hours}h | Line 2 {line2_speed}% ({line2_temp}°C) | Shortfall {shortfall} units on #{order_id}"
+            + (" | parameters set by scenario/slider override" if overridden else "")
         ),
         message=(
-            f"🚨 Disruption alert ingested via {state.get('source_channel', 'WEB_DASHBOARD')}. "
-            f"Parsing unstructured feed: '{state['raw_message'][:120]}...'"
+            f"🚨 Alert ingested via {state.get('source_channel', 'WEB_DASHBOARD')}. "
+            f"Parsed with {'Gemini' if source.startswith('gemini') else 'the regex fallback (LLM not used)'}: "
+            f"'{state['raw_message'][:120]}…'"
         ),
     )
 
-    # 2. SQL Blast Radius
-    blast_res = query_blast_radius_sql(
-        shortfall_units=shortfall,
-        delay_hours=delay_hours,
-        line2_speed_pct=line2_speed,
-        order_id=order_id,
+    blast = query_blast_radius_sql(
+        shortfall_units=shortfall, delay_hours=delay_hours, line2_speed_pct=line2_speed,
+        order_id=order_id, line2_temp_celsius=line2_temp,
     )
-
-    detective_msg = _llm_agent_reason(
-        agent_name="Blast-Radius Detective",
-        agent_role="Causal Dependency Mapper",
-        objective="Map compound disruption impact across supply chain, shop-floor line speeds, and SLA penalties.",
-        context={
-            "delay_hours": delay_hours,
-            "line2_speed_pct": line2_speed,
-            "line2_temp_celsius": line2_temp,
-            "shortfall_units": shortfall,
-            "order_id": order_id,
-        },
-        tool_summary=f"Order #{order_id} exposed to ₹{blast_res['sla_penalty_inr']:,} penalty. Chennai Casings: DELAYED (+{delay_hours}h) | Line 2: THROTTLED ({line2_speed}%)",
-        fallback_message=(
-            f"⚠️ Causal blast radius mapped. Inbound logistics delay on NH48 collides with "
-            f"Welding Line 2 thermal slowdown (89°C). Order #{order_id} has {shortfall} unit "
-            f"shortfall with ₹{blast_res['sla_penalty_inr']/100000:.1f}L full SLA breach risk!"
-        ),
+    summary = (
+        f"Order #{order_id} exposed to ₹{blast['sla_penalty_inr']:,} penalty, "
+        f"{blast.get('hours_remaining', 38)}h to deadline. Inbound delay +{delay_hours}h; "
+        f"Line 2 at {line2_speed}% ({line2_temp}°C)."
     )
-
+    msg, mode = _llm_agent_reason(
+        "Blast-Radius Detective", "Causal Dependency Mapper",
+        "Summarise the compound disruption and what is at stake.",
+        {"delay_hours": delay_hours, "line2_speed_pct": line2_speed, "line2_temp_celsius": line2_temp,
+         "shortfall_units": shortfall, "order_id": order_id, "sla_penalty_inr": blast["sla_penalty_inr"]},
+        f"⚠️ {summary} Shortfall: {shortfall} units.",
+    )
     log_agent_step(
-        run_id=run_id,
-        step_order=2,
-        agent_name="Blast-Radius Detective",
-        agent_role="Causal Dependency Mapper",
-        badge_color="amber",
-        tool_called="query_blast_radius_sql()",
-        tool_output_summary=(
-            f"Order #{order_id} exposed to ₹{blast_res['sla_penalty_inr']:,} penalty. "
-            f"Chennai Casings: DELAYED (+{delay_hours}h) | Line 2: THROTTLED ({line2_speed}%)"
-        ),
-        message=detective_msg,
+        run_id=run_id, step_order=2,
+        agent_name="Blast-Radius Detective", agent_role="Causal Dependency Mapper", badge_color="amber",
+        tool_called="query_blast_radius_sql()", tool_output_summary=summary, message=msg,
     )
 
+    trace = [{"node": "detective_extraction", "mode": "gemini" if source.startswith("gemini") else "regex-fallback"}]
+    trace.append({"node": "detective", "mode": mode})
     return {
         "delay_hours": delay_hours,
         "line2_speed_pct": line2_speed,
         "line2_temp_celsius": line2_temp,
         "shortfall_units": shortfall,
         "order_id": order_id,
-        "crisis_headline": headline,
-        "blast_radius": blast_res,
+        "crisis_headline": extraction.crisis_headline,
+        "extraction_source": source,
+        "blast_radius": blast,
         "rebuttal_count": 0,
+        "rebuttal_pending": False,
+        "cfo_reliability_floor_pct": 0.0,
+        "llm_trace": trace,
     }
 
 
 # ─── Node 2: Operations Hawk ─────────────────────────────────────────────────
 
 def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
-    """
-    Agent 2 (Rose Badge):
-      - Objective: 100% On-Time SLA Delivery regardless of cost.
-      - Queries air charter & overtime capacity.
-      - Proposes Plan A (Emergency Air Cargo @ ₹6.0L + Overtime).
-      - In rebuttal turn (rebuttal_count == 1), attacks CFO if Peenya stock is capped at 200 units!
-    """
     run_id = state["run_id"]
-    rebuttal_cnt = state.get("rebuttal_count", 0)
-    shortfall = state["shortfall_units"]
+    deadline, delay, penalty = _ctx(state)
+    shortfall, speed = state["shortfall_units"], state["line2_speed_pct"]
 
-    if rebuttal_cnt == 0:
-        # Round 1: Standard Demand for Air Charter
+    if not state.get("rebuttal_pending"):
         check_air_charter_and_max_overtime()
-        ot_hours = 0 if shortfall <= 200 else min(8, (shortfall + 37) // 38)
-
-        ops_msg = _llm_agent_reason(
-            agent_name="Operations Hawk",
-            agent_role="Chief of Manufacturing Operations",
-            objective="Demand immediate 100% on-time delivery using air charter and maximum overtime to prevent a catastrophic SLA breach.",
-            context={"shortfall": shortfall, "order_id": state.get("order_id", "EV-402")},
-            tool_summary="BlueDart HAL Air Cargo verified (500 units cap, 6h lead time, 98.5% reliability). Lines 1 & 3 OT capacity: up to 8h (304 units).",
-            fallback_message=(
-                f"🔥 Critical factory emergency! We cannot risk a ₹25,00,000 SLA penalty. "
-                f"I demand PLAN A: Charter BlueDart Aviation immediately (HAL corridor @ ₹6.0L flat) "
-                f"+ authorize parallel overtime on Lines 1 & 3. 99.4% on-time confidence!"
-            ),
-        )
-
-        log_agent_step(
-            run_id=run_id,
-            step_order=3,
-            agent_name="Operations Hawk",
-            agent_role="Chief of Manufacturing Operations",
-            badge_color="rose",
-            tool_called="check_air_charter_and_max_overtime()",
-            tool_output_summary=(
-                f"BlueDart HAL Air Cargo verified (500 units cap, 6h lead time, 98.5% reliability). "
-                f"Lines 1 & 3 OT capacity: up to 8h (304 units)."
-            ),
-            message=ops_msg,
-        )
-
-        return {
-            "ops_proposal": {
-                "plan": "PLAN_A",
-                "use_air": True,
-                "air_cost": 600000,
-                "ot_hours": ot_hours,
-                "confidence": 99.4,
-            }
+        lp = solve_pulp_milp(shortfall, delay, speed, deadline, force_air=True)
+        prop = _score_proposal(lp, deadline, delay, penalty)
+        facts = {
+            "plan": _fmt_units(prop["units_by_vendor"]), "overtime_hours": prop["overtime_hours"],
+            "cost_inr": prop["total_cost_inr"], "p_on_time_pct": prop["confidence_pct"],
+            "feasible": prop["feasible"],
         }
-    else:
-        # Round 2: Stress-Test Rebuttal Turn against CFO
-        ops_rebuttal_msg = _llm_agent_reason(
-            agent_name="Operations Hawk",
-            agent_role="Chief of Manufacturing Operations",
-            objective="Aggressively challenge CFO's proposal by exposing that Peenya SME caps at 200 units, creating an unmitigated shortfall.",
-            context={"shortfall": shortfall, "peenya_cap": 200, "deficit": shortfall - 200},
-            tool_summary=f"CAPACITY OVERFLOW: Shortfall is {shortfall} units, but Peenya caps strictly at 200 units!",
-            fallback_message=(
-                f"⚡ REBUTTAL TO CFO: Peenya Rapid Metals has a hard ceiling of 200 casings! "
-                f"Where are the remaining {shortfall - 200} units coming from? If we rely solely on Peenya, "
-                f"the factory starves and we breach the ₹25L SLA on Friday!"
-            ),
+        msg, mode = _llm_agent_reason(
+            "Operations Hawk", "Chief of Manufacturing Operations",
+            "Argue for the fastest, most reliable recovery (air charter).", facts,
+            f"🔥 My position: {facts['plan']} + {prop['overtime_hours']}h overtime. "
+            f"Cost ₹{prop['total_cost_inr']:,}, modelled P(on-time) {prop['confidence_pct']}%."
+            + ("" if prop["feasible"] else " Even this leaves units uncovered."),
         )
-
         log_agent_step(
-            run_id=run_id,
-            step_order=5,
-            agent_name="Operations Hawk",
-            agent_role="Chief of Manufacturing Operations",
-            badge_color="rose",
-            tool_called="audit_vendor_capacity_caps()",
+            run_id=run_id, step_order=3,
+            agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
+            tool_called="solve_pulp_milp(force_air=True) + simulate_monte_carlo()",
             tool_output_summary=(
-                f"CAPACITY OVERFLOW: Shortfall is {shortfall} units, but Peenya caps strictly at 200 units!"
+                f"{facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
+                f"P(on-time) {prop['confidence_pct']}% | E[cost] ₹{prop['expected_cost_inr']:,}"
             ),
-            message=ops_rebuttal_msg,
+            message=msg,
         )
+        return {"ops_proposal": prop, "llm_trace": _trace(state, "ops_hawk", mode)}
 
-        return {
-            "rebuttal_count": 2,
-            "rebuttal_notes": state.get("rebuttal_notes", []) + [
-                f"Ops Hawk flagged Peenya capacity overflow ({shortfall} > 200 max cap)."
-            ],
-        }
+    # Rebuttal turn: challenge the CFO plan with computed evidence.
+    cfo, ops = state["cfo_proposal"], state["ops_proposal"]
+    weak = _weak_vendors(cfo["units_by_vendor"])
+    reasons = []
+    if weak:
+        reasons.append(f"relies on {', '.join(weak)} below the {RELIABILITY_FLOOR_PCT:g}% reliability floor")
+    if not cfo["feasible"]:
+        reasons.append("leaves units uncovered")
+    if ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT:
+        reasons.append(f"P(on-time) {cfo['confidence_pct']}% vs my {ops['confidence_pct']}%")
+    challenge = "CFO plan " + "; ".join(reasons) + "."
+    msg, mode = _llm_agent_reason(
+        "Operations Hawk", "Chief of Manufacturing Operations",
+        "Challenge the CFO plan using only the computed risk evidence.",
+        {"challenge": challenge, "cfo_plan": _fmt_units(cfo["units_by_vendor"])},
+        f"⚡ REBUTTAL: {challenge} Re-plan without the weak link.",
+    )
+    log_agent_step(
+        run_id=run_id, step_order=5,
+        agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
+        tool_called="audit_proposal_risk()", tool_output_summary=challenge, message=msg,
+    )
+    return {
+        "rebuttal_pending": False,
+        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"Ops: {challenge}"],
+        "llm_trace": _trace(state, "ops_hawk_rebuttal", mode),
+    }
 
 
 # ─── Node 3: CFO Watchdog ────────────────────────────────────────────────────
 
+def _needs_rebuttal(cfo: Dict[str, Any], ops: Dict[str, Any]) -> bool:
+    return bool(
+        _weak_vendors(cfo["units_by_vendor"])
+        or not cfo["feasible"]
+        or ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT
+    )
+
+
 def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
-    """
-    Agent 3 (Cyan Badge):
-      - Objective: Margin Protection & Working-Capital Optimization.
-      - Queries regional vendors (Peenya @ ₹600, Hosur @ ₹850) & episodic memory.
-      - Rebuts Ops Hawk's ₹6.0L air charter spend.
-      - If shortfall > 200, initiates rebuttal round (rebuttal_count = 1).
-      - In post-rebuttal (rebuttal_count == 2), concedes to multi-tier split and passes to Arbitrator.
-    """
     run_id = state["run_id"]
-    shortfall = state["shortfall_units"]
-    rebuttal_cnt = state.get("rebuttal_count", 0)
+    deadline, delay, penalty = _ctx(state)
+    shortfall, speed = state["shortfall_units"], state["line2_speed_pct"]
+    rounds = state.get("rebuttal_count", 0)
+    query_regional_vendors_and_memory(shortfall)
 
-    # Query regional vendors + episodic memory
-    vendor_data = query_regional_vendors_and_memory(shortfall)
-    peenya = vendor_data["peenya"]
-
-    if shortfall <= 200:
-        # Standard Scenario: Peenya covers full shortfall
-        peenya_cost = shortfall * peenya["cost_per_unit"]
-        ot_hours = max(2, (shortfall + 37) // 38)
-        ot_cost = ot_hours * 22500
-        total_b = peenya_cost + ot_cost
-
-        cfo_msg = _llm_agent_reason(
-            agent_name="CFO Watchdog",
-            agent_role="VP of Finance & Capital Preservation",
-            objective="Protect plant working capital by firmly vetoing the ₹6.0L air charter and proving Peenya SME vendor saves significant capital with high reliability.",
-            context={"shortfall": shortfall, "peenya_cost": peenya_cost, "ot_cost": ot_cost, "total_b": total_b},
-            tool_summary=f"Peenya Rapid Metals (14 km): 200 units avail @ ₹600/u. Historical reliability 93.3%, 0.8% rejection. Air freight waste: ₹{600000 - total_b:,}!",
-            fallback_message=(
-                f"💰 REJECTING Plan A Air Charter! Spending ₹6,00,000 on air freight when local SME "
-                f"Peenya Rapid Metals is 14 km away is financially irresponsible. Peenya has 93.3% historical "
-                f"reliability. {shortfall} casings @ ₹600 (₹{peenya_cost:,}) + {ot_hours}h overtime (₹{ot_cost:,}) = "
-                f"₹{total_b/100000:.2f}L total cost. Saves ₹{(2500000 - total_b)/100000:.2f}L with optimal ROI!"
-            ),
-        )
-
-        log_agent_step(
-            run_id=run_id,
-            step_order=4,
-            agent_name="CFO Watchdog",
-            agent_role="VP of Finance & Capital Preservation",
-            badge_color="cyan",
-            tool_called=f"query_regional_vendors_and_memory(shortfall={shortfall})",
-            tool_output_summary=(
-                f"Peenya Rapid Metals (14 km): 200 units avail @ ₹600/u. "
-                f"Memory: 14/15 on-time (93.3% rel, 0.8% rej). Air freight waste: ₹{600000 - total_b:,}!"
-            ),
-            message=cfo_msg,
-        )
-
-        return {
-            "cfo_proposal": {
-                "plan": "PLAN_B",
-                "peenya_units": shortfall,
-                "hosur_units": 0,
-                "ot_hours": ot_hours,
-                "total_cost": total_b,
-            },
-            "rebuttal_count": 0,
+    if rounds == 0:
+        lp = solve_pulp_milp(shortfall, delay, speed, deadline)
+        prop = _score_proposal(lp, deadline, delay, penalty)
+        ops = state["ops_proposal"]
+        saving = ops["total_cost_inr"] - prop["total_cost_inr"]
+        facts = {
+            "plan": _fmt_units(prop["units_by_vendor"]), "overtime_hours": prop["overtime_hours"],
+            "cost_inr": prop["total_cost_inr"], "p_on_time_pct": prop["confidence_pct"],
+            "saving_vs_ops_inr": saving,
         }
-    else:
-        # Severe Scenario (Shortfall > 200 units)
-        if rebuttal_cnt == 0:
-            # Round 1: Trigger Rebuttal Loop
-            cfo_rebuttal_start = _llm_agent_reason(
-                agent_name="CFO Watchdog",
-                agent_role="VP of Finance & Capital Preservation",
-                objective="Propose a split between Peenya (200 units cap) and Hosur Precision to avoid air charter, but flag Attibele toll risks.",
-                context={"shortfall": shortfall, "peenya_cap": 200, "hosur_units": shortfall - 200},
-                tool_summary="Peenya (200 units @ ₹600) + Hosur Precision (150 units @ ₹850). Hosur memory: 9/11 on-time (81.8%), Attibele toll risk.",
-                fallback_message=(
-                    f"💰 Shortfall is {shortfall} units. Air charter is ₹6.0L+, but we can combine "
-                    f"Peenya (200 units cap) with Tier-3 Hosur Precision (150 units). Let's stress-test "
-                    f"whether the toll bottleneck at Attibele violates our 38h SLA deadline!"
-                ),
-            )
+        msg, mode = _llm_agent_reason(
+            "CFO Watchdog", "VP of Finance",
+            "Argue for the lowest-cost plan that still protects the order.", facts,
+            f"💰 Cost-minimal plan: {facts['plan']} + {prop['overtime_hours']}h overtime = "
+            f"₹{prop['total_cost_inr']:,} (₹{saving:,} less than Ops), P(on-time) {prop['confidence_pct']}%.",
+        )
+        log_agent_step(
+            run_id=run_id, step_order=4,
+            agent_name="CFO Watchdog", agent_role="VP of Finance", badge_color="cyan",
+            tool_called="solve_pulp_milp(min cost) + simulate_monte_carlo()",
+            tool_output_summary=(
+                f"{facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
+                f"P(on-time) {prop['confidence_pct']}% | E[cost] ₹{prop['expected_cost_inr']:,}"
+            ),
+            message=msg,
+        )
+        pending = _needs_rebuttal(prop, ops) and MAX_REBUTTAL_ROUNDS > 0
+        return {
+            "cfo_proposal": prop,
+            "rebuttal_pending": pending,
+            "rebuttal_count": 1 if pending else 0,
+            "llm_trace": _trace(state, "cfo_watchdog", mode),
+        }
 
-            log_agent_step(
-                run_id=run_id,
-                step_order=4,
-                agent_name="CFO Watchdog",
-                agent_role="VP of Finance & Capital Preservation",
-                badge_color="cyan",
-                tool_called=f"query_regional_vendors_and_memory(shortfall={shortfall})",
-                tool_output_summary=(
-                    f"Peenya (200 units @ ₹600) + Hosur Precision (150 units @ ₹850). "
-                    f"Hosur memory: 9/11 on-time (81.8%), Attibele toll risk."
-                ),
-                message=cfo_rebuttal_start,
-            )
-            return {
-                "cfo_proposal": {
-                    "plan": "PLAN_B_MULTI_TIER",
-                    "peenya_units": 200,
-                    "hosur_units": shortfall - 200,
-                },
-                "rebuttal_count": 1,  # Sets state to trigger rebuttal loop
-            }
-        else:
-            # Round 2 Post-Rebuttal Concession
-            cfo_concession_msg = _llm_agent_reason(
-                agent_name="CFO Watchdog",
-                agent_role="VP of Finance & Capital Preservation",
-                objective="Accept multi-tier allocation of Peenya 200 + Hosur + 8h overtime, proving it still preserves massive margin vs a ₹25L breach.",
-                context={"shortfall": shortfall, "total_cost": 427500, "sla_penalty": 2500000},
-                tool_summary=f"Multi-tier solution accepted: 200 Peenya + {shortfall - 200} Hosur + 8h OT = ₹4.28L. Saving ₹20.72L vs SLA breach.",
-                fallback_message=(
-                    f"🤝 Conceding multi-tier compromise: Peenya (200 units @ ₹1.2L) + Hosur ({shortfall - 200} units "
-                    f"@ ₹1.28L) + 8h Overtime (₹1.8L) = ₹4.28L total. Still saves ₹20.72L compared to a "
-                    f"₹25.0L breach. Passing to Arbitrator for mathematical LP proof."
-                ),
-            )
+    # Response to the rebuttal: re-solve without low-reliability vendors, keep the better E[cost].
+    original = state["cfo_proposal"]
+    lp = solve_pulp_milp(shortfall, delay, speed, deadline, min_vendor_reliability_pct=RELIABILITY_FLOOR_PCT)
+    revised = _score_proposal(lp, deadline, delay, penalty)
+    concede = revised["expected_cost_inr"] < original["expected_cost_inr"]
+    chosen = revised if concede else original
+    verdict = (
+        f"Conceded: revised plan {_fmt_units(revised['units_by_vendor'])} has lower E[cost] "
+        f"(₹{revised['expected_cost_inr']:,} vs ₹{original['expected_cost_inr']:,})."
+        if concede else
+        f"Held position: excluding weak vendors raises E[cost] to ₹{revised['expected_cost_inr']:,} "
+        f"vs ₹{original['expected_cost_inr']:,}; the reliability risk does not threaten the deadline."
+    )
+    msg, mode = _llm_agent_reason(
+        "CFO Watchdog", "VP of Finance", "Respond to the Ops rebuttal using the re-solved numbers.",
+        {"verdict": verdict}, f"🤝 {verdict}",
+    )
+    log_agent_step(
+        run_id=run_id, step_order=6,
+        agent_name="CFO Watchdog", agent_role="VP of Finance", badge_color="cyan",
+        tool_called=f"solve_pulp_milp(min_reliability={RELIABILITY_FLOOR_PCT:g}%)",
+        tool_output_summary=verdict, message=msg,
+    )
+    return {
+        "cfo_proposal": chosen,
+        "cfo_reliability_floor_pct": RELIABILITY_FLOOR_PCT if concede else 0.0,
+        "rebuttal_count": rounds,  # rounds completed (set to 1 when the rebuttal started)
+        "rebuttal_pending": False,
+        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"CFO: {verdict}"],
+        "llm_trace": _trace(state, "cfo_watchdog_response", mode),
+    }
 
-            log_agent_step(
-                run_id=run_id,
-                step_order=6,
-                agent_name="CFO Watchdog",
-                agent_role="VP of Finance & Capital Preservation",
-                badge_color="cyan",
-                tool_called="evaluate_multi_tier_risk_adjusted_cost()",
-                tool_output_summary=(
-                    f"Multi-tier solution accepted: 200 Peenya + {shortfall - 200} Hosur + 8h OT = ₹4.28L. "
-                    f"Saving ₹20.72L vs SLA breach."
-                ),
-                message=cfo_concession_msg,
-            )
-            return {
-                "cfo_proposal": {
-                    "plan": "PLAN_B_MULTI_TIER",
-                    "peenya_units": 200,
-                    "hosur_units": shortfall - 200,
-                    "ot_hours": 8,
-                    "total_cost": 427500,
-                },
-                "rebuttal_count": 3,  # Concluded rebuttal, advance to Arbitrator
-            }
-
-
-# ─── Conditional Edge: Rebuttal Router ───────────────────────────────────────
 
 def should_rebuttal_continue(state: CascadeGraphState) -> Literal["rebuttal", "arbitrate"]:
-    """
-    Conditional Edge:
-      If rebuttal_count == 1 (set by CFO when shortfall > 200), route back to Ops Hawk.
-      Once rebuttal_count > 1 (or shortfall <= 200), route to Arbitrator.
-    """
-    rebuttal_cnt = state.get("rebuttal_count", 0)
-
-    if rebuttal_cnt == 1:
-        logger.info("⚡ Triggering LangGraph Rebuttal Loop: Shortfall > Peenya Cap (200)")
+    if state.get("rebuttal_pending") and state.get("rebuttal_count", 0) <= MAX_REBUTTAL_ROUNDS:
         return "rebuttal"
     return "arbitrate"
 
 
-# ─── Node 4: Neuro-Symbolic Arbitrator ───────────────────────────────────────
+# ─── Node 4: Arbitrator ──────────────────────────────────────────────────────
 
 def arbitrator_node(state: CascadeGraphState) -> Dict[str, Any]:
-    """
-    Agent 4 (Emerald Badge):
-      - Objective: Zero-Hallucination Mathematical Verification & Playbook Ranking.
-      - Solves PuLP Mixed-Integer Linear Program + 1,000-run Monte Carlo simulation.
-      - Logs exact LP solver proof, variables, and survival probability %.
-      - Ranks Plan A, Plan B, and Plan C.
-    """
     run_id = state["run_id"]
-    shortfall = state["shortfall_units"]
-    delay_hours = state["delay_hours"]
-    line2_speed = state["line2_speed_pct"]
-    order_id = state.get("order_id", "EV-402")
-
-    # Run solver
+    deadline, delay, penalty = _ctx(state)
+    br = state.get("blast_radius", {})
     solver_dict = run_pulp_milp_and_monte_carlo(
-        shortfall_units=shortfall,
-        delay_hours=delay_hours,
-        line2_speed_pct=line2_speed,
-        order_id=order_id,
+        shortfall_units=state["shortfall_units"],
+        delay_hours=delay,
+        line2_speed_pct=state["line2_speed_pct"],
+        order_id=state.get("order_id", "EV-402"),
+        sla_penalty_inr=penalty,
+        partial_penalty_inr=int(_default(br.get("partial_delay_penalty_inr"), 500_000)),
+        deadline_hours=deadline,
+        client=br.get("client", "Ather-Grid Mobility Corp"),
+        cfo_min_vendor_reliability_pct=state.get("cfo_reliability_floor_pct", 0.0),
     )
-
     playbooks = solver_dict["playbooks"]
     winner_id = solver_dict["recommended_plan_id"]
-    winner_plan = next(p for p in playbooks if p["id"] == winner_id)
-
-    arbitrator_msg = _llm_agent_reason(
-        agent_name="Mathematical Arbitrator",
-        agent_role="Chief Mathematical Arbitrator & LP Solver",
-        objective="Validate the optimal recovery playbook through Mixed-Integer Linear Programming and Monte Carlo simulation without arithmetic hallucination.",
-        context={
-            "shortfall": shortfall,
-            "recommended_plan": winner_id,
-            "mitigation_cost": winner_plan["total_mitigation_cost_inr"],
-            "net_saved": winner_plan["net_sla_saved_inr"],
-            "roi": winner_plan["roi_multiplier"],
-            "confidence": winner_plan["confidence_pct"],
-        },
-        tool_summary=(
-            f"LP Proof: Status '{solver_dict['lp_status']}' | Solved in {solver_dict['solve_duration_ms']}ms. "
-            f"Winner: [{winner_id}] {winner_plan['name']} | Cost: ₹{winner_plan['total_mitigation_cost_inr']:,} | "
-            f"Net Saved: ₹{winner_plan['net_sla_saved_inr']:,} | ROI: {winner_plan['roi_multiplier']}x | Confidence: {winner_plan['confidence_pct']}%"
-        ),
-        fallback_message=(
-            f"⚖️ Mathematical arbitration complete. Mixed-Integer Linear Program solved with zero arithmetic "
-            f"hallucination. {winner_plan['name']} is the optimal verified solution: "
-            f"₹{winner_plan['total_mitigation_cost_inr']/100000:.2f}L spend preserves ₹{winner_plan['net_sla_saved_inr']/100000:.2f}L "
-            f"margin ({winner_plan['roi_multiplier']}x ROI, {winner_plan['confidence_pct']}% SLA survival confidence). "
-            f"Tally Prime PO XML and shift overtime broadcast notices generated."
-        ),
+    w = next(p for p in playbooks if p["id"] == winner_id)
+    ranking = " | ".join(f"{p['id']} E[₹{p['expected_cost_inr']:,}]" for p in playbooks)
+    summary = (
+        f"MILP status: {solver_dict['lp_status']} ({solver_dict['solve_duration_ms']}ms). "
+        f"Ranked by {solver_dict['ranking_rule']}: {ranking}. Winner {winner_id}."
     )
-
+    msg, mode = _llm_agent_reason(
+        "Arbitrator", "Solver & Risk Ranking", "Explain why the winning plan has the lowest risk-adjusted cost.",
+        {"winner": winner_id, "cost_inr": w["total_mitigation_cost_inr"], "p_on_time_pct": w["confidence_pct"],
+         "expected_cost_inr": w["expected_cost_inr"], "ranking": ranking},
+        f"⚖️ {w['name']} wins: ₹{w['total_mitigation_cost_inr']:,} spend, P(on-time) {w['confidence_pct']}% "
+        f"(95% CI {w.get('confidence_ci_low_pct')}–{w.get('confidence_ci_high_pct')}%), "
+        f"lowest expected cost ₹{w['expected_cost_inr']:,}.",
+    )
     log_agent_step(
-        run_id=run_id,
-        step_order=7 if state.get("rebuttal_count", 0) > 0 else 5,
-        agent_name="Mathematical Arbitrator",
-        agent_role="Chief Mathematical Arbitrator & LP Solver",
-        badge_color="emerald",
-        tool_called="run_pulp_milp_and_monte_carlo(PuLP MILP + 1000 Monte Carlo runs)",
-        tool_output_summary=(
-            f"LP Proof: Status '{solver_dict['lp_status']}' | Solved in {solver_dict['solve_duration_ms']}ms. "
-            f"Winner: [{winner_id}] {winner_plan['name']} | "
-            f"Cost: ₹{winner_plan['total_mitigation_cost_inr']:,} | "
-            f"Net Saved: ₹{winner_plan['net_sla_saved_inr']:,} | ROI: {winner_plan['roi_multiplier']}x | "
-            f"Confidence: {winner_plan['confidence_pct']}%"
-        ),
-        message=arbitrator_msg,
+        run_id=run_id, step_order=7 if state.get("rebuttal_count", 0) > 0 else 5,
+        agent_name="Arbitrator", agent_role="Solver & Risk Ranking", badge_color="emerald",
+        tool_called="generate_playbooks(MILP + 1000-run Monte Carlo)", tool_output_summary=summary, message=msg,
     )
-
     return {
         "solver_result": solver_dict,
         "playbooks": playbooks,
         "recommended_plan_id": winner_id,
+        "llm_trace": _trace(state, "arbitrator", mode),
     }
 
 
-# ─── Build & Compile the Cyclic StateGraph ───────────────────────────────────
+# ─── Build & Compile ─────────────────────────────────────────────────────────
 
 def build_cascade_graph():
-    """
-    Constructs and compiles the 4-Agent LangGraph StateGraph:
-      START
-        │
-        ▼
-      detective_node
-        │
-        ▼
-      ops_hawk_node ◄────────┐ (rebuttal loop when shortfall > 200u)
-        │                    │
-        ▼                    │
-      cfo_watchdog_node      │
-        │                    │
-        ├──[ if rebuttal_count == 1 ]──┘
-        │
-        └──[ else ]──► arbitrator_node ──► END
-    """
     workflow = StateGraph(CascadeGraphState)
-
-    # Register the 4 agent nodes
     workflow.add_node("detective", detective_node)
     workflow.add_node("ops_hawk", ops_hawk_node)
     workflow.add_node("cfo_watchdog", cfo_watchdog_node)
     workflow.add_node("arbitrator", arbitrator_node)
-
-    # Set entry point
     workflow.set_entry_point("detective")
-
-    # Linear edges
     workflow.add_edge("detective", "ops_hawk")
     workflow.add_edge("ops_hawk", "cfo_watchdog")
-
-    # Conditional rebuttal edge from CFO Watchdog
     workflow.add_conditional_edges(
-        "cfo_watchdog",
-        should_rebuttal_continue,
-        {
-            "rebuttal": "ops_hawk",
-            "arbitrate": "arbitrator",
-        },
+        "cfo_watchdog", should_rebuttal_continue, {"rebuttal": "ops_hawk", "arbitrate": "arbitrator"},
     )
-
-    # Terminal edge
     workflow.add_edge("arbitrator", END)
-
     return workflow.compile()
 
 
-# Compile singleton graph instance
 cascade_graph = build_cascade_graph()
 
 
-# ─── Convenience Pipeline Runner ─────────────────────────────────────────────
+def summarize_ai_mode(trace: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Collapse the per-node trace into what the UI should disclose."""
+    modes = {t["mode"] for t in trace}
+    llm_modes = {"gemini"}
+    if modes and modes <= llm_modes:
+        overall = "llm"
+    elif modes & llm_modes:
+        overall = "mixed"
+    else:
+        overall = "fallback"
+    return {
+        "overall": overall,
+        "model": settings.GEMINI_MODEL if overall != "fallback" else None,
+        "trace": trace,
+        "note": (
+            "All numbers come from the MILP solver and Monte Carlo simulation. "
+            + ("Narration and extraction used Gemini." if overall == "llm" else
+               "Some or all narration/extraction used templates or regex because the LLM was unavailable."
+               if overall == "mixed" else
+               "LLM not used: extraction ran on regex rules and narration is templated.")
+        ),
+    }
+
 
 def run_cascade_pipeline(
     raw_message: str,
@@ -590,31 +499,19 @@ def run_cascade_pipeline(
     override_line2_speed_pct: Optional[int] = None,
     order_id: str = "EV-402",
 ) -> Dict[str, Any]:
-    """
-    Executes the full 4-Agent LangGraph pipeline and returns the final state.
-    """
     run_id = f"RUN-{uuid.uuid4().hex[:8].upper()}"
-
-    initial_state: CascadeGraphState = {
+    initial: CascadeGraphState = {
         "run_id": run_id,
         "raw_message": raw_message,
         "source_channel": source_channel,
-        "delay_hours": override_delay_hours or 0,
-        "line2_speed_pct": override_line2_speed_pct or 0,
-        "line2_temp_celsius": 0.0,
-        "shortfall_units": override_shortfall_units or 0,
+        "delay_hours": override_delay_hours,
+        "line2_speed_pct": override_line2_speed_pct,
+        "line2_temp_celsius": None,
+        "shortfall_units": override_shortfall_units,
         "order_id": order_id,
-        "crisis_headline": "",
-        "blast_radius": {},
-        "ops_proposal": {},
-        "cfo_proposal": {},
-        "rebuttal_count": 0,
         "rebuttal_notes": [],
-        "solver_result": {},
-        "playbooks": [],
-        "recommended_plan_id": "",
-        "logs": [],
+        "llm_trace": [],
     }
-
-    final_state = cascade_graph.invoke(initial_state)
+    final_state = cascade_graph.invoke(initial)
+    final_state["ai_mode"] = summarize_ai_mode(final_state.get("llm_trace", []))
     return final_state

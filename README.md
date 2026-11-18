@@ -1,14 +1,14 @@
 # CascadeZero — Neuro-Symbolic AI Crisis Control Tower & 2.5D Digital Twin
 
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110.0-009688.svg?style=flat&logo=fastapi)](https://fastapi.tiangolo.com)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg?style=flat&logo=fastapi)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14.2-black.svg?style=flat&logo=next.js)](https://nextjs.org)
 [![LangGraph](https://img.shields.io/badge/LangGraph-Multi--Agent-orange.svg?style=flat)](https://github.com/langchain-ai/langgraph)
 [![PuLP](https://img.shields.io/badge/PuLP-MILP%20Solver-blue.svg?style=flat)](https://coin-or.github.io/pulp/)
 [![Supabase](https://img.shields.io/badge/Supabase-Realtime%20Postgres-3ECF8E.svg?style=flat&logo=supabase)](https://supabase.com)
 [![TailwindCSS](https://img.shields.io/badge/Tailwind-Rinesk%20Glass-38B2AC.svg?style=flat&logo=tailwind-css)](https://tailwindcss.com)
 
-> **Autonomous Multi-Agent Disruption Arbitrator & Digital Twin for Discrete Manufacturing.**  
-> Solves high-stakes industrial supply-chain failures by pairing **LLM cognitive perception (Gemini 3.8 Flash)** with **deterministic mathematical optimization (PuLP MILP)** to eliminate arithmetic hallucinations.
+> **Disruption-response copilot and digital twin for discrete manufacturing (demo plant).**  
+> Pairs an **LLM for reading messy alerts and narrating decisions (Gemini, configurable)** with a **PuLP mixed-integer program and Monte Carlo simulation** that make every numeric decision, so the LLM never does the arithmetic. A human approves every plan.
 
 ---
 
@@ -25,7 +25,7 @@ When an Indian EV battery plant faces compound disruptions (e.g., an NH48 highwa
 ```
                   ┌──────────────────────────────────────────────┐
                   │          UNSTRUCTURED DISRUPTION FEED        │
-                  │  (Driver Text / IoT Sensor / Toll FASTag)    │
+                  │  (Driver text / simulated PLC / ERP CSV)     │
                   └──────────────────────┬───────────────────────┘
                                          │
                                          ▼
@@ -51,8 +51,8 @@ When an Indian EV battery plant faces compound disruptions (e.g., an NH48 highwa
                   ┌──────────────────────────────────────────────┐
                   │       MATHEMATICAL ARBITRATOR AGENT          │
                   │    • Symbolic PuLP MILP Optimization Solver  │
-                  │    • 1,000 Monte Carlo Stochastic Simulations│
-                  │    • Zero Arithmetic Hallucination Proof     │
+                  │    • 1,000-run seeded Monte Carlo            │
+                  │    • Ranks by risk-adjusted expected cost    │
                   └──────────────────────┬───────────────────────┘
                                          │
                    ┌─────────────────────┴─────────────────────┐
@@ -60,9 +60,9 @@ When an Indian EV battery plant faces compound disruptions (e.g., an NH48 highwa
                    ▼                                           ▼
    ┌───────────────────────────────┐           ┌───────────────────────────────┐
    │   2.5D DIGITAL TWIN COCKPIT   │           │      HITL ONE-TAP EXECUTION   │
-   │  • Organic Sage Glass (Rinesk)│           │  • Native Tally Prime XML PO  │
-   │  • Executive vs Studio Views  │           │  • Shift Supervisor SMS Alerts│
-   │  • Custom Scenario Sandbox    │           │  • Client SLA Protection Notice│
+   │  • Organic Sage Glass (Rinesk)│           │  • Draft Tally Prime XML PO   │
+   │  • Executive vs Studio Views  │           │  • Draft shift notice (text)  │
+   │  • Custom Scenario Sandbox    │           │  • Draft client SLA notice    │
    └───────────────────────────────┘           └───────────────────────────────┘
 ```
 
@@ -81,8 +81,8 @@ When an Indian EV battery plant faces compound disruptions (e.g., an NH48 highwa
 
 ### 3. 🏭 Real Shop-Floor SME Integration
 - **`cascade_sync.py`:** Watches local on-premise folders for exported Tally ERP / Excel CSV sheets.
-- **`simulator_plc.py`:** Generates live Modbus/OPC-UA thermal and speed ticks simulating overheating welding robots.
-- **Automated Tally Prime XML PO:** Produces schema-compliant accounting vouchers directly importable into Tally ERP 9 / Tally Prime.
+- **`simulator_plc.py`:** Generates *synthetic* thermal and speed ticks and POSTs them as JSON over HTTP. It does not speak Modbus/OPC-UA; a real plant needs an edge collector.
+- **Draft Tally Prime XML PO:** One Purchase Order voucher per supplier, XML-escaped, with party and inventory entries. Not yet validated against a live Tally instance; ledgers/stock item must exist and GST ledgers are not included.
 
 ### 4. 📱 Mobile Field Controller (`/mobile`)
 - Dedicated handheld web UI for shop-floor supervisors with one-tap scenario injection and instant recovery authorization.
@@ -108,7 +108,7 @@ pip install -r requirements.txt
 
 # Configure environment variables
 cp .env.example .env
-# Edit .env with your SUPABASE_URL, SUPABASE_SERVICE_KEY, and GEMINI_API_KEY
+# Edit .env: SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, GEMINI_API_KEY, CASCADE_API_KEY
 
 # Start FastAPI server
 python -m app.main
@@ -123,7 +123,7 @@ cd ../frontend
 # Install Node dependencies
 npm install
 
-# Configure environment
+# Configure environment (set CASCADE_API_KEY to the same value as the backend; server-side only)
 cp .env.local.example .env.local
 
 # Start Next.js dev server
@@ -132,13 +132,23 @@ npm run dev
 Frontend runs at: `http://localhost:3000`  
 Mobile Field Controller: `http://localhost:3000/mobile`
 
-### 3. Run Automated System Test Suite
+### 3. Database
+
+Run `supabase/schema.sql`, then `supabase/migrations/001_rls_and_audit.sql` in the Supabase SQL editor.
+The migration enables Row-Level Security (browser = read-only) and adds approval audit columns.
+After it, backend writes require `SUPABASE_SERVICE_ROLE_KEY`.
+
+### 4. Run the Tests
 
 ```bash
 cd ../backend
-python test_step6.py
+python -m unittest discover -s tests -t .
 ```
-Runs 6 end-to-end integration tests:
+Offline suite (no Supabase, LLM or WhatsApp calls): solver correctness, infeasibility reporting,
+ranking, Monte Carlo sensitivity, Tally XML well-formedness, API auth, webhook signatures,
+WhatsApp approver allowlist, idempotent execution and CSV import.
+
+`python test_step6.py` is a separate **live** smoke test that uses the keys in `.env`. It covers:
 - Legacy Tally CSV Ingestion
 - PLC Overheat Telemetry
 - Phone WhatsApp Webhook Emulation
@@ -147,6 +157,43 @@ Runs 6 end-to-end integration tests:
 - Factory Seed Reset
 
 ---
+
+## ✅ What Is Real vs Simulated
+
+| Component | Status |
+|---|---|
+| MILP allocation (vendors, overtime, deadline feasibility, Line 2 throughput gap) | Real (PuLP + HiGHS/CBC). Infeasible inputs are reported, not hidden |
+| Plan ranking | Real: argmin of `cost + (1 − P_on_time) × SLA penalty` |
+| Monte Carlo on-time probability | Real, seeded; distributions are **assumptions** for the demo plant |
+| **Sourcing Agent** | Real agent loop: sends enquiries (not orders) to the vendors in a plan, reads replies (Gemini or regex, English/Hinglish), and re-plans with confirmed capacity/price/ETA, asking the next vendor when one declines, offers less, or times out (max 3 rounds). WhatsApp or simulated channel |
+| Ops ⇄ CFO debate | Proposals are solver outputs; the rebuttal fires on computed risk (weak vendor, infeasibility, confidence gap) and the CFO re-solves |
+| LLM | Extracts parameters from free text and narrates. The UI shows when it fell back to regex/templates |
+| Vendor costs, capacities, lead times | Hard-coded demo constants in `solver.py`, not yet read from the DB |
+| PLC telemetry | Simulated, HTTP JSON |
+| Weather | OpenWeatherMap city weather if a key is set; otherwise shown as offline |
+| WhatsApp | Meta Cloud API with HMAC verification; approvals only from allow-listed numbers |
+| Execution | Generates **drafts** (Tally XML, notices). Nothing is sent to suppliers automatically |
+
+## 🤝 Sourcing Agent
+
+The planner's vendor numbers are assumptions; the Sourcing Agent replaces them with what vendors actually say.
+
+1. After an analysis, click **Confirm with suppliers first** (dashboard) or `POST /api/v1/sourcing/start {run_id}`.
+2. The agent sends an enquiry to each vendor in the chosen plan — explicitly *not* a purchase order.
+3. Replies arrive over WhatsApp (`SOURCING_MODE=whatsapp`, vendor numbers in `suppliers.whatsapp_number`) or are typed on the dashboard (simulated mode, or a reply received by phone).
+4. Each reply becomes a structured offer. Declines and timeouts remove that vendor; partial or re-priced offers update capacity, price and lead time for this run only.
+5. When no enquiry is outstanding it re-solves. If the best plan needs an unconfirmed vendor, it asks that vendor (next round); otherwise it hands a **confirmed plan** back for human approval (`<run_id>-S<round>`).
+
+Only one PO can ever be created per analysis — the original run and its sourced re-plan share an idempotency key.
+Apply `supabase/migrations/002_sourcing_agent.sql` for vendor numbers and the enquiry audit table.
+
+## 🔐 Security Setup
+
+- `CASCADE_API_KEY` gates every mutating endpoint. The Next.js middleware injects it server-side; it never reaches the browser. This is an operator-level gate, not per-user auth.
+- `META_APP_SECRET` verifies WhatsApp webhook signatures; `WA_APPROVER_NUMBERS` lists who may approve.
+- `ALLOWED_ORIGINS` replaces the old `*` CORS policy.
+- `CASCADE_ENV=production` refuses to start if any of the above is missing, and disables `/reset` and the Twilio sandbox.
+- Execution uses the plan the server computed for a `run_id`, once per run. Costs are never accepted from the client.
 
 ## 🏗️ Repository Architecture
 
@@ -180,12 +227,13 @@ cascade0/
 │   │   │   ├── CustomNodes.tsx   # Industrial Supply Chain & Machine Nodes
 │   │   │   ├── AgentStream.tsx   # Live Autonomous Agent Audit Trail
 │   │   │   ├── PlaybookSidebar.tsx # Multi-Plan Trade-Off Comparison
-│   │   │   └── ExecutionModal.tsx# Tally XML PO Receipt & SMS Dispatcher
+│   │   │   └── ExecutionModal.tsx# Draft Tally XML PO & notices
 │   │   └── store/
 │   │       └── useFactoryStore.ts# Zustand Global Factory State & Realtime Sync
 │
 ├── supabase/
-│   └── migrations/               # PostgreSQL Tables & Row-Level Security
+│   ├── schema.sql                # Tables & seed data
+│   └── migrations/               # Row-Level Security & audit columns
 ├── PRODUCTION_ROADMAP.md         # Commercial B2B SaaS Architecture Blueprint
 ├── run.md                        # Master Startup & Daemon Command Guide
 └── README.md

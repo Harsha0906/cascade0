@@ -1,6 +1,7 @@
 -- ============================================================================
 -- CASCADEZERO — Complete PostgreSQL Schema, Realtime Setup & Seed Data
 -- Target: Supabase Cloud PostgreSQL (ap-south-1)
+-- After this file, apply supabase/migrations/001_rls_and_audit.sql (Row-Level Security).
 -- Factory: Apex Volt EV Battery Plant (Bengaluru Unit-2)
 -- ============================================================================
 
@@ -122,6 +123,8 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
     shift_broadcast_msg     TEXT NOT NULL DEFAULT '',
     client_sla_notice       TEXT NOT NULL DEFAULT '',
     status                  TEXT NOT NULL DEFAULT 'DRAFT',
+    approved_by             TEXT NOT NULL DEFAULT '',
+    run_id                  TEXT NOT NULL DEFAULT '',
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

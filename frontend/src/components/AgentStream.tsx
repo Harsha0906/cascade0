@@ -40,6 +40,8 @@ export function AgentStream() {
         return "bg-sky-100 border border-sky-300 text-sky-950 font-bold";
       case "emerald":
         return "bg-forest/15 border border-forest/40 text-forest-deep font-bold";
+      case "violet":
+        return "bg-violet-100 border border-violet-300 text-violet-950 font-bold";
       default:
         return "bg-white/60 border border-white/80 text-charcoal-800 font-bold";
     }

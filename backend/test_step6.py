@@ -1,5 +1,6 @@
 """
-CascadeZero — Step 6 End-to-End System Verification Suite
+CascadeZero — Step 6 End-to-End System Verification Suite (LIVE: uses the Supabase/Gemini keys in .env)
+For offline, repeatable tests run:  python -m unittest discover -s tests -t .
 Tests the complete multi-channel industrial pipeline:
 1. Legacy ERP / Tally CSV Sync (watched folder -> /api/v1/ingest/erp-csv)
 2. Shop-Floor Machine PLC Telemetry (/api/v1/ingest/plc-telemetry)
@@ -21,7 +22,8 @@ if sys.platform == "win32":
 from app.main import app
 from app.db import fetch_all
 
-client = TestClient(app)
+import os
+client = TestClient(app, headers={"X-API-Key": os.environ.get("CASCADE_API_KEY", "")})
 
 
 def test_step6_e2e():
@@ -101,38 +103,18 @@ def test_step6_e2e():
     # 5. Test HITL Execution & Tally XML PO Generation
     # ─────────────────────────────────────────────────────────────────────────
     print("\n[TEST 5/6] Testing HITL Execution & Tally ERP XML Generation...")
+    res_sim = client.post("/api/v1/simulate-crisis", json={"scenario_id": 1})
+    assert res_sim.status_code == 200, f"Simulation failed: {res_sim.text}"
+    sim = res_sim.json()
     res_exec = client.post(
         "/api/v1/execute-plan",
-        json={
-            "po_number": "PO-APEX-2026-E2E",
-            "playbook_id": "PLAN_B",
-            "order_id": "EV-402",
-            "allocations": [
-                {
-                    "supplier_id": "SUP-PNY-02",
-                    "supplier_name": "Peenya Rapid Metals",
-                    "tier": "TIER-2",
-                    "units_allocated": 150,
-                    "cost_per_unit_inr": 600,
-                    "flat_charter_cost_inr": 0,
-                    "total_cost_inr": 90000,
-                    "lead_time_hours": 4,
-                    "route": "Peenya (14 km)",
-                }
-            ],
-            "overtime_hours": 4,
-            "total_cost_inr": 180000,
-            "net_sla_saved_inr": 2320000,
-            "confidence_pct": 94.2,
-            "client": "Ather-Grid Mobility Corp",
-        },
+        json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"], "approved_by": "e2e-script"},
     )
     assert res_exec.status_code == 200, f"Execution failed: {res_exec.text}"
     exec_data = res_exec.json()
     assert exec_data["success"] is True
     assert "<ENVELOPE>" in exec_data["tally_xml_payload"]
-    assert "PO-APEX-2026-E2E" in exec_data["tally_xml_payload"]
-    assert "Peenya Rapid Metals" in exec_data["tally_xml_payload"]
+    assert exec_data["po_number"] in exec_data["tally_xml_payload"]
     print(f"  ✅ Tally PO #{exec_data['po_number']} created in Supabase 'purchase_orders'.")
     print(f"  • SLA Saved: ₹{exec_data['net_sla_saved_inr']:,}")
     print(f"  • Supervisor Code: {exec_data['shift_broadcast_msg'].split('code:')[-1].strip()}")

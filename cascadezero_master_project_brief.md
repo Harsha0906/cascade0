@@ -1,5 +1,8 @@
 # CASCADEZERO — COMPLETE AGENT ENGINEERING & MASTER PRODUCT BRIEF
 
+> ⚠️ **SUPERSEDED BUILD SPEC — not a description of current behaviour.** This was the original prompt used to generate the first version. Fixed figures (e.g. Plan B, 13.9x ROI, 94.2%), "dispatch" and "zero-hallucination" language below do not reflect the current code. See README.md ("What Is Real vs Simulated").
+
+
 > **INSTRUCTIONS FOR THE AI CODING AGENT IN GOOGLE ANTIGRAVITY:**
 > This document is the single source of truth for building **CascadeZero**. Nothing has been implemented yet; you are starting from a clean slate. Read every section carefully and adhere strictly to the architecture, database schema, 4-Agent LangGraph design, PuLP + Monte Carlo math solver, hex color tokens, and the **Step-by-Step Build Order** in Section 8. **Never skip ahead to Step N+1 until the user has run, tested, and verified Step N.** Always provide complete, top-to-bottom file contents (never partial diffs or `// ... existing code ...` placeholders).
 
