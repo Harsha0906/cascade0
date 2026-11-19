@@ -137,6 +137,20 @@ Mobile Field Controller: `http://localhost:3000/mobile`
 Run `supabase/schema.sql`, then `supabase/migrations/001_rls_and_audit.sql` in the Supabase SQL editor.
 The migration enables Row-Level Security (browser = read-only) and adds approval audit columns.
 After it, backend writes require `SUPABASE_SERVICE_ROLE_KEY`.
+Then apply `002_sourcing_agent.sql`, `003_factory_model.sql` and `004_durable_state.sql` in order.
+`004_durable_state.sql` adds `analysis_runs`, `sourcing_sessions`, `execution_receipts`, `webhook_events`,
+the atomic `execute_plan_tx` function and a `schema_migrations` table (level 4 is required).
+
+Check it with `GET /healthz`, which returns
+`{"storage", "db", "migration_level", "required_migration_level", "ready"}` and HTTP 200 when ready,
+503 otherwise. The backend logs an error at startup if the database is below level 4 (production refuses to start).
+
+### Storage modes
+
+| Mode | When | Behaviour |
+|---|---|---|
+| `supabase` | `SUPABASE_URL` and a Supabase key are set | All state is in Postgres. Any database failure raises and the API returns **503**; there is no silent fallback to memory |
+| `offline` | No Supabase credentials | State lives in an in-process mirror, lost on restart. Demo and tests only; refused when `CASCADE_ENV=production` |
 
 ### 4. Run the Tests
 
@@ -172,6 +186,7 @@ WhatsApp approver allowlist, idempotent execution and CSV import.
 | PLC telemetry | Simulated, HTTP JSON |
 | Weather | OpenWeatherMap city weather if a key is set; otherwise shown as offline |
 | WhatsApp | Meta Cloud API with HMAC verification; approvals only from allow-listed numbers |
+| Analysis runs, sourcing sessions, execution receipts | Stored in Postgres (`analysis_runs`, `sourcing_sessions`, `execution_receipts`); in offline mode in process memory. Approving a run twice returns the original receipt with `already_executed: true`; a different plan for an executed run is a 409 |
 | Execution | Generates **drafts** (Tally XML, notices). Nothing is sent to suppliers automatically |
 
 ## 🤝 Sourcing Agent
@@ -186,6 +201,9 @@ The planner's vendor numbers are assumptions; the Sourcing Agent replaces them w
 
 Only one PO can ever be created per analysis — the original run and its sourced re-plan share an idempotency key.
 Apply `supabase/migrations/002_sourcing_agent.sql` for vendor numbers and the enquiry audit table, then `supabase/migrations/003_factory_model.sql` (must be applied after 002) for the per-factory model the planner reads.
+
+Known limits: WhatsApp messages are de-duplicated by Meta message id and recorded before processing, so a retry of a message whose processing failed is dropped (the sender is told to resend) rather than risk running an approval twice.
+Sourcing sessions use optimistic concurrency (`version` column; 409 after 3 conflicting retries), but multiple backend workers are not yet supported for sourcing.
 
 ## 🔐 Security Setup
 
