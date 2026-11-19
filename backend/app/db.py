@@ -254,6 +254,17 @@ _SEED_FACTORIES: list[dict[str, Any]] = [
 ]
 
 
+REQUIRED_MIGRATION_LEVEL = 4
+
+# Durable-state tables cleared on reset, with their primary-key column.
+_DURABLE_TABLES: tuple[tuple[str, str], ...] = (
+    ("analysis_runs", "run_id"),
+    ("sourcing_sessions", "run_id"),
+    ("execution_receipts", "root_run_id"),
+    ("webhook_events", "message_id"),
+)
+
+
 class InMemoryMirror:
     """
     Thread-safe in-memory data store that mirrors the Supabase schema.
@@ -270,6 +281,13 @@ class InMemoryMirror:
         self.agent_logs: list[dict[str, Any]] = []
         self.purchase_orders: list[dict[str, Any]] = []
         self.sourcing_rfqs: list[dict[str, Any]] = []
+        self.analysis_runs: list[dict[str, Any]] = []
+        self.sourcing_sessions: list[dict[str, Any]] = []
+        self.execution_receipts: list[dict[str, Any]] = []
+        self.webhook_events: list[dict[str, Any]] = []
+        self.schema_migrations: list[dict[str, Any]] = [
+            {"version": v} for v in range(1, REQUIRED_MIGRATION_LEVEL + 1)
+        ]
 
     def get_table(self, table_name: str) -> list[dict[str, Any]]:
         """Return reference to an in-memory table by name."""
@@ -435,6 +453,48 @@ def delete_all(table_name: str) -> bool:
     return True
 
 
+def _is_missing_table(exc: Exception) -> bool:
+    code = str(getattr(exc, "code", "") or "")
+    text = str(exc).lower()
+    return (
+        code in ("PGRST205", "42P01")
+        or "could not find the table" in text
+        or ("relation" in text and "does not exist" in text)
+    )
+
+
+def migration_level() -> int:
+    """Highest applied migration version (0 if schema_migrations is missing)."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            response = (
+                client.table("schema_migrations")
+                .select("version")
+                .order("version", desc=True)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:
+            if _is_missing_table(exc):
+                return 0
+            raise _fail("migration_level", "schema_migrations", exc) from exc
+        rows = response.data or []
+        return int(rows[0]["version"]) if rows else 0
+    return max((r["version"] for r in _mirror.schema_migrations), default=0)
+
+
+def call_function(name: str, params: dict[str, Any]) -> Any:
+    """Call a Postgres function via supabase rpc. Not available offline."""
+    client = _get_supabase()
+    if client is None:
+        raise DatabaseError("rpc", name)
+    try:
+        return client.rpc(name, params).execute().data
+    except Exception as exc:
+        raise _fail("rpc", name, exc) from exc
+
+
 # ─── Table-Specific Helpers ────────────────────────────────────────────────
 
 
@@ -589,6 +649,8 @@ def reset_to_seed() -> dict[str, str]:
             client.table("sourcing_rfqs").delete().neq("id", "").execute()
         except Exception as exc:
             logger.warning("Could not clear sourcing_rfqs: %s", exc)
+        for tbl, pk in _DURABLE_TABLES:
+            client.table(tbl).delete().neq(pk, "___impossible___").execute()
 
         for tbl, seed in (
             ("factories", _SEED_FACTORIES),

@@ -1,7 +1,7 @@
 -- ============================================================================
 -- CASCADEZERO — Complete PostgreSQL Schema, Realtime Setup & Seed Data
 -- Target: Supabase Cloud PostgreSQL (ap-south-1)
--- After this file, apply supabase/migrations/001_rls_and_audit.sql (Row-Level Security).
+-- Fresh install: run this file, then migrations 001, 002, 003, 004 in order.
 -- Factory: Apex Volt EV Battery Plant (Bengaluru Unit-2)
 -- ============================================================================
 

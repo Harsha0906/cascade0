@@ -7,7 +7,7 @@ from tests import _offline_env  # noqa: F401  (must precede app imports)
 from fastapi.testclient import TestClient
 
 from app import db, main
-from tests.fake_supabase import FailingClient
+from tests.fake_supabase import FailingClient, MissingTableError, StubClient
 
 KEY = {"X-API-Key": "test-operator-key"}
 
@@ -79,3 +79,57 @@ class FailLoudTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DurableStateTests(unittest.TestCase):
+    def setUp(self):
+        db.reset_to_seed()
+
+    def test_offline_migration_level_is_required_level(self):
+        self.assertEqual(db.migration_level(), db.REQUIRED_MIGRATION_LEVEL)
+
+    def test_reset_clears_durable_tables(self):
+        db.insert_row("analysis_runs", {"run_id": "R1", "factory_id": "f", "payload": {}})
+        db.reset_to_seed()
+        self.assertEqual(db.fetch_all("analysis_runs"), [])
+
+    def test_call_function_offline_is_an_error(self):
+        with self.assertRaises(db.DatabaseError):
+            db.call_function("execute_plan_tx", {})
+
+    def test_migration_level_live_max_version(self):
+        stub = StubClient(data=[{"version": 4}])
+        with mock.patch("app.db._get_supabase", return_value=stub):
+            self.assertEqual(db.migration_level(), 4)
+
+    def test_migration_level_missing_table_is_zero(self):
+        with mock.patch("app.db._get_supabase", return_value=StubClient(error=MissingTableError())):
+            self.assertEqual(db.migration_level(), 0)
+
+    def test_migration_level_other_error_raises(self):
+        with mock.patch("app.db._get_supabase", return_value=FailingClient()):
+            with self.assertRaises(db.DatabaseError):
+                db.migration_level()
+
+    def test_call_function_live_returns_data(self):
+        stub = StubClient(data={"ok": True})
+        with mock.patch("app.db._get_supabase", return_value=stub):
+            self.assertEqual(db.call_function("execute_plan_tx", {}), {"ok": True})
+
+    def test_call_function_live_failure_raises(self):
+        with mock.patch("app.db._get_supabase", return_value=FailingClient()):
+            with self.assertRaises(db.DatabaseError):
+                db.call_function("execute_plan_tx", {})
+
+    def test_reset_live_clears_durable_tables(self):
+        deleted = []
+
+        class Rec(StubClient):
+            def table(self, name, *a, **k):
+                deleted.append(name)
+                return super().table(name)
+
+        with mock.patch("app.db._get_supabase", return_value=Rec(data=[])):
+            db.reset_to_seed()
+        for t in ("analysis_runs", "sourcing_sessions", "execution_receipts", "webhook_events"):
+            self.assertIn(t, deleted)
