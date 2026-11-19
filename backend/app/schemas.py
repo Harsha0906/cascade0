@@ -77,7 +77,8 @@ class PlaybookOption(BaseModel):
     name: str
     strategy_type: str  # AIR_CHARTER_MAX_OT | REGIONAL_BALANCED_OT | TARGETED_OT_ONLY | SLA_RENEGOTIATION
     vendor_allocations: List[VendorAllocation]
-    overtime_hours: int
+    overtime_hours: int                              # elapsed overtime window (longest line)
+    overtime_line_hours: dict[str, int] = {}         # overtime hours per production line id
     overtime_cost_inr: int
     supplier_cost_inr: int
     total_mitigation_cost_inr: int
@@ -112,7 +113,7 @@ class SolverResult(BaseModel):
     lp_status: str
     monte_carlo_iterations: int = 1000
     deadline_hours: float = 38.0
-    line2_throughput_gap_units: int = 0
+    throughput_gap_units: int = 0
     ranking_rule: str = ""
     capacity_exhausted: bool = False
 
