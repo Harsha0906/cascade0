@@ -246,7 +246,7 @@ def _send_rfq(session: SourcingSession, supplier_id: str, units: int) -> RFQ:
         supplier_name=vendor.name,
         units_requested=units,
         expected_unit_price_inr=int(override.get("unit_cost", vendor.unit_cost)),
-        needed_within_hours=max(1.0, round(session.params["deadline_hours"] - 2.5 - 1, 1)),
+        needed_within_hours=max(1.0, round(session.params["deadline_hours"] - model.qa_dispatch_hours - 1, 1)),
         channel=settings.SOURCING_MODE,
     )
     rfq.message = _rfq_text(model, rfq)
