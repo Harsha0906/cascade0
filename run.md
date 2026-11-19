@@ -1,6 +1,6 @@
 # 🚀 CascadeZero — Quick Run & Execution Guide
 
-CascadeZero is an Autonomous AI Crisis Control Tower & 2.5D Digital Twin for high-stakes manufacturing operations.
+CascadeZero is a human-approved disruption-response copilot and 2.5D digital twin for a demo manufacturing plant. See README.md for what is real vs simulated.
 
 ---
 
@@ -52,7 +52,7 @@ CascadeZero supports both **Meta's Official WhatsApp Cloud API (Native Interacti
 2. **Configure Webhook in [developers.facebook.com](https://developers.facebook.com/):**
    - In your WhatsApp App Dashboard $\rightarrow$ **Configuration** $\rightarrow$ **Webhook** $\rightarrow$ Click **Edit**.
    - **Callback URL:** `https://<YOUR_TUNNEL_URL>/api/v1/webhooks/whatsapp`
-   - **Verify Token:** `cascadezero_verify_token_2026`
+   - **Verify Token:** the random value you set as `META_WA_VERIFY_TOKEN` in `backend/.env` (also set `META_APP_SECRET` and `WA_APPROVER_NUMBERS`)
    - Click **Verify and Save**.
    - Under Webhook fields, click **Subscribe** to `messages`.
 
@@ -62,11 +62,11 @@ CascadeZero supports both **Meta's Official WhatsApp Cloud API (Native Interacti
 
 4. **Send Message from Phone:**
    - Send any disruption report: *"Driver Ramesh reporting flood on NH48..."*
-   - CascadeZero replies with native clickable buttons: `[⚡ Approve Plan B]` and `[📊 Plant Status]`! Tapping a button automatically executes the recovery and creates the Tally PO!
+   - CascadeZero replies with native clickable buttons: `[⚡ Approve Plan B]` and `[📊 Plant Status]`! Tapping Approve from an allow-listed number approves that run's recommended plan and generates a draft Tally PO (nothing is sent to suppliers automatically).
 
 ---
 
-### B. Twilio Sandbox Fallback
+### B. Twilio Sandbox Fallback (development only — read-only, cannot approve, disabled in production)
 1. Open [Twilio Console -> Messaging -> Try WhatsApp](https://console.twilio.com/).
 2. In **Sandbox Settings**, paste into *"When a message comes in"*:
    ```

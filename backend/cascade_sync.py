@@ -58,8 +58,9 @@ def sync_file_to_api(file_path: Path, api_base: str) -> bool:
     }
 
     try:
+        headers = {"X-API-Key": os.environ["CASCADE_API_KEY"]} if os.environ.get("CASCADE_API_KEY") else {}
         with httpx.Client(timeout=5.0) as client:
-            res = client.post(url, json=payload)
+            res = client.post(url, json=payload, headers=headers)
             if res.status_code == 200:
                 data = res.json()
                 print(

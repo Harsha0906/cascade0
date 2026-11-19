@@ -2,6 +2,8 @@
 
 import React from "react";
 import { useFactoryStore } from "@/store/useFactoryStore";
+import { AiModeBadge } from "@/components/AiModeBadge";
+import { SourcingPanel } from "@/components/SourcingPanel";
 import {
   AlertTriangle,
   ArrowRight,
@@ -31,6 +33,10 @@ export function ExecutiveStoryView() {
     executePlaybook,
     isExecuting,
     rebuttalOccurred,
+    rebuttalNotes,
+    solveDurationMs,
+    solverMeta,
+    lastError,
     openCustomCrisisModal,
     setDashboardViewMode,
     executionReceipt,
@@ -40,7 +46,12 @@ export function ExecutiveStoryView() {
   const isCrisis = statusMode === "CRISIS";
   const isProtected = statusMode === "PROTECTED";
   const ev402 = orders.find((o) => o.order_id === "EV-402");
-  const selectedPlan = playbooks.find((p) => p.id === (selectedPlaybookId || "PLAN_B"));
+  const selectedPlan =
+    playbooks.find((p) => p.id === selectedPlaybookId) || playbooks.find((p) => p.recommended);
+  const opsPlan = playbooks.find((p) => p.id === "PLAN_A");
+  const cfoPlan = playbooks.find((p) => p.id === "PLAN_B");
+  const line2 = productionLines.find((l) => l.line_id === "LINE-2");
+  const lakh = (n: number) => `₹${(n / 100000).toFixed(2)}L`;
 
   return (
     <div className="w-full max-w-[1400px] mx-auto p-4 sm:p-6 flex flex-col gap-6 animate-in fade-in duration-300">
@@ -88,7 +99,7 @@ export function ExecutiveStoryView() {
                   {isCrisis
                     ? "CRITICAL INCIDENT IN PROGRESS"
                     : isProtected
-                    ? "RECOVERY PLAN DISPATCHED"
+                    ? "RECOVERY PLAN APPROVED"
                     : "ALL SYSTEMS NOMINAL"}
                 </span>
 
@@ -99,18 +110,18 @@ export function ExecutiveStoryView() {
 
               <h2 className="text-xl sm:text-2xl font-extrabold text-charcoal-900 tracking-tight mt-2">
                 {isCrisis
-                  ? "Compound Risk: ₹25.0L SLA Penalty on Order #EV-402"
+                  ? `Compound Risk: ${lakh(ev402?.sla_penalty_inr ?? 0)} SLA Penalty on Order #EV-402`
                   : isProtected
-                  ? "Factory Shielded: Tally PO Generated & Overtime Broadcasted"
+                  ? "Recovery Plan Approved: Draft PO & Notices Generated"
                   : "Zero Contractual Exposure • All Production Lines Running"}
               </h2>
 
               <p className="text-xs sm:text-sm text-charcoal-700 font-medium max-w-2xl mt-1 leading-relaxed">
                 {isCrisis
-                  ? "An inbound logistics breakdown (NH48 flood) has collided with shop-floor machine thermal throttling (Line 2 at 89°C). 150 battery casings are in immediate deficit."
-                  : isProtected
-                  ? `Plan B authorized. Saved ₹${((selectedPlan?.net_sla_saved_inr || 2320000) / 100000).toFixed(1)} Lakhs in client penalties with a 13.9x return on capital.`
-                  : "Sensors, FASTag highway corridors, and Tally ERP sheets are continuously audited by 4 autonomous agents to prevent supply chain bottlenecks."}
+                  ? `Inbound supply delay combined with Line 2 running at ${line2?.speed_pct ?? "?"}% (${line2?.temp_celsius ?? "?"}°C). ${ev402?.shortfall_units ?? 0} battery casings short.`
+                  : isProtected && selectedPlan
+                  ? `${selectedPlan.id} approved: ${lakh(selectedPlan.total_mitigation_cost_inr)} spend, modelled on-time probability ${selectedPlan.confidence_pct}%. Delivery is not guaranteed until suppliers confirm.`
+                  : "Run a scenario or paste a disruption alert to get ranked recovery plans. Telemetry in this demo is simulated."}
               </p>
             </div>
           </div>
@@ -164,7 +175,9 @@ export function ExecutiveStoryView() {
                     </span>
                   </div>
                   <p className="text-[11px] text-rose-950 mt-1.5 leading-relaxed">
-                    Wanted <strong>Plan A</strong>: Emergency BlueDart air charter (@ ₹6.0L flat) + 8h overtime. Demanded 99.4% on-time guarantee regardless of price.
+                    {opsPlan
+                      ? `${opsPlan.description} — ${lakh(opsPlan.total_mitigation_cost_inr)}, P(on-time) ${opsPlan.confidence_pct}%.`
+                      : "—"}
                   </p>
                 </div>
 
@@ -179,7 +192,9 @@ export function ExecutiveStoryView() {
                     </span>
                   </div>
                   <p className="text-[11px] text-cyan-950 mt-1.5 leading-relaxed">
-                    <strong>Vetoed Plan A!</strong> Proven waste of ₹4.2 Lakhs. Sourced local Peenya Rapid Metals (14 km away, 93.3% reliability) for ₹90,000 + 4h overtime.
+                    {cfoPlan
+                      ? `${cfoPlan.description} — ${lakh(cfoPlan.total_mitigation_cost_inr)}, P(on-time) ${cfoPlan.confidence_pct}%.`
+                      : "—"}
                   </p>
                 </div>
 
@@ -187,16 +202,16 @@ export function ExecutiveStoryView() {
                 <div className="p-2.5 rounded-xl bg-charcoal-900/5 text-[11px] font-mono text-charcoal-700 flex items-center gap-2">
                   <CheckCircle2 className="w-3.5 h-3.5 text-forest shrink-0" />
                   <span>
-                    {rebuttalOccurred
-                      ? "Cyclic rebuttal triggered: Ops conceded to regional sourcing."
-                      : "Dispute arbitrated: Local SME route satisfies SLA safely."}
+                    {rebuttalOccurred && rebuttalNotes.length
+                      ? rebuttalNotes.join(" → ")
+                      : "No rebuttal: the cost-minimal plan raised no reliability or deadline risk."}
                   </span>
                 </div>
               </div>
             </div>
 
             <p className="text-[10px] font-mono text-charcoal-500 mt-4 border-t border-charcoal-900/10 pt-2">
-              LangGraph StateGraph • Conflicting Objective Functions
+              Positions computed by the solver <AiModeBadge className="ml-1" />
             </p>
           </div>
 
@@ -238,27 +253,37 @@ export function ExecutiveStoryView() {
 
                 <div className="grid grid-cols-2 gap-3 pt-2 border-t border-charcoal-900/10">
                   <div>
-                    <span className="text-[10px] font-mono text-charcoal-500 block">Capital ROI</span>
+                    <span className="text-[10px] font-mono text-charcoal-500 block">Penalty ÷ cost</span>
                     <span className="text-sm font-extrabold font-mono text-charcoal-900">
-                      {selectedPlan.roi_multiplier}x Return
+                      {selectedPlan.roi_multiplier}x
+                      {selectedPlan.strategy_type === "SLA_RENEGOTIATION" && " (if client accepts)"}
                     </span>
                   </div>
                   <div>
-                    <span className="text-[10px] font-mono text-charcoal-500 block">SLA Confidence</span>
+                    <span className="text-[10px] font-mono text-charcoal-500 block">Modelled P(on-time)</span>
                     <span className="text-sm font-extrabold font-mono text-forest">
-                      {selectedPlan.confidence_pct}% (Zero Delay)
+                      {selectedPlan.confidence_pct}%
+                      {selectedPlan.confidence_ci_low_pct != null &&
+                        ` (95% CI ${selectedPlan.confidence_ci_low_pct}–${selectedPlan.confidence_ci_high_pct})`}
                     </span>
                   </div>
                 </div>
               </div>
 
               <div className="mt-3 text-[11px] text-charcoal-600 leading-relaxed">
-                ⚖️ <strong>Mathematical Guarantee:</strong> Mixed-Integer Linear Program guarantees zero arithmetic hallucination — calculated in 28ms.
+                ⚖️ <strong>How it was chosen:</strong> lowest expected cost (spend + (1 − P on-time) × penalty) ={" "}
+                {lakh(selectedPlan.expected_cost_inr)}. Solver: {solverMeta?.lp_status || "—"} in {solveDurationMs}ms.
+                Results are only as good as the vendor, cost and lead-time inputs.
+                {!selectedPlan.feasible && (
+                  <span className="block text-coral font-bold mt-1">
+                    ⚠ Capacity exhausted: {selectedPlan.uncovered_units} units uncovered.
+                  </span>
+                )}
               </div>
             </div>
 
             <p className="text-[10px] font-mono text-charcoal-500 mt-4 border-t border-charcoal-900/10 pt-2">
-              COIN-OR CBC / PuLP Solver • Pareto Optimum
+              PuLP MILP (HiGHS/CBC) • 1,000-run Monte Carlo
             </p>
           </div>
 
@@ -277,22 +302,38 @@ export function ExecutiveStoryView() {
 
               <div className="space-y-3">
                 <p className="text-xs text-charcoal-700 leading-relaxed font-medium">
-                  Authorizing this playbook will automatically:
+                  Approving generates drafts — nothing is sent automatically:
                 </p>
                 <ul className="text-xs text-charcoal-800 space-y-2">
                   <li className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-emerald-100 text-emerald-800 flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">✓</span>
-                    <span>Generate Tally Prime XML Purchase Order for Peenya Rapid Metals.</span>
+                    <span>
+                      {selectedPlan.vendor_allocations.length
+                        ? `Tally Prime XML purchase order for ${selectedPlan.vendor_allocations
+                            .map((a) => a.supplier_name.split(" (")[0])
+                            .join(", ")}.`
+                        : "No supplier PO needed for this plan."}
+                    </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-emerald-100 text-emerald-800 flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">✓</span>
-                    <span>Send SMS shift broadcast to Line 1 & 3 supervisors with code <strong>#CZ-OT-4H</strong>.</span>
+                    <span>
+                      {selectedPlan.overtime_hours
+                        ? `Shift notice: ${
+                            Object.entries(selectedPlan.overtime_line_hours ?? {})
+                              .filter(([, h]) => h > 0)
+                              .map(([line, h]) => `${line} ${h}h`)
+                              .join(", ") || `${selectedPlan.overtime_hours}h`
+                          } overtime.`
+                        : "No overtime notice needed."}
+                    </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-emerald-100 text-emerald-800 flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">✓</span>
-                    <span>Deliver formal SLA Protection Guarantee to Ather-Grid Procurement.</span>
+                    <span>Client notice for {ev402?.client || "the client"} stating the modelled on-time probability.</span>
                   </li>
                 </ul>
+                <SourcingPanel />
               </div>
             </div>
 
@@ -303,21 +344,25 @@ export function ExecutiveStoryView() {
                   className="w-full py-4 rounded-2xl font-mono font-extrabold text-xs bg-emerald-600 hover:bg-emerald-700 text-white shadow-lg transition-all active:scale-95 flex items-center justify-center gap-2"
                 >
                   <FileText className="w-4 h-4" />
-                  <span>View Dispatched Tally PO & Receipts</span>
+                  <span>View Draft Tally PO & Notices</span>
                 </button>
               ) : (
                 <button
                   onClick={() => executePlaybook(selectedPlan.id)}
-                  disabled={isExecuting}
-                  className="w-full py-4 rounded-2xl font-mono font-extrabold text-xs bg-acid hover:bg-acid-hover text-charcoal-950 shadow-pill transition-all active:scale-95 flex items-center justify-center gap-2"
+                  disabled={isExecuting || !selectedPlan.feasible}
+                  className="w-full py-4 rounded-2xl font-mono font-extrabold text-xs bg-acid hover:bg-acid-hover text-charcoal-950 shadow-pill transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50"
                 >
                   <Zap className="w-4 h-4 fill-current" />
-                  <span>{isExecuting ? "Generating Tally XML..." : "⚡ APPROVE PLAN B & EXECUTE"}</span>
+                  <span>{isExecuting ? "Generating drafts..." : `⚡ APPROVE ${selectedPlan.id.replace("_", " ")}`}</span>
                 </button>
               )}
-              <p className="text-[10px] font-mono text-center text-charcoal-500">
-                1-Click Industrial Authorization
-              </p>
+              {lastError ? (
+                <p role="alert" className="text-[11px] font-mono text-center text-coral font-bold">
+                  {lastError}
+                </p>
+              ) : (
+                <p className="text-[10px] font-mono text-center text-charcoal-500">Human approval required</p>
+              )}
             </div>
           </div>
         </div>
@@ -353,13 +398,13 @@ export function ExecutiveStoryView() {
           <div className="island-card p-6 border border-white/60">
             <div className="flex items-center justify-between text-xs font-mono text-charcoal-600">
               <span className="font-bold uppercase">Multi-Agent Control</span>
-              <span className="text-forest font-bold">4 AGENTS LIVE</span>
+              <span className="text-forest font-bold">4-STEP PIPELINE</span>
             </div>
             <div className="text-3xl font-extrabold font-mono text-charcoal-900 mt-2">
               0 Violations
             </div>
             <p className="text-xs text-charcoal-600 mt-1">
-              Ready to arbitrate compound logistics & machine bottlenecks in 28 milliseconds.
+              Ready to rank recovery plans when a disruption is reported.
             </p>
           </div>
         </div>

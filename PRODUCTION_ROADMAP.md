@@ -11,7 +11,7 @@
   1. `Blast-Radius Detective`: Unstructured NLP entity extraction + causal SQL blast-radius mapping.
   2. `Operations Hawk`: Max SLA survival heuristic, air charter proponent, overtime maximizer.
   3. `CFO Watchdog`: Margin preservation heuristic, capital optimizer, local SME vendor advocate.
-  4. `Mathematical Arbitrator`: Symbolic PuLP Mixed-Integer Linear Programming (MILP) solver with zero arithmetic hallucination.
+  4. `Mathematical Arbitrator`: PuLP mixed-integer program + Monte Carlo; plans ranked by risk-adjusted expected cost (the LLM never computes numbers).
 - **Opposing Objective Functions:**
   $$\min_{\text{Operations}} \text{DelayHours} \quad \text{vs.} \quad \min_{\text{Finance}} \text{MitigationCostINR}$$
 - **Cyclic Rebuttal Edge:** When disparity exceeds tolerance, the graph loops back, forcing Operations to defend against CFO vetoes.

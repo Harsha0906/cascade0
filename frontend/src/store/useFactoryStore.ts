@@ -84,6 +84,7 @@ export interface PlaybookOption {
   strategy_type: string;
   vendor_allocations: VendorAllocation[];
   overtime_hours: number;
+  overtime_line_hours?: Record<string, number>;   // overtime hours per production line id
   overtime_cost_inr: number;
   supplier_cost_inr: number;
   total_mitigation_cost_inr: number;
@@ -91,12 +92,68 @@ export interface PlaybookOption {
   net_sla_saved_inr: number;
   roi_multiplier: number;
   confidence_pct: number;
+  confidence_ci_low_pct?: number | null;
+  confidence_ci_high_pct?: number | null;
+  p90_finish_hours?: number | null;
+  expected_cost_inr: number;
+  feasible: boolean;
+  uncovered_units: number;
   recommended: boolean;
   badge_label: string;
   description: string;
   tally_po_payload?: any;
   shift_broadcast_msg: string;
   client_sla_notice: string;
+}
+
+export interface AiMode {
+  overall: "llm" | "mixed" | "fallback";
+  model: string | null;
+  note: string;
+  trace: { node: string; mode: string }[];
+}
+
+export interface SolverMeta {
+  lp_status: string;
+  ranking_rule: string;
+  deadline_hours: number;
+  capacity_exhausted: boolean;
+  throughput_gap_units: number;
+}
+
+/** Order statuses that mean a recovery plan has been approved (not that delivery is guaranteed). */
+export const RECOVERY_STATUSES = ["RECOVERY_IN_PROGRESS", "EXTENSION_REQUESTED", "RISK_ACCEPTED", "SLA_PROTECTED"];
+
+export interface Rfq {
+  id: string;
+  round: number;
+  supplier_id: string;
+  supplier_name: string;
+  units_requested: number;
+  expected_unit_price_inr: number;
+  needed_within_hours: number;
+  channel: string;
+  status: "SENT" | "CONFIRMED" | "PARTIAL" | "DECLINED" | "NO_REPLY" | "SEND_FAILED";
+  offered_units: number | null;
+  offered_unit_price_inr: number | null;
+  offered_eta_hours: number | null;
+  reply_text: string;
+  parsed_by: string;
+}
+
+export interface SourcingState {
+  run_id: string;
+  playbook_id: string;
+  status: "ACTIVE" | "COMPLETE" | "COMPLETE_UNCONFIRMED" | "NOTHING_TO_SOURCE";
+  mode: string;
+  round: number;
+  max_rounds: number;
+  reply_timeout_min: number;
+  rfqs: Rfq[];
+  events: string[];
+  sourced_run_id: string | null;
+  playbooks: PlaybookOption[];
+  recommended_plan_id: string | null;
 }
 
 export type FactoryStatusMode = "NORMAL" | "CRISIS" | "PROTECTED";
@@ -117,6 +174,12 @@ interface FactoryState {
   isExecuting: boolean;
   solveDurationMs: number;
   rebuttalOccurred: boolean;
+  rebuttalNotes: string[];
+  aiMode: AiMode | null;
+  solverMeta: SolverMeta | null;
+  lastError: string | null;
+  sourcing: SourcingState | null;
+  isSourcingBusy: boolean;
   executionReceipt: any | null;
   isReceiptModalOpen: boolean;
   selectedNodeData: any | null;
@@ -131,6 +194,9 @@ interface FactoryState {
   initRealtimeSubscriptions: () => () => void;
   simulateCrisis: (scenarioId?: number, customText?: string) => Promise<void>;
   executePlaybook: (playbookId: string) => Promise<void>;
+  startSourcing: () => Promise<void>;
+  refreshSourcing: () => Promise<void>;
+  submitVendorReply: (supplierId: string, text: string) => Promise<void>;
   resetFactory: () => Promise<void>;
   setSelectedNodeData: (data: any) => void;
   closeInspectionDrawer: () => void;
@@ -219,7 +285,21 @@ const INITIAL_EDGES: Edge[] = [
   },
 ];
 
-export const useFactoryStore = create<FactoryState>((set, get) => ({
+export const useFactoryStore = create<FactoryState>((set, get) => {
+  /** Store sourcing state; once the agent finishes, switch the dashboard to the confirmed plan. */
+  const applySourcing = (data: SourcingState) => {
+    set({ sourcing: data });
+    if (data.sourced_run_id && data.playbooks?.length && get().activeRunId !== data.sourced_run_id) {
+      set({
+        activeRunId: data.sourced_run_id,
+        playbooks: data.playbooks,
+        selectedPlaybookId: data.recommended_plan_id,
+      });
+      get().updateNodesAndEdges();
+    }
+  };
+
+  return {
   factoryName: "Apex Volt EV Battery Plant (Bengaluru Unit-2)",
   statusMode: "NORMAL",
   activeScenarioId: null,
@@ -235,6 +315,12 @@ export const useFactoryStore = create<FactoryState>((set, get) => ({
   isExecuting: false,
   solveDurationMs: 0,
   rebuttalOccurred: false,
+  rebuttalNotes: [],
+  aiMode: null,
+  solverMeta: null,
+  lastError: null,
+  sourcing: null,
+  isSourcingBusy: false,
   executionReceipt: null,
   isReceiptModalOpen: false,
   selectedNodeData: null,
@@ -309,7 +395,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => ({
   },
 
   simulateCrisis: async (scenarioId?: number, customText?: string) => {
-    set({ isSimulating: true, activeScenarioId: scenarioId ?? null });
+    set({ isSimulating: true, activeScenarioId: scenarioId ?? null, lastError: null, sourcing: null });
     try {
       const res = await fetch(`${API_BASE}/api/v1/simulate-crisis`, {
         method: "POST",
@@ -320,71 +406,141 @@ export const useFactoryStore = create<FactoryState>((set, get) => ({
           source_channel: "WEB_DASHBOARD",
         }),
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        set({
-          statusMode: "CRISIS",
-          playbooks: data.playbooks || [],
-          selectedPlaybookId: data.recommended_plan_id || null,
-          activeRunId: data.run_id,
-          solveDurationMs: data.solver_result?.solve_duration_ms || 28.5,
-          rebuttalOccurred: data.rebuttal_occurred,
-          isSimulating: false,
-        });
-        await get().fetchInitialState();
-        get().updateNodesAndEdges();
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `Simulation failed (HTTP ${res.status})`);
       }
+      const data = await res.json();
+      const sr = data.solver_result || {};
+      set({
+        statusMode: "CRISIS",
+        playbooks: data.playbooks || [],
+        selectedPlaybookId: data.recommended_plan_id || null,
+        activeRunId: data.run_id,
+        solveDurationMs: sr.solve_duration_ms ?? 0,
+        rebuttalOccurred: !!data.rebuttal_occurred,
+        rebuttalNotes: data.rebuttal_notes || [],
+        aiMode: data.ai_mode || null,
+        solverMeta: {
+          lp_status: sr.lp_status || "",
+          ranking_rule: sr.ranking_rule || "",
+          deadline_hours: sr.deadline_hours ?? 0,
+          capacity_exhausted: !!sr.capacity_exhausted,
+          throughput_gap_units: sr.throughput_gap_units ?? 0,
+        },
+      });
+      await get().fetchInitialState();
+      get().updateNodesAndEdges();
     } catch (err) {
       console.error("Simulation error", err);
+      set({ lastError: err instanceof Error ? err.message : "Simulation failed" });
+    } finally {
       set({ isSimulating: false });
     }
   },
 
   executePlaybook: async (playbookId: string) => {
-    const playbook = get().playbooks.find((p) => p.id === playbookId);
-    if (!playbook) return;
+    const { activeRunId, playbooks } = get();
+    const playbook = playbooks.find((p) => p.id === playbookId);
+    if (!playbook || !activeRunId) return;
 
-    set({ isExecuting: true });
+    set({ isExecuting: true, lastError: null });
     try {
-      const poNum = `PO-APEX-2026-${Math.floor(100 + Math.random() * 900)}`;
+      // The server executes the plan it computed for this run; no costs are sent from the browser.
       const res = await fetch(`${API_BASE}/api/v1/execute-plan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          po_number: poNum,
+          run_id: activeRunId,
           playbook_id: playbook.id,
-          order_id: "EV-402",
-          allocations: playbook.vendor_allocations,
-          overtime_hours: playbook.overtime_hours,
-          total_cost_inr: playbook.total_mitigation_cost_inr,
-          net_sla_saved_inr: playbook.net_sla_saved_inr,
-          confidence_pct: playbook.confidence_pct,
-          client: "Ather-Grid Mobility Corp",
+          approved_by: "dashboard-operator",
         }),
       });
-
-      if (res.ok) {
-        const receipt = await res.json();
-        set({
-          statusMode: "PROTECTED",
-          executionReceipt: receipt,
-          isReceiptModalOpen: true,
-          isExecuting: false,
-        });
-        await get().fetchInitialState();
-        get().updateNodesAndEdges();
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `Execution failed (HTTP ${res.status})`);
       }
+      const receipt = await res.json();
+      set({
+        statusMode: "PROTECTED",
+        executionReceipt: receipt,
+        isReceiptModalOpen: true,
+        selectedPlaybookId: playbook.id,
+      });
+      await get().fetchInitialState();
+      get().updateNodesAndEdges();
     } catch (err) {
       console.error("Execution error", err);
+      set({ lastError: err instanceof Error ? err.message : "Execution failed" });
+    } finally {
       set({ isExecuting: false });
+    }
+  },
+
+  startSourcing: async () => {
+    const { activeRunId, selectedPlaybookId } = get();
+    if (!activeRunId) return;
+    set({ isSourcingBusy: true, lastError: null });
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/sourcing/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_id: activeRunId, playbook_id: selectedPlaybookId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Could not start sourcing (HTTP ${res.status})`);
+      applySourcing(data);
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : "Could not start sourcing" });
+    } finally {
+      set({ isSourcingBusy: false });
+    }
+  },
+
+  refreshSourcing: async () => {
+    const sourcing = get().sourcing;
+    if (!sourcing) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/sourcing/${encodeURIComponent(sourcing.run_id)}`);
+      if (res.ok) applySourcing(await res.json());
+    } catch {
+      // keep last known state; the panel shows it
+    }
+  },
+
+  submitVendorReply: async (supplierId: string, text: string) => {
+    const sourcing = get().sourcing;
+    if (!sourcing || !text.trim()) return;
+    set({ isSourcingBusy: true, lastError: null });
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/sourcing/${encodeURIComponent(sourcing.run_id)}/vendor-reply`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ supplier_id: supplierId, text }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Could not record reply (HTTP ${res.status})`);
+      applySourcing(data);
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : "Could not record reply" });
+    } finally {
+      set({ isSourcingBusy: false });
     }
   },
 
   resetFactory: async () => {
     try {
-      await fetch(`${API_BASE}/api/v1/reset`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/api/v1/reset`, { method: "POST" });
+      if (!res.ok) throw new Error(`Reset failed (HTTP ${res.status})`);
       set({
+        lastError: null,
+        sourcing: null,
+        aiMode: null,
+        solverMeta: null,
+        rebuttalNotes: [],
         statusMode: "NORMAL",
         activeScenarioId: null,
         playbooks: [],
@@ -398,6 +554,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => ({
       get().updateNodesAndEdges();
     } catch (err) {
       console.error("Reset error", err);
+      set({ lastError: err instanceof Error ? err.message : "Reset failed" });
     }
   },
 
@@ -438,7 +595,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => ({
     const selectedPlaybook = playbooks.find((p) => p.id === selectedPlaybookId);
 
     const isCrisis = statusMode === "CRISIS" || l2?.status?.includes("OVERHEAT");
-    const isProtected = statusMode === "PROTECTED" || ev402?.status === "SLA_PROTECTED";
+    const isProtected = statusMode === "PROTECTED" || RECOVERY_STATUSES.includes(ev402?.status ?? "");
 
     // 1. Update Nodes Data
     const updatedNodes = INITIAL_NODES.map((node) => {
@@ -489,7 +646,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => ({
         return {
           ...node,
           data: {
-            status: isProtected ? "OVERTIME_ACTIVE" : isCrisis ? "BUFFER_RESERVE" : "NORMAL",
+            status: isProtected ? "OVERTIME_SCHEDULED" : isCrisis ? "BUFFER_RESERVE" : "NORMAL",
             otHours: selectedPlaybook?.overtime_hours || (isCrisis ? 4 : 0),
             otRate: "₹22,500/hr",
             isCrisis,
@@ -503,10 +660,10 @@ export const useFactoryStore = create<FactoryState>((set, get) => ({
           data: {
             orderId: "EV-402",
             client: ev402?.client || "Ather-Grid Mobility Corp",
-            status: isProtected ? "SLA_PROTECTED" : isCrisis ? "BREACH_RISK" : "ON_TRACK",
+            status: isProtected ? (ev402?.status || "RECOVERY_IN_PROGRESS") : isCrisis ? "BREACH_RISK" : "ON_TRACK",
             shortfall: isProtected ? 0 : ev402?.shortfall_units || (isCrisis ? 150 : 0),
-            penaltyExposure: isProtected ? 0 : isCrisis ? 2500000 : 0,
-            savedInr: isProtected ? (selectedPlaybook?.net_sla_saved_inr || 2320000) : 0,
+            penaltyExposure: isProtected ? 0 : isCrisis ? ev402?.sla_penalty_inr ?? 0 : 0,
+            savedInr: isProtected ? selectedPlaybook?.net_sla_saved_inr ?? 0 : 0,
             isCrisis,
             isProtected,
           },
@@ -546,4 +703,5 @@ export const useFactoryStore = create<FactoryState>((set, get) => ({
 
     set({ nodes: updatedNodes, edges: updatedEdges });
   },
-}));
+};
+});

@@ -25,8 +25,24 @@ interface FactoryStateSummary {
   lastAgentLog: string;
   lastAgentName: string;
   bestPlaybook: string | null;
-  roiMultiplier: number;
 }
+
+interface LatestRun {
+  run_id: string | null;
+  recommended_plan_id?: string;
+  executed?: boolean;
+  winner?: {
+    id: string;
+    description: string;
+    total_mitigation_cost_inr: number;
+    confidence_pct: number;
+    feasible: boolean;
+  } | null;
+  ai_mode?: { overall?: string };
+}
+
+const RECOVERY_STATUSES = ["RECOVERY_IN_PROGRESS", "EXTENSION_REQUESTED", "RISK_ACCEPTED", "SLA_PROTECTED"];
+const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
 
 export default function MobileControllerPage() {
   const [summary, setSummary] = useState<FactoryStateSummary>({
@@ -37,8 +53,8 @@ export default function MobileControllerPage() {
     lastAgentLog: "All systems operating within nominal tolerances.",
     lastAgentName: "Detective",
     bestPlaybook: null,
-    roiMultiplier: 13.9,
   });
+  const [latestRun, setLatestRun] = useState<LatestRun>({ run_id: null });
 
   const [customPrompt, setCustomPrompt] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -54,21 +70,22 @@ export default function MobileControllerPage() {
         const logs = data.agent_logs || [];
         const lastLog = logs.length > 0 ? logs[logs.length - 1] : null;
 
-        const isProtected = ev402?.status === "SLA_PROTECTED";
+        const isProtected = RECOVERY_STATUSES.includes(ev402?.status);
         const isCrisis =
           ev402?.shortfall_units > 0 && !isProtected;
 
         setSummary({
           statusMode: isProtected ? "PROTECTED" : isCrisis ? "CRISIS" : "NORMAL",
           orderClient: ev402 ? `${ev402.client} (#${ev402.order_id})` : "Ather-Grid Mobility Corp (#EV-402)",
-          orderShortfall: ev402?.shortfall_units || (isCrisis ? 150 : 0),
-          contractRiskInr: isProtected ? 0 : isCrisis ? (ev402?.sla_penalty_inr || 2500000) : 0,
+          orderShortfall: ev402?.shortfall_units ?? 0,
+          contractRiskInr: isCrisis ? ev402?.sla_penalty_inr ?? 0 : 0,
           lastAgentLog: lastLog ? lastLog.message : "All systems operating within nominal tolerances.",
           lastAgentName: lastLog ? lastLog.agent_name : "Detective",
-          bestPlaybook: isProtected ? "PLAN B (EXECUTED)" : isCrisis ? "PLAN B (RECOMMENDED)" : null,
-          roiMultiplier: 13.9,
+          bestPlaybook: null,
         });
       }
+      const runRes = await fetch("/api/v1/runs/latest");
+      if (runRes.ok) setLatestRun(await runRes.json());
     } catch {
       // Keep existing state if offline
     }
@@ -90,8 +107,11 @@ export default function MobileControllerPage() {
         body: JSON.stringify({ scenario_id: scenarioId }),
       });
       if (res.ok) {
-        setFeedbackMsg(`✅ Scenario ${scenarioId} dispatched! 4 Agents reasoning...`);
+        const data = await res.json();
+        setFeedbackMsg(`✅ Scenario ${scenarioId} analysed → ${data.recommended_plan_id} recommended.`);
         await refreshState();
+      } else {
+        setFeedbackMsg(`⚠️ Backend error (HTTP ${res.status}).`);
       }
     } catch {
       setFeedbackMsg("⚠️ Could not contact FastAPI backend.");
@@ -109,12 +129,16 @@ export default function MobileControllerPage() {
       const res = await fetch("/api/v1/simulate-crisis", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ custom_text: customPrompt }),
+        body: JSON.stringify({ raw_message: customPrompt, source_channel: "MOBILE_CONTROLLER" }),
       });
       if (res.ok) {
-        setFeedbackMsg("✅ Extracted via Gemini & dispatched to LangGraph!");
+        const data = await res.json();
+        const via = data.extracted_parameters?.source?.startsWith("gemini") ? "Gemini" : "regex fallback (LLM offline)";
+        setFeedbackMsg(`✅ Parsed via ${via} → ${data.recommended_plan_id} recommended.`);
         setCustomPrompt("");
         await refreshState();
+      } else {
+        setFeedbackMsg(`⚠️ Backend error (HTTP ${res.status}).`);
       }
     } catch {
       setFeedbackMsg("⚠️ Error triggering custom disruption.");
@@ -128,8 +152,8 @@ export default function MobileControllerPage() {
     setIsSubmitting(true);
     setFeedbackMsg("Resetting factory to clean seed state...");
     try {
-      await fetch("/api/v1/reset", { method: "POST" });
-      setFeedbackMsg("✅ Factory restored to NORMAL operations.");
+      const res = await fetch("/api/v1/reset", { method: "POST" });
+      setFeedbackMsg(res.ok ? "✅ Factory restored to NORMAL operations." : `⚠️ Reset failed (HTTP ${res.status}).`);
       await refreshState();
     } catch {
       setFeedbackMsg("⚠️ Error resetting factory.");
@@ -140,40 +164,26 @@ export default function MobileControllerPage() {
   };
 
   const executeRecommendedPlan = async () => {
+    if (!latestRun.run_id || !latestRun.recommended_plan_id) return;
     setIsSubmitting(true);
-    setFeedbackMsg("Executing Plan B via Human-In-The-Loop action...");
+    setFeedbackMsg(`Approving ${latestRun.recommended_plan_id}...`);
     try {
-      const poNum = `PO-APEX-2026-${Math.floor(100 + Math.random() * 900)}`;
+      // The server executes the plan it computed for this run; no figures are sent from the phone.
       const res = await fetch("/api/v1/execute-plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          po_number: poNum,
-          playbook_id: "PLAN_B",
-          order_id: "EV-402",
-          allocations: [
-            {
-              supplier_id: "SUP-PNY-02",
-              supplier_name: "Peenya Rapid Metals",
-              tier: "TIER-2",
-              units_allocated: 150,
-              cost_per_unit_inr: 600,
-              flat_charter_cost_inr: 0,
-              total_cost_inr: 90000,
-              lead_time_hours: 4,
-              route: "Peenya (14 km)",
-            },
-          ],
-          overtime_hours: 4,
-          total_cost_inr: 180000,
-          net_sla_saved_inr: 2320000,
-          confidence_pct: 94.2,
-          client: "Ather-Grid Mobility Corp",
+          run_id: latestRun.run_id,
+          playbook_id: latestRun.recommended_plan_id,
+          approved_by: "mobile-controller",
         }),
       });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        setFeedbackMsg("✅ Plan B Executed! Tally PO Dispatched & SLA Protected.");
+        setFeedbackMsg(`✅ ${data.playbook_id} approved. Draft PO ${data.po_number} generated (not sent).`);
         await refreshState();
+      } else {
+        setFeedbackMsg(`⚠️ ${data.detail || `Execution failed (HTTP ${res.status})`}`);
       }
     } catch {
       setFeedbackMsg("⚠️ Execution failed.");
@@ -283,9 +293,11 @@ export default function MobileControllerPage() {
               }`}
             >
               {isCrisis
-                ? "-₹25,00,000"
+                ? `-${inr(summary.contractRiskInr)}`
                 : isProtected
-                ? "₹0 (Saved ₹23.20L)"
+                ? latestRun.winner
+                  ? `${inr(latestRun.winner.total_mitigation_cost_inr)} plan approved`
+                  : "Plan approved"
                 : "₹0 Exposure"}
             </div>
           </div>
@@ -318,21 +330,29 @@ export default function MobileControllerPage() {
               </div>
               <div>
                 <h3 className="text-xs font-extrabold text-charcoal-900 uppercase tracking-wider font-mono">
-                  PuLP LP Solver Ready
+                  {latestRun.recommended_plan_id ? `Recommended: ${latestRun.recommended_plan_id}` : "Awaiting analysis"}
                 </h3>
                 <p className="text-[11px] text-charcoal-700 font-medium">
-                  Plan B: Peenya 150u + 4h OT (₹1.80L mitigation • 13.9x ROI)
+                  {latestRun.winner
+                    ? `${latestRun.winner.description} (${inr(latestRun.winner.total_mitigation_cost_inr)} • P(on-time) ${latestRun.winner.confidence_pct}%)`
+                    : "Run a scenario to get a recommendation."}
                 </p>
               </div>
             </div>
 
             <button
               onClick={executeRecommendedPlan}
-              disabled={isSubmitting}
+              disabled={isSubmitting || !latestRun.run_id || latestRun.executed || latestRun.winner?.feasible === false}
               className="w-full py-3 px-5 rounded-full bg-acid hover:bg-acid-hover text-charcoal-950 font-mono font-extrabold text-xs uppercase tracking-wider flex items-center justify-center gap-2 shadow-pill active:scale-95 transition-all"
             >
               <Zap className="w-4 h-4 fill-charcoal-950" />
-              <span>{isSubmitting ? "Dispatching PO..." : "⚡ [Approve & Dispatch Plan B]"}</span>
+              <span>
+                {isSubmitting
+                  ? "Approving..."
+                  : latestRun.executed
+                  ? "Already approved"
+                  : `⚡ Approve ${latestRun.recommended_plan_id ?? ""}`}
+              </span>
             </button>
           </div>
         )}
@@ -368,7 +388,7 @@ export default function MobileControllerPage() {
                 NH48 Highway flood (48h delay) + Welding Line 2 throttled to 50% @ 89°C.
               </p>
               <span className="text-[10px] text-forest font-bold font-mono mt-1.5 block">
-                → Recommended: Plan B (₹1.80L • 13.9x ROI)
+                → Tap to compute ranked recovery plans
               </span>
             </div>
           </button>
@@ -392,10 +412,10 @@ export default function MobileControllerPage() {
                 </span>
               </div>
               <p className="text-[11px] text-charcoal-700 mt-1 leading-snug font-medium">
-                Line 3 temperature spike (78°C). Minor casing shortfall.
+                6h toll delay + Line 2 slightly throttled (85%). Minor casing shortfall.
               </p>
               <span className="text-[10px] text-forest font-bold font-mono mt-1.5 block">
-                → Recommended: Plan C (2h Overtime @ ₹45k • 55.6x ROI)
+                → Tap to compute ranked recovery plans
               </span>
             </div>
           </button>
@@ -422,7 +442,7 @@ export default function MobileControllerPage() {
                 Chennai supplier transformer explosion. Full 350-unit deficit.
               </p>
               <span className="text-[10px] text-forest font-bold font-mono mt-1.5 block">
-                → Recommended: Multi-tier Split (Peenya 200 + Hosur 150 + 8h OT)
+                → Tap to compute ranked recovery plans
               </span>
             </div>
           </button>
@@ -439,7 +459,7 @@ export default function MobileControllerPage() {
             </h3>
           </div>
           <p className="text-[11px] text-charcoal-600 font-medium leading-snug">
-            Type natural language disruption text. Gemini will extract entities & trigger LangGraph.
+            Type a disruption in plain language. Gemini extracts the numbers when available (regex fallback otherwise); the solver ranks the plans.
           </p>
 
           <textarea

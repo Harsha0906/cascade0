@@ -1,8 +1,24 @@
 -- ============================================================================
 -- CASCADEZERO — Complete PostgreSQL Schema, Realtime Setup & Seed Data
 -- Target: Supabase Cloud PostgreSQL (ap-south-1)
+-- After this file, apply supabase/migrations/001_rls_and_audit.sql (Row-Level Security).
 -- Factory: Apex Volt EV Battery Plant (Bengaluru Unit-2)
 -- ============================================================================
+
+-- ============================================================================
+-- TABLE 0: factories (per-plant constants for the data-driven factory model)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS factories (
+    id                          TEXT PRIMARY KEY,
+    name                        TEXT NOT NULL,
+    stock_item_name             TEXT NOT NULL,
+    qa_dispatch_hours           FLOAT NOT NULL,
+    safety_stock_units          INTEGER NOT NULL,
+    production_hours_in_window  FLOAT NOT NULL
+);
+ALTER TABLE factories ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS factories_read ON factories;
+CREATE POLICY factories_read ON factories FOR SELECT TO anon, authenticated USING (true);
 
 -- ============================================================================
 -- TABLE 1: suppliers
@@ -23,7 +39,15 @@ CREATE TABLE IF NOT EXISTS suppliers (
     weather_risk_pct FLOAT NOT NULL DEFAULT 0.0,
     status          TEXT NOT NULL DEFAULT 'ON_TIME',
     delay_hours     INTEGER NOT NULL DEFAULT 0,
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    factory_id      TEXT,
+    sourcing_role   TEXT,
+    lead_time_sigma_hours FLOAT,
+    delay_shock_min_hours FLOAT,
+    delay_shock_max_hours FLOAT,
+    unreliable_delay_min_hours FLOAT,
+    unreliable_delay_max_hours FLOAT,
+    min_lead_hours  FLOAT
 );
 
 -- ============================================================================
@@ -54,7 +78,9 @@ CREATE TABLE IF NOT EXISTS production_lines (
     overtime_cost_per_hour_inr INTEGER NOT NULL DEFAULT 0,
     extra_units_per_ot_hour INTEGER NOT NULL DEFAULT 0,
     max_ot_hours            INTEGER NOT NULL DEFAULT 0,
-    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    factory_id              TEXT,
+    rated_units_per_hour    FLOAT
 );
 
 -- ============================================================================
@@ -71,7 +97,8 @@ CREATE TABLE IF NOT EXISTS orders (
     partial_delay_penalty_inr INTEGER NOT NULL DEFAULT 0,
     status                  TEXT NOT NULL DEFAULT 'ON_TRACK',
     shortfall_units         INTEGER NOT NULL DEFAULT 0,
-    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    factory_id              TEXT
 );
 
 -- ============================================================================
@@ -122,6 +149,8 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
     shift_broadcast_msg     TEXT NOT NULL DEFAULT '',
     client_sla_notice       TEXT NOT NULL DEFAULT '',
     status                  TEXT NOT NULL DEFAULT 'DRAFT',
+    approved_by             TEXT NOT NULL DEFAULT '',
+    run_id                  TEXT NOT NULL DEFAULT '',
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -129,13 +158,17 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
 -- SEED DATA: Apex Volt EV Battery Plant (Bengaluru Unit-2)
 -- ============================================================================
 
+-- Factory
+INSERT INTO factories (id, name, stock_item_name, qa_dispatch_hours, safety_stock_units, production_hours_in_window)
+VALUES ('apex-volt-blr2', 'Apex Volt EV Battery Plant (Bengaluru Unit-2)', 'Aluminium Battery Casing', 2.5, 50, 16);
+
 -- Suppliers
-INSERT INTO suppliers (id, name, tier, route, part_name, inbound_qty, max_available_qty, extra_cost_per_unit_inr, flat_charter_cost_inr, lead_time_hours, traffic_risk_pct, weather_risk_pct, status, delay_hours)
+INSERT INTO suppliers (id, name, tier, route, part_name, inbound_qty, max_available_qty, extra_cost_per_unit_inr, flat_charter_cost_inr, lead_time_hours, traffic_risk_pct, weather_risk_pct, status, delay_hours, factory_id, sourcing_role, lead_time_sigma_hours, delay_shock_min_hours, delay_shock_max_hours, unreliable_delay_min_hours, unreliable_delay_max_hours, min_lead_hours)
 VALUES
-    ('SUP-CHN-01', 'Chennai Precision Casings Ltd', 'TIER-1', 'NH48 Chennai-Bengaluru Highway', 'Aluminum Battery Casings', 500, 500, 0, 0, 12, 5.0, 0.0, 'ON_TIME', 0),
-    ('SUP-PNY-02', 'Peenya Rapid Metals (Local SME Vendor)', 'TIER-2', 'Peenya Industrial Area (14 km)', 'Aluminum Battery Casings', 0, 200, 600, 0, 4, 6.0, 0.0, 'STANDBY', 0),
-    ('SUP-HSR-03', 'Hosur Precision Castings', 'TIER-3', 'Hosur Industrial Corridor (42 km)', 'Aluminum Battery Casings', 0, 180, 850, 0, 8, 8.0, 0.0, 'STANDBY', 0),
-    ('SUP-AIR-04', 'BlueDart Aviation Charter', 'EMERGENCY-AIR', 'HAL/KEMPEGOWDA Air Cargo Corridor', 'Aluminum Battery Casings', 0, 500, 0, 600000, 6, 0.0, 2.0, 'STANDBY', 0);
+    ('SUP-CHN-01', 'Chennai Precision Casings Ltd', 'TIER-1', 'NH48 Chennai-Bengaluru Highway', 'Aluminum Battery Casings', 500, 500, 0, 0, 12, 5.0, 0.0, 'ON_TIME', 0, 'apex-volt-blr2', 'PRIMARY', 1.0, 1.0, 3.0, 2.0, 4.0, 8.0),
+    ('SUP-PNY-02', 'Peenya Rapid Metals (Local SME Vendor)', 'TIER-2', 'Peenya Industrial Area (14 km)', 'Aluminum Battery Casings', 0, 200, 600, 0, 4, 6.0, 0.0, 'STANDBY', 0, 'apex-volt-blr2', 'BACKUP', 0.45, 1.0, 2.5, 1.5, 3.0, 2.0),
+    ('SUP-HSR-03', 'Hosur Precision Castings', 'TIER-3', 'Hosur Industrial Corridor (42 km)', 'Aluminum Battery Casings', 0, 180, 850, 0, 8, 8.0, 0.0, 'STANDBY', 0, 'apex-volt-blr2', 'BACKUP', 1.1, 2.0, 4.0, 2.5, 5.0, 4.0),
+    ('SUP-AIR-04', 'BlueDart Aviation Charter', 'EMERGENCY-AIR', 'HAL/KEMPEGOWDA Air Cargo Corridor', 'Aluminum Battery Casings', 0, 500, 0, 600000, 6, 0.0, 2.0, 'STANDBY', 0, 'apex-volt-blr2', 'EXPEDITE', 0.25, 1.0, 2.0, 1.0, 2.0, 4.5);
 
 -- Vendor History (Episodic Memory)
 INSERT INTO vendor_history (supplier_id, past_orders_count, on_time_deliveries, reliability_score_pct, quality_rejection_rate_pct, last_incident_note)
@@ -146,21 +179,22 @@ VALUES
     ('SUP-AIR-04', 5, 5, 98.5, 0.0, 'Guaranteed priority airfreight slot; high flat charter fee.');
 
 -- Production Lines
-INSERT INTO production_lines (line_id, name, status, speed_pct, temp_celsius, daily_capacity_units, overtime_cost_per_hour_inr, extra_units_per_ot_hour, max_ot_hours)
+INSERT INTO production_lines (line_id, name, status, speed_pct, temp_celsius, daily_capacity_units, overtime_cost_per_hour_inr, extra_units_per_ot_hour, max_ot_hours, factory_id, rated_units_per_hour)
 VALUES
-    ('LINE-1', 'Robotic Welding Line 1', 'NORMAL', 100, 61.0, 200, 22500, 38, 8),
-    ('LINE-2', 'Robotic Welding Line 2', 'NORMAL', 100, 62.0, 200, 0, 0, 0),
-    ('LINE-3', 'Robotic Welding Line 3', 'NORMAL', 100, 60.0, 150, 22500, 38, 8);
+    ('LINE-1', 'Robotic Welding Line 1', 'NORMAL', 100, 61.0, 200, 11250, 19, 8, 'apex-volt-blr2', 19),
+    ('LINE-2', 'Robotic Welding Line 2', 'NORMAL', 100, 62.0, 200, 0, 0, 0, 'apex-volt-blr2', 19),
+    ('LINE-3', 'Robotic Welding Line 3', 'NORMAL', 100, 60.0, 150, 11250, 19, 8, 'apex-volt-blr2', 14);
 
 -- Orders
-INSERT INTO orders (order_id, client, required_qty, deadline_label, hours_remaining, sla_penalty_inr, partial_delay_penalty_inr, status, shortfall_units)
+INSERT INTO orders (order_id, client, required_qty, deadline_label, hours_remaining, sla_penalty_inr, partial_delay_penalty_inr, status, shortfall_units, factory_id)
 VALUES
-    ('EV-402', 'Ather-Grid Mobility Corp', 500, 'Friday 17:00 IST (38 Hours Remaining)', 38, 2500000, 500000, 'ON_TRACK', 0),
-    ('EV-405', 'Deccan E-Fleet Logistics', 300, 'Monday 12:00 IST (110 Hours Remaining)', 110, 1000000, 200000, 'ON_TRACK', 0);
+    ('EV-402', 'Ather-Grid Mobility Corp', 500, 'Friday 17:00 IST (38 Hours Remaining)', 38, 2500000, 500000, 'ON_TRACK', 0, 'apex-volt-blr2'),
+    ('EV-405', 'Deccan E-Fleet Logistics', 300, 'Monday 12:00 IST (110 Hours Remaining)', 110, 1000000, 200000, 'ON_TRACK', 0, 'apex-volt-blr2');
 
 -- ============================================================================
 -- SUPABASE REALTIME: Enable postgres_changes on all 7 tables
 -- ============================================================================
+ALTER PUBLICATION supabase_realtime ADD TABLE factories;
 ALTER PUBLICATION supabase_realtime ADD TABLE suppliers;
 ALTER PUBLICATION supabase_realtime ADD TABLE vendor_history;
 ALTER PUBLICATION supabase_realtime ADD TABLE production_lines;

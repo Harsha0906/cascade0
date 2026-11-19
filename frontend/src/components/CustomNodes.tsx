@@ -104,7 +104,7 @@ export const BackupVendorNode = memo(({ data }: any) => {
           }`}
         >
           <Clock className="w-3 h-3" />
-          {isProtected ? "PO DISPATCHED" : isCrisis ? "RECOVERY READY" : "STANDBY (14 KM)"}
+          {isProtected ? "PO DRAFTED" : isCrisis ? "RECOVERY READY" : "STANDBY (14 KM)"}
         </span>
       </div>
 
@@ -307,7 +307,7 @@ ParallelBufferNode.displayName = "ParallelBufferNode";
 // ─── Node 5: Order #EV-402 SLA Contract (Right) ─────────────────────────────
 export const OrderSlaNode = memo(({ data }: any) => {
   const setSelectedNodeData = useFactoryStore((s) => s.setSelectedNodeData);
-  const isProtected = data.isProtected || data.status === "SLA_PROTECTED";
+  const isProtected = data.isProtected || ["SLA_PROTECTED", "RECOVERY_IN_PROGRESS", "EXTENSION_REQUESTED"].includes(data.status);
   const isCrisis = !isProtected && (data.isCrisis || data.status === "BREACH_RISK");
 
   return (
@@ -386,7 +386,7 @@ export const OrderSlaNode = memo(({ data }: any) => {
                 : "text-forest-deep"
             }`}
           >
-            {isProtected ? "0 Units (Mitigated)" : isCrisis ? `-${data.shortfall || 150} Casings` : "0 Casings"}
+            {isProtected ? "Recovery plan approved" : isCrisis ? `-${data.shortfall ?? 0} Casings` : "0 Casings"}
           </span>
         </div>
 
@@ -402,9 +402,9 @@ export const OrderSlaNode = memo(({ data }: any) => {
             }`}
           >
             {isProtected
-              ? `₹0 (Saved ₹${(data.savedInr / 100000 || 23.2).toFixed(1)}L)`
+              ? "Mitigation approved"
               : isCrisis
-              ? "-₹25,00,000"
+              ? `-₹${(data.penaltyExposure ?? 0).toLocaleString("en-IN")}`
               : "₹0 Risk"}
           </span>
         </div>

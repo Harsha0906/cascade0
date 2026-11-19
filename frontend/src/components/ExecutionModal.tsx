@@ -19,79 +19,13 @@ export function ExecutionModal({
   isOpen: boolean;
   onClose: () => void;
 }) {
-  const { executionReceipt, selectedPlaybookId } = useFactoryStore();
+  const { executionReceipt } = useFactoryStore();
   const [activeTab, setActiveTab] = useState<"tally" | "whatsapp" | "sla">("tally");
   const [copiedType, setCopiedType] = useState<string | null>(null);
 
-  if (!isOpen && !executionReceipt) return null;
-
-  const receipt = executionReceipt || {
-    po_number: "PO-APEX-2026-889",
-    playbook_id: selectedPlaybookId || "PLAN_B",
-    order_id: "EV-402",
-    tally_xml_payload: `<ENVELOPE>
-  <HEADER>
-    <TALLYREQUEST>Import Data</TALLYREQUEST>
-  </HEADER>
-  <BODY>
-    <IMPORTDATA>
-      <REQUESTDESC>
-        <REPORTNAME>Vouchers</REPORTNAME>
-      </REQUESTDESC>
-      <REQUESTDATA>
-        <TALLYMESSAGE xmlns:UDF="TallyUDF">
-          <VOUCHER VCHTYPE="Purchase Order" ACTION="Create">
-            <VOUCHERNUMBER>PO-APEX-2026-889</VOUCHERNUMBER>
-            <DATE>20261108</DATE>
-            <PARTYNAME>Peenya Rapid Metals</PARTYNAME>
-            <NARRATION>CascadeZero Emergency PO: Plan B | Shortfall Mitigation</NARRATION>
-            <INVENTORYALLOCATIONS.LIST>
-              <STOCKITEMNAME>Aluminum Battery Casings</STOCKITEMNAME>
-              <RATE>₹600</RATE>
-              <ACTUALQTY>150 Nos</ACTUALQTY>
-              <BILLEDQTY>150 Nos</BILLEDQTY>
-              <AMOUNT>₹90,000</AMOUNT>
-            </INVENTORYALLOCATIONS.LIST>
-            <BASICBUYERADDRESS>Unit-2, Peenya Industrial Area, Bengaluru - 560058</BASICBUYERADDRESS>
-          </VOUCHER>
-        </TALLYMESSAGE>
-      </REQUESTDATA>
-    </IMPORTDATA>
-  </BODY>
-</ENVELOPE>`,
-    tally_json_payload: {
-      voucher_type: "Purchase Order",
-      po_number: "PO-APEX-2026-889",
-      date: "2026-11-08",
-      company: "Apex Volt EV Battery Plant (Bengaluru Unit-2)",
-      total_cost_inr: 180000,
-      allocations: [
-        { supplier_name: "Peenya Rapid Metals", units_allocated: 150, cost_per_unit_inr: 600 }
-      ],
-      overtime_hours: 4
-    },
-    shift_broadcast_msg: `🚨 *CASCADEZERO SHIFT OVERTIME DISPATCH NOTICE*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• *Facility:* Apex Volt Unit-2 (Bengaluru)
-• *Target Lines:* Robotic Welding Lines 1 & 3 (Parallel)
-• *Mandated Overtime:* *4 Hours* (Shift Ext. to 21:00 IST)
-• *Target Production:* *150 Battery Casings*
-• *Overtime Rate:* Approved @ ₹22,500/hr factory cost
-• *Priority Order:* Ather-Grid Mobility Corp (#EV-402)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Floor supervisors please log supervisor confirmation code: *#CZ-OT-4H*.`,
-    client_sla_notice: `📄 *OFFICIAL SLA COMPLIANCE & DISPATCH CONFIRMATION*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• *Client:* Ather-Grid Mobility Corp
-• *Order ID:* #EV-402
-• *Committed Deadline:* Friday 17:00 IST (38h Remaining)
-• *Status:* 100% ON-TRACK (SLA Penalty Shield Active)
-• *Mitigation Protocol:* CascadeZero Automated Re-Route Enacted
-• *Dispatched Casings:* 500/500 units verified in line buffer
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Apex Volt Operational Crisis Control Tower — Zero Penalty Breach.`,
-    executed_at: new Date().toISOString(),
-  };
+  // Only real, server-generated receipts are shown — no canned fallback.
+  if (!isOpen || !executionReceipt) return null;
+  const receipt = executionReceipt;
 
   const downloadXml = () => {
     const blob = new Blob([receipt.tally_xml_payload], { type: "application/xml" });
@@ -138,7 +72,7 @@ Apex Volt Operational Crisis Control Tower — Zero Penalty Breach.`,
                 </span>
               </h2>
               <p className="text-xs text-charcoal-600 font-medium">
-                Transaction committed to Supabase • Dispatched to Accounting, Floor & Client
+                Approval recorded • Drafts below are NOT sent — review, then send through your normal channels
               </p>
             </div>
           </div>
@@ -230,7 +164,7 @@ Apex Volt Operational Crisis Control Tower — Zero Penalty Breach.`,
             <div className="space-y-3 font-mono text-xs">
               <div className="flex items-center justify-between">
                 <span className="text-charcoal-600 text-[11px] font-medium">
-                  Automated floor supervisor dispatch for Robotic Welding Lines 1 & 3
+                  Draft shift notice for Lines 1 & 3 supervisors (copy and send)
                 </span>
                 <button
                   onClick={() => copyText(receipt.shift_broadcast_msg, "whatsapp")}
@@ -256,7 +190,7 @@ Apex Volt Operational Crisis Control Tower — Zero Penalty Breach.`,
             <div className="space-y-3 font-mono text-xs">
               <div className="flex items-center justify-between">
                 <span className="text-charcoal-600 text-[11px] font-medium">
-                  Official SLA Compliance Certificate dispatched to Ather-Grid Mobility Corp
+                  Draft client notice (copy and send after supplier confirmation)
                 </span>
                 <button
                   onClick={() => copyText(receipt.client_sla_notice, "sla")}

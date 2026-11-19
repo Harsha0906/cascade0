@@ -147,11 +147,11 @@ export function CrisisSandboxModal() {
                       Scenario A: NH48 Highway Inundation + Machine Overheat
                     </h4>
                     <p className="text-[11px] text-charcoal-600 mt-0.5">
-                      150 unit deficit on Ather-Grid #EV-402 (+48h delay). Solves for Plan B regional SME re-routing (Peenya).
+                      150 unit deficit on Ather-Grid #EV-402 (+48h delay), Line 2 at 50%.
                     </p>
                     <div className="flex items-center gap-2 mt-2 text-[10px] font-mono text-charcoal-500">
                       <span className="px-2 py-0.5 rounded bg-charcoal-900/5">SLA Risk: ₹25.0L</span>
-                      <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">Expected ROI: 13.9x</span>
+                      <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">Plans computed on run</span>
                     </div>
                   </div>
                 </div>

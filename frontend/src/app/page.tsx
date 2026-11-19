@@ -37,7 +37,7 @@ export default function CommandCenterPage() {
       {/* 2. SME Multi-Channel Ingestion Bar */}
       <WebhookBar />
 
-      {/* 3. 4-Agent Autonomous Pipeline Status Strip */}
+      {/* 3. 4-Step Agent Pipeline Status Strip */}
       <AgentPipelineStrip />
 
       {/* 4. Conditional View: Executive Story View vs 2.5D Digital Twin Studio */}
@@ -94,7 +94,7 @@ export default function CommandCenterPage() {
       {/* 5. Custom Crisis Scenario Studio Modal */}
       <CrisisSandboxModal />
 
-      {/* 6. HITL Execution & Dispatched PO / Notices Modal */}
+      {/* 6. HITL Approval & Draft PO / Notices Modal */}
       <ExecutionModal
         isOpen={isReceiptModalOpen}
         onClose={closeReceiptModal}

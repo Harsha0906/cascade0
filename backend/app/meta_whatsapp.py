@@ -49,6 +49,46 @@ def send_whatsapp_text(to_number: str, text: str) -> bool:
         return False
 
 
+def send_whatsapp_template(
+    to_number: str,
+    template_name: str,
+    body_params: List[str],
+    language: str = "en",
+) -> bool:
+    """
+    Sends an approved message template. Required for business-initiated messages to anyone who
+    has not messaged this number in the last 24 hours (e.g. a first enquiry to a supplier).
+    """
+    if not settings.META_WA_ACCESS_TOKEN or not settings.META_WA_PHONE_NUMBER_ID:
+        logger.warning("Meta WhatsApp credentials not set. Template %s not sent.", template_name)
+        return False
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{settings.META_WA_PHONE_NUMBER_ID}/messages"
+    template: Dict[str, Any] = {"name": template_name, "language": {"code": language}}
+    if body_params:
+        template["components"] = [{
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(p)[:1000]} for p in body_params],
+        }]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number.replace("+", "").strip(),
+        "type": "template",
+        "template": template,
+    }
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(url, json=payload,
+                               headers={"Authorization": f"Bearer {settings.META_WA_ACCESS_TOKEN}"})
+        if resp.status_code in (200, 201):
+            logger.info("✅ Meta WhatsApp template %s sent to %s", template_name, to_number)
+            return True
+        logger.error("❌ Meta WhatsApp template error %s: %s", resp.status_code, resp.text)
+        return False
+    except Exception as exc:
+        logger.error("❌ Meta WhatsApp HTTP Exception: %s", exc)
+        return False
+
+
 def send_whatsapp_interactive_buttons(
     to_number: str,
     body_text: str,
