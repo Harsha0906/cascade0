@@ -50,7 +50,8 @@ INSERT INTO schema_migrations (version) VALUES (1), (2), (3), (4) ON CONFLICT DO
 
 -- ----------------------------------------------------------------------------
 -- execute_plan_tx: the atomic execution path. One function call = one transaction;
--- any exception rolls back every write. The receipt insert comes first, so a
+-- any exception rolls back every write. p_agent_log may be a single agent_logs row object
+-- or an array of row objects (NULL/other -> no rows). The receipt insert comes first, so a
 -- duplicate root_run_id raises unique_violation before anything else is written.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION execute_plan_tx(
@@ -112,7 +113,12 @@ BEGIN
      WHERE line_id = ANY (COALESCE(p_overtime_line_ids, ARRAY[]::TEXT[]));
 
     -- 6. Agent log rows (id is SERIAL: omitted so its default applies).
-    FOR log_item IN SELECT * FROM jsonb_array_elements(COALESCE(p_agent_log, '[]'::jsonb))
+    FOR log_item IN SELECT * FROM jsonb_array_elements(
+        CASE jsonb_typeof(p_agent_log)
+            WHEN 'object' THEN jsonb_build_array(p_agent_log)
+            WHEN 'array'  THEN p_agent_log
+            ELSE '[]'::jsonb
+        END)
     LOOP
         log_rec := jsonb_populate_record(NULL::agent_logs, log_item);
         INSERT INTO agent_logs (
