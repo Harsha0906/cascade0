@@ -202,7 +202,7 @@ The planner's vendor numbers are assumptions; the Sourcing Agent replaces them w
 Only one PO can ever be created per analysis — the original run and its sourced re-plan share an idempotency key.
 Apply `supabase/migrations/002_sourcing_agent.sql` for vendor numbers and the enquiry audit table, then `supabase/migrations/003_factory_model.sql` (must be applied after 002) for the per-factory model the planner reads.
 
-Known limits: WhatsApp messages are de-duplicated by Meta message id and recorded before processing, so a retry of a message whose processing failed is dropped (the sender is told to resend) rather than risk running an approval twice.
+Known limits: WhatsApp messages are de-duplicated by Meta message id and recorded before processing, so a replayed approval or vendor reply never runs twice. If processing fails unexpectedly after recording (database error or other exception) the id is released and the webhook returns 503/500, so Meta's retry is processed; messages that were handled (including error replies sent to the sender) stay recorded.
 Sourcing sessions use optimistic concurrency (`version` column; 409 after 3 conflicting retries), but multiple backend workers are not yet supported for sourcing.
 
 ## 🔐 Security Setup

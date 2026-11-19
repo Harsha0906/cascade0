@@ -46,6 +46,28 @@ ALTER TABLE execution_receipts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_events     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE schema_migrations  ENABLE ROW LEVEL SECURITY;
 
+-- Prerequisite guard: this migration claims levels 1-3 as applied, so refuse to run unless
+-- 001 (purchase_orders.run_id / approved_by), 002 (suppliers.whatsapp_number) and
+-- 003 (factories table) are really present. Re-run safe (read-only check).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'purchase_orders' AND column_name = 'run_id')
+       OR NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'purchase_orders' AND column_name = 'approved_by') THEN
+        RAISE EXCEPTION 'Migration 001 not applied (purchase_orders.run_id / approved_by missing); apply 001-003 before 004';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'suppliers' AND column_name = 'whatsapp_number') THEN
+        RAISE EXCEPTION 'Migration 002 not applied (suppliers.whatsapp_number missing); apply 001-003 before 004';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'factories') THEN
+        RAISE EXCEPTION 'Migration 003 not applied (table factories missing); apply 001-003 before 004';
+    END IF;
+END
+$$;
+
 INSERT INTO schema_migrations (version) VALUES (1), (2), (3), (4) ON CONFLICT DO NOTHING;
 
 -- ----------------------------------------------------------------------------
@@ -65,6 +87,7 @@ CREATE OR REPLACE FUNCTION execute_plan_tx(
     p_receipt            JSONB
 ) RETURNS JSONB
 LANGUAGE plpgsql
+SET search_path = public
 AS $$
 DECLARE
     po_rec   purchase_orders;
@@ -81,7 +104,8 @@ BEGIN
         p_receipt
     );
 
-    -- 2. Purchase order (explicit column list so table defaults are never overridden).
+    -- 2. Purchase order. Every column is read from p_po: a key missing from it becomes NULL and
+    --    violates NOT NULL (the caller always sends them all); only created_at falls back to its default.
     po_rec := jsonb_populate_record(NULL::purchase_orders, p_po);
     INSERT INTO purchase_orders (
         po_number, playbook_id, order_id, vendor_allocations_json, overtime_hours,
@@ -96,6 +120,9 @@ BEGIN
 
     -- 3. Order status.
     UPDATE orders SET status = p_order_status, updated_at = NOW() WHERE order_id = p_order_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'order % not found', p_order_id;  -- rolls back the receipt and PO too
+    END IF;
 
     -- 4. Suppliers: [{supplier_id, inbound_qty}] -> PO_DRAFTED.
     FOR upd IN SELECT * FROM jsonb_array_elements(COALESCE(p_supplier_updates, '[]'::jsonb))

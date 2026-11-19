@@ -374,14 +374,28 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     msg = messages[0]
     sender = msg.get("from", "")
 
-    # De-duplicate Meta retries/redeliveries. Recorded before processing: a retry of a message
-    # whose processing failed is dropped (the sender is told to resend), but a replayed approval
-    # or vendor reply can never run twice.
+    # De-duplicate Meta retries/redeliveries. The id is recorded before processing so a replayed
+    # approval or vendor reply can never run twice. If processing then fails unexpectedly (database
+    # error or any other exception) the id is released again and the error re-raised (503/500), so
+    # Meta's retry is processed rather than dropped as a duplicate. Handled outcomes (replies already
+    # sent, including error replies) keep the id recorded.
     message_id = msg.get("id")
     if message_id and not await run_in_threadpool(db.record_webhook_event, str(message_id)):
         logger.info("Duplicate WhatsApp message %s ignored", message_id)
         return {"status": "duplicate"}
 
+    try:
+        return await _process_meta_message(msg, sender)
+    except Exception:
+        if message_id:
+            try:
+                await run_in_threadpool(db.release_webhook_event, str(message_id))
+            except Exception:
+                logger.exception("Could not release webhook event %s after a processing failure", message_id)
+        raise
+
+
+async def _process_meta_message(msg: Dict[str, Any], sender: str) -> Dict[str, Any]:
     if msg.get("type") == "interactive":
         button_id = msg.get("interactive", {}).get("button_reply", {}).get("id", "")
         if button_id.startswith("APPROVE:"):
@@ -406,7 +420,7 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
             return {"status": "success", "action": "plan_executed"}
         if button_id == "VIEW_STATUS":
-            await run_in_threadpool(send_whatsapp_text, sender, _status_text())
+            await run_in_threadpool(send_whatsapp_text, sender, await run_in_threadpool(_status_text))
             return {"status": "success", "action": "status_sent"}
         return {"status": "ignored"}
 
@@ -414,7 +428,7 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not body_text:
         return {"status": "ignored"}
 
-    open_rfq = sourcing.find_open_rfq_by_number(sender)
+    open_rfq = await run_in_threadpool(sourcing.find_open_rfq_by_number, sender)
     if open_rfq:
         run_id, supplier_id = open_rfq
         try:
@@ -429,7 +443,7 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         await run_in_threadpool(send_whatsapp_text, sender, "🙏 Thank you — your reply has been recorded. This is not yet a purchase order.")
         return {"status": "success", "action": "vendor_reply_recorded", "run_id": run_id}
     if body_text.lower() in ("status", "plant", "check"):
-        await run_in_threadpool(send_whatsapp_text, sender, _status_text())
+        await run_in_threadpool(send_whatsapp_text, sender, await run_in_threadpool(_status_text))
         return {"status": "ok"}
 
     try:

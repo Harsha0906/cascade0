@@ -28,11 +28,13 @@ def save_run(result: Dict[str, Any]) -> None:
         payload = json.loads(json.dumps(payload))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"run payload is not JSON-serialisable: {exc}") from exc
+    existing = db.fetch_by_id(_TABLE, "run_id", result["run_id"])  # a re-save keeps the original created_at
+    created_at = (existing or {}).get("created_at") or datetime.now(timezone.utc).isoformat()
     db.upsert_row(_TABLE, {
         "run_id": result["run_id"],
         "parent_run_id": result.get("parent_run_id"),
         "factory_id": result.get("factory_id") or (model.factory_id if isinstance(model, FactoryModel) else None),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": created_at,
         "payload": payload,
     })
 
@@ -48,5 +50,5 @@ def get_run(run_id: str) -> Optional[Dict[str, Any]]:
 
 
 def latest_run_id() -> Optional[str]:
-    rows = db.fetch_ordered(_TABLE, "created_at", desc=True, limit=1)
+    rows = db.fetch_ordered(_TABLE, "created_at", desc=True, limit=1, tiebreak="run_id")
     return rows[0]["run_id"] if rows else None

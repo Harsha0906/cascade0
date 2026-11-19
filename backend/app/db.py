@@ -301,6 +301,7 @@ _mirror = InMemoryMirror()
 
 # ─── Supabase Client ───────────────────────────────────────────────────────
 _supabase_client = None
+_warned_offline = False
 
 
 class DatabaseError(RuntimeError):
@@ -323,11 +324,13 @@ def _get_supabase():
     Returns None only in offline mode (no credentials). When credentials are
     configured but the client cannot be created, raises DatabaseError.
     """
-    global _supabase_client
+    global _supabase_client, _warned_offline
     if _supabase_client is not None:
         return _supabase_client
     if not settings.has_supabase:
-        logger.warning("⚠ Supabase credentials not configured — using in-memory mirror")
+        if not _warned_offline:
+            _warned_offline = True
+            logger.warning("⚠ Supabase credentials not configured — using in-memory mirror")
         return None
     try:
         from supabase import create_client
@@ -374,20 +377,17 @@ def fetch_by_id(table_name: str, pk_column: str, pk_value: str) -> dict[str, Any
 
 
 def fetch_ordered(
-    table_name: str, order_column: str, *, desc: bool = True, limit: int = 1
+    table_name: str, order_column: str, *, desc: bool = True, limit: int = 1, tiebreak: str | None = None
 ) -> list[dict[str, Any]]:
     """Fetch up to `limit` rows ordered by a column. Offline mode orders the mirror
     (ties keep insertion order, so the last inserted row is newest)."""
     client = _get_supabase()
     if client is not None:
         try:
-            response = (
-                client.table(table_name)
-                .select("*")
-                .order(order_column, desc=desc)
-                .limit(limit)
-                .execute()
-            )
+            query = client.table(table_name).select("*").order(order_column, desc=desc)
+            if tiebreak:
+                query = query.order(tiebreak, desc=desc)
+            response = query.limit(limit).execute()
             return response.data or []
         except Exception as exc:
             raise _fail("fetch_ordered", table_name, exc) from exc
@@ -559,6 +559,20 @@ def record_webhook_event(message_id: str) -> bool:
         return True
 
 
+def release_webhook_event(message_id: str) -> None:
+    """Forget a recorded Meta message id so that Meta's retry is processed again.
+    Used when processing failed after record_webhook_event. Failures raise DatabaseError."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            client.table("webhook_events").delete().eq("message_id", message_id).execute()
+        except Exception as exc:
+            raise _fail("delete", "webhook_events", exc) from exc
+        return
+    with _conditional_lock:
+        _mirror.webhook_events[:] = [r for r in _mirror.webhook_events if r["message_id"] != message_id]
+
+
 def call_function(name: str, params: dict[str, Any]) -> Any:
     """Call a Postgres function via supabase rpc. Not available offline."""
     client = _get_supabase()
@@ -633,6 +647,9 @@ def execute_plan_tx(
         }, root_run_id)
 
     # Offline: all-or-nothing on the mirror, same write order as the SQL function.
+    # NOTE (offline/demo only): rollback restores snapshots of whole _EXECUTION_TABLES, so a
+    # concurrent writer that does not hold _execute_lock (e.g. Sourcing's agent_logs) can have
+    # its rows erased by a rollback. The live path is a real transaction and has no such issue.
     with _execute_lock:
         mirror = _mirror
         snapshot = {t: copy.deepcopy(mirror.get_table(t)) for t in _EXECUTION_TABLES}
@@ -647,7 +664,8 @@ def execute_plan_tx(
             })
             insert_row("purchase_orders", dict(po))
             now = datetime.now(timezone.utc).isoformat()
-            update_rows("orders", "order_id", order_id, {"status": order_status, "updated_at": now})
+            if not update_rows("orders", "order_id", order_id, {"status": order_status, "updated_at": now}):
+                raise DatabaseError("update", "orders")  # mirrors the SQL IF NOT FOUND; rolls back below
             for upd in supplier_updates:
                 update_rows("suppliers", "id", upd["supplier_id"], {
                     "status": "PO_DRAFTED", "inbound_qty": upd["inbound_qty"], "updated_at": now,
@@ -815,11 +833,9 @@ def reset_to_seed() -> dict[str, str]:
 
     try:
         # Clear dynamic tables
-        for tbl in ["purchase_orders", "agent_logs", "disruption_events"]:
-            try:
-                client.table(tbl).delete().gte("id", 0).execute()
-            except Exception:
-                client.table(tbl).delete().neq("po_number", "___none___").execute()
+        client.table("purchase_orders").delete().neq("po_number", "___none___").execute()
+        for tbl in ("agent_logs", "disruption_events"):  # SERIAL integer id
+            client.table(tbl).delete().gte("id", 0).execute()
         try:
             client.table("sourcing_rfqs").delete().neq("id", "").execute()
         except Exception as exc:
