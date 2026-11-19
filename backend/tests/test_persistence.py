@@ -187,6 +187,25 @@ class SourcingPersistenceTests(unittest.TestCase):
                                  json={"supplier_id": "SUP-PNY-02", "text": "YES"}, headers=KEY)
         self.assertEqual(r.status_code, 409)
 
+    def test_insert_race_loser_gets_concurrent_update_error(self):
+        sim = self._simulate(1)
+        self._start(sim["run_id"])
+        s = sourcing_store.load(sim["run_id"])
+        s.version = 0   # pretend a fresh session racing the winner's insert
+        row = db.fetch_by_id("sourcing_sessions", "run_id", sim["run_id"])
+        with mock.patch.object(db, "fetch_by_id", side_effect=[None, row]),                 mock.patch.object(db, "insert_row", side_effect=db.DatabaseError("insert", "sourcing_sessions")):
+            with self.assertRaises(sourcing_store.ConcurrentUpdateError):
+                sourcing_store.save(s)
+
+    def test_insert_failure_without_row_reraises(self):
+        sim = self._simulate(1)
+        self._start(sim["run_id"])
+        s = sourcing_store.load(sim["run_id"])
+        s.version = 0
+        with mock.patch.object(db, "fetch_by_id", return_value=None),                 mock.patch.object(db, "insert_row", side_effect=db.DatabaseError("insert", "sourcing_sessions")):
+            with self.assertRaises(db.DatabaseError):
+                sourcing_store.save(s)
+
     def test_session_round_trips_and_active_lists_it(self):
         sim = self._simulate(1)
         self._start(sim["run_id"])

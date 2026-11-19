@@ -55,7 +55,13 @@ def save(session: "SourcingSession") -> None:
         if session.version == 0:
             if db.fetch_by_id(_TABLE, "run_id", session.run_id) is not None:
                 raise ConcurrentUpdateError(session.run_id)
-            db.insert_row(_TABLE, row)
+            try:
+                db.insert_row(_TABLE, row)
+            except db.DatabaseError:
+                # Another worker inserted first (primary-key violation): that is a conflict.
+                if db.fetch_by_id(_TABLE, "run_id", session.run_id) is not None:
+                    raise ConcurrentUpdateError(session.run_id)
+                raise
         else:
             updates = {k: v for k, v in row.items() if k != "run_id"}
             updated = db.update_rows_where(

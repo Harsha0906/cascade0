@@ -483,6 +483,8 @@ def _save_new(session: SourcingSession) -> Dict[str, Any]:
 
 
 def record_reply(run_id: str, supplier_id: str, text: str, source: str = "operator") -> Dict[str, Any]:
+    # Known multi-worker limitation: a retry re-runs reply side effects (re-planning may re-send RFQs),
+    # and RFQs sent by the loser of a concurrent start are orphaned (the winner's session is served).
     with _lock:
         for _ in range(_MAX_ATTEMPTS):
             session = sourcing_store.load(run_id)
