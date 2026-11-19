@@ -10,6 +10,7 @@ from tests import _offline_env  # noqa: F401  (must precede app imports)
 from fastapi.testclient import TestClient
 
 from app import main, run_store
+from app.factory_model import FactoryDataError
 
 KEY = {"X-API-Key": "test-operator-key"}
 
@@ -54,6 +55,26 @@ class ApiTests(unittest.TestCase):
         r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": scenario}, headers=KEY)
         self.assertEqual(r.status_code, 200, r.text)
         return r.json()
+
+    # ── factory data ──
+    def test_factory_endpoint_lists_data(self):
+        d = self.client.get("/api/v1/factory").json()
+        self.assertEqual(d["factory_id"], "apex-volt-blr2")
+        self.assertIn("SUP-PNY-02", [v["supplier_id"] for v in d["vendors"]])
+
+    def test_invalid_factory_data_is_503_with_reason(self):
+        with mock.patch("app.agents.graph.load_factory_model",
+                        side_effect=FactoryDataError("suppliers.lead_time_sigma_hours missing — apply supabase/migrations/003_factory_model.sql")):
+            r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 1}, headers=KEY)
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("003_factory_model", r.json()["detail"])
+
+    def test_execution_marks_only_scheduled_overtime_lines(self):
+        sim = self._simulate(2)
+        self.client.post("/api/v1/execute-plan", json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}, headers=KEY)
+        lines = {l["line_id"]: l["status"] for l in self.client.get("/api/v1/state").json()["production_lines"]}
+        self.assertEqual((lines["LINE-1"], lines["LINE-3"]), ("OVERTIME_SCHEDULED", "OVERTIME_SCHEDULED"))
+        self.assertNotEqual(lines["LINE-2"], "OVERTIME_SCHEDULED")
 
     # ── auth ──
     def test_mutating_endpoints_require_api_key(self):

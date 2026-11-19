@@ -2,6 +2,7 @@
 CascadeZero — FastAPI server
 
   GET  /api/v1/state                       factory snapshot (read-only, open)
+  GET  /api/v1/factory                     factory model: vendors + lines (read-only, open)
   POST /api/v1/simulate-crisis             run the agent graph + solver          [API key]
   GET  /api/v1/webhooks/whatsapp           Meta verification handshake
   POST /api/v1/webhooks/whatsapp           Meta (HMAC-verified) / Twilio webhook
@@ -43,6 +44,7 @@ from app import run_store
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
 from app.config import settings
+from app.factory_model import FactoryDataError, load_factory_model
 from app.solver import SolverInputError
 from app.db import (
     default_factory_name,
@@ -155,6 +157,34 @@ def get_state():
     return get_full_state()
 
 
+def _factory_503(exc: Exception) -> HTTPException:
+    logger.error("Factory data invalid: %s", exc)
+    return HTTPException(status_code=503, detail=f"Factory data invalid: {exc}")
+
+
+@app.get("/api/v1/factory")
+def get_factory():
+    """The factory model the planner uses (vendors + lines), loaded from the database."""
+    try:
+        m = load_factory_model()
+    except FactoryDataError as exc:
+        raise _factory_503(exc)
+    return {
+        "factory_id": m.factory_id,
+        "name": m.name,
+        "vendors": [
+            {k: getattr(v, k) for k in ("supplier_id", "name", "sourcing_role", "max_units",
+                                        "unit_cost", "flat_cost", "lead_hours", "reliability_pct")}
+            for v in m.vendors
+        ],
+        "lines": [
+            {k: getattr(l, k) for k in ("line_id", "name", "rated_units_per_hour", "ot_units_per_hour",
+                                        "ot_cost_per_hour", "max_ot_hours")}
+            for l in m.lines
+        ],
+    }
+
+
 @app.get("/api/v1/runs/latest")
 def get_latest_run():
     """Summary of the most recent analysis run (used by the mobile controller to approve it)."""
@@ -195,6 +225,8 @@ def simulate_crisis(req: SimulateCrisisRequest):
         result = _run_pipeline(message, req.source_channel, delay, shortfall, speed)
     except SolverInputError as exc:
         raise HTTPException(status_code=422, detail=f"Cannot plan for these inputs: {exc}")
+    except FactoryDataError as exc:
+        raise _factory_503(exc)
 
     return {
         "success": True,
@@ -334,7 +366,16 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         await run_in_threadpool(send_whatsapp_text, sender, _status_text())
         return {"status": "ok"}
 
-    result = await run_in_threadpool(_run_pipeline, body_text, "META_WHATSAPP_CLOUD_API")
+    try:
+        result = await run_in_threadpool(_run_pipeline, body_text, "META_WHATSAPP_CLOUD_API")
+    except FactoryDataError as exc:
+        logger.error("WhatsApp pipeline failed, factory data invalid: %s", exc)
+        await run_in_threadpool(send_whatsapp_text, sender, f"⚠️ Cannot plan right now: factory data invalid — {exc}")
+        return {"status": "error", "detail": f"Factory data invalid: {exc}"}
+    except SolverInputError as exc:
+        logger.warning("WhatsApp pipeline rejected inputs: %s", exc)
+        await run_in_threadpool(send_whatsapp_text, sender, f"⚠️ Cannot plan for these inputs: {exc}")
+        return {"status": "error", "detail": str(exc)}
     winner_id = result["recommended_plan_id"]
     await run_in_threadpool(
         send_whatsapp_interactive_buttons,
@@ -392,8 +433,14 @@ async def whatsapp_webhook(request: Request):
     if not body_text or body_text.lower() in ("hi", "hello", "ping", "test") or "join" in body_text.lower():
         reply = "✅ CascadeZero connected. Send a disruption alert, e.g. 'Flood on NH48, 48h delay, 150 casings short on EV-402'."
     else:
-        result = await run_in_threadpool(_run_pipeline, body_text, "TWILIO_WHATSAPP_SANDBOX")
-        reply = _winner_summary(result) + "\nApprove from the dashboard."
+        try:
+            result = await run_in_threadpool(_run_pipeline, body_text, "TWILIO_WHATSAPP_SANDBOX")
+            reply = _winner_summary(result) + "\nApprove from the dashboard."
+        except FactoryDataError as exc:
+            logger.error("Twilio pipeline failed, factory data invalid: %s", exc)
+            reply = f"⚠️ Cannot plan right now: factory data invalid — {exc}"
+        except SolverInputError as exc:
+            reply = f"⚠️ Cannot plan for these inputs: {exc}"
     logger.info("Twilio reply to %s", sender)
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -579,8 +626,8 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
             update_rows("suppliers", "id", a["supplier_id"], {
                 "status": "PO_DRAFTED", "inbound_qty": a["units_allocated"], "updated_at": now,
             })
-        if playbook["overtime_hours"] > 0:
-            for lid in ("LINE-1", "LINE-3"):
+        for lid, hrs in (playbook.get("overtime_line_hours") or {}).items():
+            if hrs > 0:
                 update_rows("production_lines", "line_id", lid, {"status": "OVERTIME_SCHEDULED", "updated_at": now})
 
         log_agent_step(
@@ -639,6 +686,8 @@ def _sourcing_call(fn, *args):
         return fn(*args)
     except sourcing.SourcingError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except FactoryDataError as exc:
+        raise _factory_503(exc)
 
 
 @app.post("/api/v1/sourcing/start", dependencies=[Depends(require_api_key)])

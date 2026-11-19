@@ -117,7 +117,7 @@ export interface SolverMeta {
   ranking_rule: string;
   deadline_hours: number;
   capacity_exhausted: boolean;
-  line2_throughput_gap_units: number;
+  throughput_gap_units: number;
 }
 
 /** Order statuses that mean a recovery plan has been approved (not that delivery is guaranteed). */
@@ -425,7 +425,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
           ranking_rule: sr.ranking_rule || "",
           deadline_hours: sr.deadline_hours ?? 0,
           capacity_exhausted: !!sr.capacity_exhausted,
-          line2_throughput_gap_units: sr.line2_throughput_gap_units ?? 0,
+          throughput_gap_units: sr.throughput_gap_units ?? 0,
         },
       });
       await get().fetchInitialState();

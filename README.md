@@ -168,7 +168,7 @@ WhatsApp approver allowlist, idempotent execution and CSV import.
 | **Sourcing Agent** | Real agent loop: sends enquiries (not orders) to the vendors in a plan, reads replies (Gemini or regex, English/Hinglish), and re-plans with confirmed capacity/price/ETA, asking the next vendor when one declines, offers less, or times out (max 3 rounds). WhatsApp or simulated channel |
 | Ops ⇄ CFO debate | Proposals are solver outputs; the rebuttal fires on computed risk (weak vendor, infeasibility, confidence gap) and the CFO re-solves |
 | LLM | Extracts parameters from free text and narrates. The UI shows when it fell back to regex/templates |
-| Vendor costs, capacities, lead times | Hard-coded demo constants in `solver.py`, not yet read from the DB |
+| Vendor costs, capacities, lead times | Loaded per factory from the database (`suppliers`, `vendor_history`, `production_lines`, `factories`) |
 | PLC telemetry | Simulated, HTTP JSON |
 | Weather | OpenWeatherMap city weather if a key is set; otherwise shown as offline |
 | WhatsApp | Meta Cloud API with HMAC verification; approvals only from allow-listed numbers |
@@ -185,7 +185,7 @@ The planner's vendor numbers are assumptions; the Sourcing Agent replaces them w
 5. When no enquiry is outstanding it re-solves. If the best plan needs an unconfirmed vendor, it asks that vendor (next round); otherwise it hands a **confirmed plan** back for human approval (`<run_id>-S<round>`).
 
 Only one PO can ever be created per analysis — the original run and its sourced re-plan share an idempotency key.
-Apply `supabase/migrations/002_sourcing_agent.sql` for vendor numbers and the enquiry audit table.
+Apply `supabase/migrations/002_sourcing_agent.sql` for vendor numbers and the enquiry audit table, then `supabase/migrations/003_factory_model.sql` (must be applied after 002) for the per-factory model the planner reads.
 
 ## 🔐 Security Setup
 
