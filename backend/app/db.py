@@ -576,10 +576,11 @@ def _execute_plan_tx_live(params: dict[str, Any], root_run_id: str) -> dict[str,
         cause = exc.__cause__
         code = str(getattr(cause, "code", "") or "")
         text = _error_text(cause)
-        if code == "23505" or (not code and re.search(r"23505", text)):
+        if code == "23505" or (not code and re.search(r"\b23505\b", text)):
             if _RECEIPTS_CONSTRAINT in text:
                 raise AlreadyExecutedError(root_run_id) from exc
-        elif code == "PGRST202" or (not code and re.search(r"PGRST202", text))\n                or "Could not find the function" in text:
+        elif (code == "PGRST202" or (not code and re.search(r"\bPGRST202\b", text))
+                or "Could not find the function" in text):
             logger.error("execute_plan_tx is missing: apply supabase/migrations/004_durable_state.sql")
         raise
     return result if isinstance(result, dict) else params["p_receipt"]
