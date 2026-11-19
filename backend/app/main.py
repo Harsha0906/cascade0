@@ -45,6 +45,7 @@ from app.agents.graph import run_cascade_pipeline
 from app.config import settings
 from app.solver import SolverInputError
 from app.db import (
+    default_factory_name,
     get_full_state,
     insert_row,
     log_agent_step,
@@ -146,7 +147,7 @@ def _run_pipeline(message: str, source_channel: str, delay=None, shortfall=None,
 
 @app.get("/")
 def root():
-    return {"app": "CascadeZero", "status": "online", "factory": settings.FACTORY_NAME, "docs_url": "/docs"}
+    return {"app": "CascadeZero", "status": "online", "factory": default_factory_name(), "docs_url": "/docs"}
 
 
 @app.get("/api/v1/state")
@@ -609,7 +610,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
                 "voucher_type": "Purchase Order",
                 "po_number": po_number,
                 "date": datetime.now().strftime("%Y-%m-%d"),
-                "company": settings.FACTORY_NAME,
+                "company": default_factory_name(),
                 "total_cost_inr": playbook["total_mitigation_cost_inr"],
                 "allocations": playbook["vendor_allocations"],
                 "overtime_hours": playbook["overtime_hours"],

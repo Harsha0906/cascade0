@@ -1,8 +1,10 @@
 import unittest
+from unittest import mock
 
 from tests import _offline_env  # noqa: F401
 
-from app.factory_model import FactoryDataError
+from app.db import _SEED_SUPPLIERS
+from app.factory_model import FactoryDataError, load_factory_model
 from tests.factories import small_factory
 
 
@@ -30,6 +32,48 @@ class FactoryModelTests(unittest.TestCase):
     def test_override_for_unknown_vendor_rejected(self):
         with self.assertRaises(FactoryDataError):
             small_factory().with_vendor_overrides({"NOPE": {"max_units": 5}})
+
+    def test_demo_factory_loads_and_matches_previous_constants(self):
+        m = load_factory_model()  # offline -> in-memory mirror seed
+        p = m.vendor("SUP-PNY-02")
+        self.assertEqual((p.max_units, p.unit_cost, p.lead_hours, p.lead_sigma, p.delay_shock_pct,
+                          p.delay_shock_range, p.reliability_pct, p.min_lead_hours),
+                         (200, 600, 4.0, 0.45, 6.0, (1.0, 2.5), 93.3, 2.0))
+        self.assertEqual(m.vendor("SUP-AIR-04").flat_cost, 600_000)
+        self.assertEqual(m.expedite_vendor_id, "SUP-AIR-04")
+        self.assertNotIn("SUP-CHN-01", [v.supplier_id for v in m.vendors])  # PRIMARY excluded
+        self.assertEqual(m.throughput_gap({"LINE-2": 50}), 152)
+        self.assertEqual(sorted(l.line_id for l in m.overtime_lines), ["LINE-1", "LINE-3"])
+
+    def test_missing_column_names_migration(self):
+        with mock.patch("app.factory_model.get_all_suppliers",
+                        return_value=[{**_SEED_SUPPLIERS[1], "lead_time_sigma_hours": None}]):
+            with self.assertRaisesRegex(FactoryDataError, "lead_time_sigma_hours.*003_factory_model"):
+                load_factory_model()
+
+    def test_invalid_values_all_reported(self):
+        bad = {**_SEED_SUPPLIERS[1], "max_available_qty": -5,
+               "delay_shock_min_hours": 3.0, "delay_shock_max_hours": 1.0}
+        with mock.patch("app.factory_model.get_all_suppliers", return_value=[bad]):
+            with self.assertRaises(FactoryDataError) as ctx:
+                load_factory_model()
+        self.assertIn("max_available_qty", str(ctx.exception))
+        self.assertIn("delay_shock", str(ctx.exception))
+
+    def test_invalid_sourcing_role_reported(self):
+        bad = {**_SEED_SUPPLIERS[1], "sourcing_role": "WIZARD"}
+        with mock.patch("app.factory_model.get_all_suppliers", return_value=[bad]):
+            with self.assertRaisesRegex(FactoryDataError, "sourcing_role.*WIZARD"):
+                load_factory_model()
+
+    def test_backup_without_vendor_history_rejected(self):
+        with mock.patch("app.factory_model.fetch_all", return_value=[]):
+            with self.assertRaisesRegex(FactoryDataError, "SUP-PNY-02.*no vendor_history"):
+                load_factory_model()
+
+    def test_unknown_factory_id(self):
+        with self.assertRaisesRegex(FactoryDataError, "no-such-plant"):
+            load_factory_model("no-such-plant")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,14 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "status": "ON_TIME",
         "delay_hours": 0,
         "whatsapp_number": "",
+        "factory_id": "apex-volt-blr2",
+        "sourcing_role": "PRIMARY",
+        "lead_time_sigma_hours": 1.0,
+        "delay_shock_min_hours": 1.0,
+        "delay_shock_max_hours": 3.0,
+        "unreliable_delay_min_hours": 2.0,
+        "unreliable_delay_max_hours": 4.0,
+        "min_lead_hours": 8.0,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
     {
@@ -57,6 +65,14 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "status": "STANDBY",
         "delay_hours": 0,
         "whatsapp_number": "",
+        "factory_id": "apex-volt-blr2",
+        "sourcing_role": "BACKUP",
+        "lead_time_sigma_hours": 0.45,
+        "delay_shock_min_hours": 1.0,
+        "delay_shock_max_hours": 2.5,
+        "unreliable_delay_min_hours": 1.5,
+        "unreliable_delay_max_hours": 3.0,
+        "min_lead_hours": 2.0,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
     {
@@ -75,6 +91,14 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "status": "STANDBY",
         "delay_hours": 0,
         "whatsapp_number": "",
+        "factory_id": "apex-volt-blr2",
+        "sourcing_role": "BACKUP",
+        "lead_time_sigma_hours": 1.1,
+        "delay_shock_min_hours": 2.0,
+        "delay_shock_max_hours": 4.0,
+        "unreliable_delay_min_hours": 2.5,
+        "unreliable_delay_max_hours": 5.0,
+        "min_lead_hours": 4.0,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
     {
@@ -93,6 +117,14 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "status": "STANDBY",
         "delay_hours": 0,
         "whatsapp_number": "",
+        "factory_id": "apex-volt-blr2",
+        "sourcing_role": "EXPEDITE",
+        "lead_time_sigma_hours": 0.25,
+        "delay_shock_min_hours": 1.0,
+        "delay_shock_max_hours": 2.0,
+        "unreliable_delay_min_hours": 1.0,
+        "unreliable_delay_max_hours": 2.0,
+        "min_lead_hours": 4.5,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
 ]
@@ -144,9 +176,11 @@ _SEED_PRODUCTION_LINES: list[dict[str, Any]] = [
         "speed_pct": 100,
         "temp_celsius": 61.0,
         "daily_capacity_units": 200,
-        "overtime_cost_per_hour_inr": 22500,
-        "extra_units_per_ot_hour": 38,
+        "overtime_cost_per_hour_inr": 11250,
+        "extra_units_per_ot_hour": 19,
         "max_ot_hours": 8,
+        "factory_id": "apex-volt-blr2",
+        "rated_units_per_hour": 19,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
     {
@@ -159,6 +193,8 @@ _SEED_PRODUCTION_LINES: list[dict[str, Any]] = [
         "overtime_cost_per_hour_inr": 0,
         "extra_units_per_ot_hour": 0,
         "max_ot_hours": 0,
+        "factory_id": "apex-volt-blr2",
+        "rated_units_per_hour": 19,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
     {
@@ -168,9 +204,11 @@ _SEED_PRODUCTION_LINES: list[dict[str, Any]] = [
         "speed_pct": 100,
         "temp_celsius": 60.0,
         "daily_capacity_units": 150,
-        "overtime_cost_per_hour_inr": 22500,
-        "extra_units_per_ot_hour": 38,
+        "overtime_cost_per_hour_inr": 11250,
+        "extra_units_per_ot_hour": 19,
         "max_ot_hours": 8,
+        "factory_id": "apex-volt-blr2",
+        "rated_units_per_hour": 14,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
 ]
@@ -186,6 +224,7 @@ _SEED_ORDERS: list[dict[str, Any]] = [
         "partial_delay_penalty_inr": 500000,
         "status": "ON_TRACK",
         "shortfall_units": 0,
+        "factory_id": "apex-volt-blr2",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
     {
@@ -198,7 +237,19 @@ _SEED_ORDERS: list[dict[str, Any]] = [
         "partial_delay_penalty_inr": 200000,
         "status": "ON_TRACK",
         "shortfall_units": 0,
+        "factory_id": "apex-volt-blr2",
         "updated_at": datetime.now(timezone.utc).isoformat(),
+    },
+]
+
+_SEED_FACTORIES: list[dict[str, Any]] = [
+    {
+        "id": "apex-volt-blr2",
+        "name": "Apex Volt EV Battery Plant (Bengaluru Unit-2)",
+        "stock_item_name": "Aluminium Battery Casing",
+        "qa_dispatch_hours": 2.5,
+        "safety_stock_units": 50,
+        "production_hours_in_window": 16,
     },
 ]
 
@@ -210,6 +261,7 @@ class InMemoryMirror:
     """
 
     def __init__(self) -> None:
+        self.factories: list[dict[str, Any]] = copy.deepcopy(_SEED_FACTORIES)
         self.suppliers: list[dict[str, Any]] = copy.deepcopy(_SEED_SUPPLIERS)
         self.vendor_history: list[dict[str, Any]] = copy.deepcopy(_SEED_VENDOR_HISTORY)
         self.production_lines: list[dict[str, Any]] = copy.deepcopy(_SEED_PRODUCTION_LINES)
@@ -371,6 +423,17 @@ def delete_all(table_name: str) -> bool:
 # ─── Table-Specific Helpers ────────────────────────────────────────────────
 
 
+def get_factory_row(factory_id: str) -> dict[str, Any] | None:
+    """Fetch one factory (plant constants) by id."""
+    return fetch_by_id("factories", "id", factory_id)
+
+
+def default_factory_name() -> str:
+    """Display name of the default factory, falling back to its id if the row is missing."""
+    row = get_factory_row(settings.DEFAULT_FACTORY_ID)
+    return (row or {}).get("name") or settings.DEFAULT_FACTORY_ID
+
+
 def get_all_suppliers() -> list[dict[str, Any]]:
     """Fetch all suppliers."""
     return fetch_all("suppliers")
@@ -478,7 +541,7 @@ def get_full_state() -> dict[str, Any]:
     and by the frontend Zustand store for initial hydration.
     """
     return {
-        "factory_name": settings.FACTORY_NAME,
+        "factory_name": default_factory_name(),
         "suppliers": get_all_suppliers(),
         "vendor_history": fetch_all("vendor_history"),
         "production_lines": get_all_production_lines(),
@@ -514,6 +577,10 @@ def reset_to_seed() -> dict[str, str]:
             except Exception as exc:
                 logger.warning("⚠ Could not clear sourcing_rfqs: %s", exc)
 
+            # Reset factories to seed state
+            for fac in _SEED_FACTORIES:
+                client.table("factories").upsert(fac).execute()
+
             # Reset suppliers to seed state
             for sup in _SEED_SUPPLIERS:
                 client.table("suppliers").upsert(sup).execute()
@@ -530,7 +597,7 @@ def reset_to_seed() -> dict[str, str]:
         except Exception as exc:
             logger.warning("⚠ Supabase reset partially failed: %s — mirror reset OK", exc)
 
-    return {"success": True, "status": "reset_complete", "factory": settings.FACTORY_NAME}
+    return {"success": True, "status": "reset_complete", "factory": default_factory_name()}
 
 
 # ─── CLI Test Runner ───────────────────────────────────────────────────────

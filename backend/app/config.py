@@ -69,7 +69,7 @@ class Settings:
     OPENWEATHER_API_KEY: str = os.getenv("OPENWEATHER_API_KEY", "")
 
     # ── Factory Constants (Apex Volt EV Battery Plant) ────────────────────
-    FACTORY_NAME: str = "Apex Volt EV Battery Plant (Bengaluru Unit-2)"
+    DEFAULT_FACTORY_ID: str = os.getenv("FACTORY_ID", "apex-volt-blr2")
     DEFAULT_SLA_HOURS: int = 38
     MONTE_CARLO_ITERATIONS: int = 1000
 
