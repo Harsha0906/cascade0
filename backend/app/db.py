@@ -548,7 +548,7 @@ def record_webhook_event(message_id: str) -> bool:
         except Exception as exc:
             code = str(getattr(exc, "code", "") or "")
             text = _error_text(exc)
-            if code == "23505" or (not code and re.search(r"23505", text)):
+            if code == "23505" or (not code and re.search(r"\b23505\b", text)):
                 return False
             raise _fail("insert", "webhook_events", exc) from exc
         return True
