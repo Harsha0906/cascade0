@@ -283,8 +283,26 @@ _mirror = InMemoryMirror()
 _supabase_client = None
 
 
+class DatabaseError(RuntimeError):
+    """A live-database operation failed. The driver message is logged, never exposed."""
+
+    def __init__(self, operation: str, table: str) -> None:
+        self.operation = operation
+        self.table = table
+        super().__init__(f"{operation} {table} failed")
+
+
+def _fail(operation: str, table: str, exc: Exception) -> DatabaseError:
+    logger.error("Database %s on %s failed: %s", operation, table, exc)
+    return DatabaseError(operation, table)
+
+
 def _get_supabase():
-    """Lazy-initialize the Supabase client. Returns None if not configured."""
+    """Lazy-initialize the Supabase client.
+
+    Returns None only in offline mode (no credentials). When credentials are
+    configured but the client cannot be created, raises DatabaseError.
+    """
     global _supabase_client
     if _supabase_client is not None:
         return _supabase_client
@@ -298,29 +316,28 @@ def _get_supabase():
         logger.info("✅ Supabase client connected to %s", settings.SUPABASE_URL)
         return _supabase_client
     except Exception as exc:
-        logger.warning("⚠ Supabase connection failed (%s) — using in-memory mirror", exc)
-        return None
+        raise _fail("connect", "supabase", exc) from exc
 
 
 # ─── Generic CRUD Helpers ──────────────────────────────────────────────────
 
 
 def fetch_all(table_name: str) -> list[dict[str, Any]]:
-    """Fetch all rows from a table. Falls back to in-memory mirror."""
+    """Fetch all rows from a table. Offline mode reads the in-memory mirror."""
     client = _get_supabase()
-    if client:
+    if client is not None:
         try:
             response = client.table(table_name).select("*").execute()
             return response.data or []
         except Exception as exc:
-            logger.warning("⚠ Supabase fetch_all(%s) failed: %s — fallback", table_name, exc)
+            raise _fail("fetch_all", table_name, exc) from exc
     return copy.deepcopy(_mirror.get_table(table_name))
 
 
 def fetch_by_id(table_name: str, pk_column: str, pk_value: str) -> dict[str, Any] | None:
-    """Fetch a single row by primary key. Falls back to in-memory mirror."""
+    """Fetch a single row by primary key. Offline mode reads the in-memory mirror."""
     client = _get_supabase()
-    if client:
+    if client is not None:
         try:
             response = (
                 client.table(table_name).select("*").eq(pk_column, pk_value).execute()
@@ -328,8 +345,8 @@ def fetch_by_id(table_name: str, pk_column: str, pk_value: str) -> dict[str, Any
             rows = response.data or []
             return rows[0] if rows else None
         except Exception as exc:
-            logger.warning("⚠ Supabase fetch_by_id(%s) failed: %s — fallback", table_name, exc)
-    # Fallback to mirror
+            raise _fail("fetch_by_id", table_name, exc) from exc
+    # Offline mirror
     for row in _mirror.get_table(table_name):
         if row.get(pk_column) == pk_value:
             return copy.deepcopy(row)
@@ -337,17 +354,16 @@ def fetch_by_id(table_name: str, pk_column: str, pk_value: str) -> dict[str, Any
 
 
 def upsert_row(table_name: str, row: dict[str, Any]) -> dict[str, Any]:
-    """Insert or update a row. Falls back to in-memory mirror."""
+    """Insert or update a row. Offline mode writes the in-memory mirror."""
     client = _get_supabase()
-    if client:
+    if client is not None:
         try:
             response = client.table(table_name).upsert(row).execute()
-            data = response.data or []
-            if data:
-                return data[0]
         except Exception as exc:
-            logger.warning("⚠ Supabase upsert(%s) failed: %s — fallback", table_name, exc)
-    # Fallback: upsert into mirror
+            raise _fail("upsert", table_name, exc) from exc
+        data = response.data or []
+        return data[0] if data else row
+    # Offline: upsert into mirror
     table = _mirror.get_table(table_name)
     # Detect PK column from the row keys (first key is typically the PK)
     pk_col = next(iter(row))
@@ -360,17 +376,16 @@ def upsert_row(table_name: str, row: dict[str, Any]) -> dict[str, Any]:
 
 
 def insert_row(table_name: str, row: dict[str, Any]) -> dict[str, Any]:
-    """Insert a new row. Falls back to in-memory mirror."""
+    """Insert a new row. Offline mode writes the in-memory mirror."""
     client = _get_supabase()
-    if client:
+    if client is not None:
         try:
             response = client.table(table_name).insert(row).execute()
-            data = response.data or []
-            if data:
-                return data[0]
         except Exception as exc:
-            logger.warning("⚠ Supabase insert(%s) failed: %s — fallback", table_name, exc)
-    # Fallback
+            raise _fail("insert", table_name, exc) from exc
+        data = response.data or []
+        return data[0] if data else row
+    # Offline
     table = _mirror.get_table(table_name)
     table.append(row)
     return row
@@ -382,9 +397,9 @@ def update_rows(
     pk_value: str,
     updates: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Update matching rows. Falls back to in-memory mirror."""
+    """Update matching rows. Offline mode updates the in-memory mirror."""
     client = _get_supabase()
-    if client:
+    if client is not None:
         try:
             response = (
                 client.table(table_name)
@@ -394,8 +409,8 @@ def update_rows(
             )
             return response.data or []
         except Exception as exc:
-            logger.warning("⚠ Supabase update(%s) failed: %s — fallback", table_name, exc)
-    # Fallback
+            raise _fail("update", table_name, exc) from exc
+    # Offline
     updated = []
     for row in _mirror.get_table(table_name):
         if row.get(pk_column) == pk_value:
@@ -405,16 +420,16 @@ def update_rows(
 
 
 def delete_all(table_name: str) -> bool:
-    """Delete all rows from a table. Used for reset. Falls back to mirror."""
+    """Delete all rows from a table. Used for reset. Offline mode clears the mirror."""
     client = _get_supabase()
-    if client:
+    if client is not None:
         try:
             # Supabase delete requires a filter; use neq on a column that always exists
             client.table(table_name).delete().neq("id", "___impossible___").execute()
             return True
-        except Exception:
-            pass
-    # Fallback: clear mirror table
+        except Exception as exc:
+            raise _fail("delete_all", table_name, exc) from exc
+    # Offline: clear mirror table
     table = _mirror.get_table(table_name)
     table.clear()
     return True
@@ -447,7 +462,7 @@ def get_supplier(supplier_id: str) -> dict[str, Any] | None:
 def get_vendor_history(supplier_id: str) -> dict[str, Any] | None:
     """Fetch vendor reliability history for a supplier."""
     client = _get_supabase()
-    if client:
+    if client is not None:
         try:
             response = (
                 client.table("vendor_history")
@@ -457,9 +472,9 @@ def get_vendor_history(supplier_id: str) -> dict[str, Any] | None:
             )
             rows = response.data or []
             return rows[0] if rows else None
-        except Exception:
-            pass
-    # Fallback
+        except Exception as exc:
+            raise _fail("get_vendor_history", "vendor_history", exc) from exc
+    # Offline
     for row in _mirror.vendor_history:
         if row.get("supplier_id") == supplier_id:
             return copy.deepcopy(row)
@@ -514,16 +529,16 @@ def log_agent_step(
 def get_agent_logs(run_id: str | None = None) -> list[dict[str, Any]]:
     """Fetch agent logs, optionally filtered by run_id."""
     client = _get_supabase()
-    if client:
+    if client is not None:
         try:
             query = client.table("agent_logs").select("*").order("step_order")
             if run_id:
                 query = query.eq("run_id", run_id)
             response = query.execute()
             return response.data or []
-        except Exception:
-            pass
-    # Fallback
+        except Exception as exc:
+            raise _fail("get_agent_logs", "agent_logs", exc) from exc
+    # Offline
     logs = _mirror.agent_logs
     if run_id:
         logs = [l for l in logs if l.get("run_id") == run_id]
@@ -558,45 +573,34 @@ def reset_to_seed() -> dict[str, str]:
     Used by the /api/v1/reset endpoint.
     """
     global _mirror
-    _mirror = InMemoryMirror()
-
     client = _get_supabase()
-    if client:
-        try:
-            # Clear dynamic tables
-            for tbl in ["purchase_orders", "agent_logs", "disruption_events"]:
-                try:
-                    client.table(tbl).delete().gte("id", 0).execute()
-                except Exception:
-                    try:
-                        client.table(tbl).delete().neq("po_number", "___none___").execute()
-                    except Exception:
-                        pass
+    if client is None:
+        _mirror = InMemoryMirror()
+        return {"success": True, "status": "reset_complete", "factory": default_factory_name()}
+
+    try:
+        # Clear dynamic tables
+        for tbl in ["purchase_orders", "agent_logs", "disruption_events"]:
             try:
-                client.table("sourcing_rfqs").delete().neq("id", "").execute()
-            except Exception as exc:
-                logger.warning("⚠ Could not clear sourcing_rfqs: %s", exc)
-
-            # Reset factories to seed state
-            for fac in _SEED_FACTORIES:
-                client.table("factories").upsert(fac).execute()
-
-            # Reset suppliers to seed state
-            for sup in _SEED_SUPPLIERS:
-                client.table("suppliers").upsert(sup).execute()
-
-            # Reset production lines to seed state
-            for line in _SEED_PRODUCTION_LINES:
-                client.table("production_lines").upsert(line).execute()
-
-            # Reset orders to seed state
-            for order in _SEED_ORDERS:
-                client.table("orders").upsert(order).execute()
-
-            logger.info("✅ Supabase tables reset to seed data")
+                client.table(tbl).delete().gte("id", 0).execute()
+            except Exception:
+                client.table(tbl).delete().neq("po_number", "___none___").execute()
+        try:
+            client.table("sourcing_rfqs").delete().neq("id", "").execute()
         except Exception as exc:
-            logger.warning("⚠ Supabase reset partially failed: %s — mirror reset OK", exc)
+            logger.warning("Could not clear sourcing_rfqs: %s", exc)
 
+        for tbl, seed in (
+            ("factories", _SEED_FACTORIES),
+            ("suppliers", _SEED_SUPPLIERS),
+            ("production_lines", _SEED_PRODUCTION_LINES),
+            ("orders", _SEED_ORDERS),
+        ):
+            for row in seed:
+                client.table(tbl).upsert(row).execute()
+    except Exception as exc:
+        raise _fail("reset", "all", exc) from exc
+    logger.info("Supabase tables reset to seed data")
     return {"success": True, "status": "reset_complete", "factory": default_factory_name()}
 
 

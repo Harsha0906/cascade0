@@ -39,10 +39,12 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app import run_store
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
+from app import db
 from app.config import settings
 from app.factory_model import FactoryDataError, load_factory_model
 from app.solver import SolverInputError
@@ -155,6 +157,15 @@ def root():
 @app.get("/api/v1/state")
 def get_state():
     return get_full_state()
+
+
+@app.exception_handler(db.DatabaseError)
+async def _database_error_handler(request: Request, exc: db.DatabaseError):
+    """Live-database failure: generic 503. The driver message stays in the server log."""
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"Database unavailable: {exc.operation} {exc.table}"},
+    )
 
 
 # Sent to WhatsApp senders when factory data is invalid; the detail stays in the server log.
@@ -365,7 +376,7 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         run_id, supplier_id = open_rfq
         try:
             await run_in_threadpool(sourcing.record_reply, run_id, supplier_id, body_text, f"whatsapp:{sender}")
-        except (FactoryDataError, sourcing.SourcingError) as exc:
+        except (FactoryDataError, db.DatabaseError, sourcing.SourcingError) as exc:
             logger.error("Vendor reply from %s could not be processed: %s", sender, exc)
             await run_in_threadpool(
                 send_whatsapp_text, sender,
@@ -380,8 +391,8 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         result = await run_in_threadpool(_run_pipeline, body_text, "META_WHATSAPP_CLOUD_API")
-    except FactoryDataError as exc:
-        logger.error("WhatsApp pipeline failed, factory data invalid: %s", exc)
+    except (FactoryDataError, db.DatabaseError) as exc:
+        logger.error("WhatsApp pipeline failed, factory data/database unavailable: %s", exc)
         await run_in_threadpool(send_whatsapp_text, sender, _MISCONFIGURED_REPLY)
         return {"status": "error", "detail": "Factory data invalid (details in server log)"}
     except SolverInputError as exc:
@@ -448,8 +459,8 @@ async def whatsapp_webhook(request: Request):
         try:
             result = await run_in_threadpool(_run_pipeline, body_text, "TWILIO_WHATSAPP_SANDBOX")
             reply = _winner_summary(result) + "\nApprove from the dashboard."
-        except FactoryDataError as exc:
-            logger.error("Twilio pipeline failed, factory data invalid: %s", exc)
+        except (FactoryDataError, db.DatabaseError) as exc:
+            logger.error("Twilio pipeline failed, factory data/database unavailable: %s", exc)
             reply = _MISCONFIGURED_REPLY
         except SolverInputError as exc:
             reply = f"⚠️ Cannot plan for these inputs: {exc}"
