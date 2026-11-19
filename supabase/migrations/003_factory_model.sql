@@ -1,6 +1,7 @@
 -- ============================================================================
 -- CascadeZero — Phase 1: data-driven factory model
--- Apply after 002_sourcing_agent.sql. Idempotent.
+-- Apply after 002_sourcing_agent.sql. Safe to re-run: no step fails on a second run;
+-- re-running restores the demo factory's seed values (factory row, supplier and line columns).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS factories (
@@ -25,7 +26,11 @@ ALTER TABLE factories ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS factories_read ON factories;
 CREATE POLICY factories_read ON factories FOR SELECT TO anon, authenticated USING (true);
 
-ALTER PUBLICATION supabase_realtime ADD TABLE factories;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND tablename = 'factories') THEN
+        ALTER PUBLICATION supabase_realtime ADD TABLE factories;
+    END IF;
+END $$;
 
 -- Suppliers
 ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS factory_id TEXT;
@@ -67,4 +72,4 @@ UPDATE production_lines SET factory_id = 'apex-volt-blr2', rated_units_per_hour 
 
 -- Orders (unused until Phase 7; added now so tenancy needs no second data migration)
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS factory_id TEXT;
-UPDATE orders SET factory_id = 'apex-volt-blr2';
+UPDATE orders SET factory_id = 'apex-volt-blr2' WHERE factory_id IS NULL;

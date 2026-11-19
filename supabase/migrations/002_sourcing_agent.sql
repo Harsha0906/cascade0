@@ -1,6 +1,6 @@
 -- ============================================================================
 -- CascadeZero — Sourcing Agent: vendor contact numbers + enquiry (RFQ) audit log
--- Apply after 001_rls_and_audit.sql.
+-- Apply after 001_rls_and_audit.sql. Safe to re-run.
 -- ============================================================================
 
 -- WhatsApp number per supplier (country code + digits, e.g. 919800000000).
@@ -36,4 +36,8 @@ ALTER TABLE sourcing_rfqs ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS sourcing_rfqs_read ON sourcing_rfqs;
 CREATE POLICY sourcing_rfqs_read ON sourcing_rfqs FOR SELECT TO anon, authenticated USING (true);
 
-ALTER PUBLICATION supabase_realtime ADD TABLE sourcing_rfqs;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND tablename = 'sourcing_rfqs') THEN
+        ALTER PUBLICATION supabase_realtime ADD TABLE sourcing_rfqs;
+    END IF;
+END $$;
