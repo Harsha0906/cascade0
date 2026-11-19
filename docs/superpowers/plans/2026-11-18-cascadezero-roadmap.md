@@ -201,3 +201,13 @@ vendor enquiries/replies. Free; no card.
 
 **Done when.** The full disruption → plan → vendor confirmation → approval loop works on
 Telegram with the same tests as the WhatsApp path.
+
+---
+
+## Carried forward from Phase 1 (review findings deferred to their owning phase)
+
+- **Phase 2:** `get_factory_row`, `reset_to_seed` and the factory loader fall back to the in-memory seed when a live-DB read fails — must raise instead when Supabase is configured. Migration 003 re-run restores demo seed values (header documents it); replace with a versioned migration level check (`/healthz`).
+- **Phase 3:** PuLP variable names are sanitised ids (`L-B` and `L_B` collide) — switch to index-based names; RFQ text says "an air charter" for any flat-fee vendor; remaining `LINE-2` / `EV-402` literals in graph/tools/main/sourcing; digital twin "Lines 1 & 3" labels.
+- **Phase 6:** forcing the expedite vendor at zero shortfall pays its fee in the objective but not in the reported cost — skip Plan A when shortfall is 0, or report it.
+- **Phase 9:** CBC fallback (`COIN_CMD`, needs a CBC binary on PATH) is untested because HiGHS is always present — add a CI job without HiGHS.
+- **Minor, any phase:** missing-column hint should say "set the column (or apply 003)"; integer columns accept fractional values and round them; no loader test with two factories in the same database; `SolverInputError` webhook replies still echo the message (sender-input errors).
