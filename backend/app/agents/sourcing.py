@@ -100,7 +100,7 @@ class SourcingSession:
     run_id: str
     playbook_id: str
     params: Dict[str, Any]
-    model: Optional[FactoryModel] = None   # loaded once at session start
+    model: FactoryModel   # the run's factory snapshot: the plan being sourced was solved on it
     status: str = "ACTIVE"   # ACTIVE | COMPLETE | COMPLETE_UNCONFIRMED | NOTHING_TO_SOURCE
     round: int = 0
     rfqs: List[RFQ] = field(default_factory=list)
@@ -300,7 +300,7 @@ def _solve(session: SourcingSession):
         model=session.model,
         shortfall_units=p["shortfall_units"],
         delay_hours=p["delay_hours"],
-        line_speeds={"LINE-2": p["line2_speed_pct"]},
+        line_speeds=p["line_speeds"],
         order_id=p["order_id"],
         sla_penalty_inr=p["sla_penalty_inr"],
         partial_penalty_inr=p["partial_penalty_inr"],
@@ -400,15 +400,18 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
         br = run.get("blast_radius", {})
         sr = run.get("solver_result", {})
         factory_id = run.get("factory_id")
+        # Source against the factory data the plan was solved on, not today's database rows.
+        model = run.get("factory_model") or load_factory_model(factory_id)   # FactoryDataError propagates
+        line_speeds = run.get("line_speeds") or {"LINE-2": run["line2_speed_pct"]}
         session = SourcingSession(
             run_id=run_id,
             playbook_id=pid,
-            model=load_factory_model(factory_id),   # FactoryDataError propagates
+            model=model,
             params={
                 "factory_id": factory_id,
                 "shortfall_units": run["shortfall_units"],
                 "delay_hours": run["delay_hours"],
-                "line2_speed_pct": run["line2_speed_pct"],
+                "line_speeds": dict(line_speeds),
                 "order_id": run.get("order_id", "EV-402"),
                 "sla_penalty_inr": int(br.get("sla_penalty_inr", sr.get("total_sla_exposure_inr", 2_500_000))),
                 "partial_penalty_inr": int(br.get("partial_delay_penalty_inr", 500_000)),
@@ -416,15 +419,16 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
                 "client": br.get("client", "Ather-Grid Mobility Corp"),
             },
         )
-        _sessions[run_id] = session
-
         if not playbook["vendor_allocations"]:
             result = _solve(session)
             _finish(session, result, "NOTHING_TO_SOURCE", f"{pid} needs no supplier purchase.")
+            _sessions[run_id] = session
             return view(run_id)
 
         session.round = 1
         sent = [_send_rfq(session, a["supplier_id"], a["units_allocated"]) for a in playbook["vendor_allocations"]]
+        # Register only once the first-round enquiries exist: a failure above leaves no half-built session.
+        _sessions[run_id] = session
         names = ", ".join(f"{r.supplier_name.split(' (')[0]} ({r.units_requested}u)" for r in sent)
         _log(session, f"Round 1 ({settings.SOURCING_MODE}): enquiries sent to {names}",
              f"📨 Checking {pid} with suppliers before approval. Enquiries sent to {names} "

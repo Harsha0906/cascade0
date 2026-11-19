@@ -89,6 +89,26 @@ class SourcingFlowTests(unittest.TestCase):
         winner = next(p for p in s["playbooks"] if p["id"] == s["recommended_plan_id"])
         self.assertTrue(all(a["confirmed"] for a in winner["vendor_allocations"]))
 
+    def test_sourcing_uses_the_runs_factory_snapshot(self):
+        sim = self._simulate(1)
+        # Vendor data changes after the analysis: the enquiry must still match the analysed plan.
+        update_rows("suppliers", "id", "SUP-PNY-02", {"extra_cost_per_unit_inr": 999})
+        s = self._start(sim["run_id"])
+        rfq = s["rfqs"][0]
+        self.assertEqual((rfq["supplier_id"], rfq["expected_unit_price_inr"]), ("SUP-PNY-02", 600))
+        session = sourcing._sessions[sim["run_id"]]
+        self.assertIs(session.model, run_store.get_run(sim["run_id"])["factory_model"])
+        self.assertEqual(session.params["line_speeds"], run_store.get_run(sim["run_id"])["line_speeds"])
+
+    def test_session_not_registered_when_first_rfq_fails(self):
+        sim = self._simulate(1)
+        with mock.patch.object(sourcing, "_send_rfq", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                sourcing.start_sourcing(sim["run_id"])
+        self.assertNotIn(sim["run_id"], sourcing._sessions)
+        s = self._start(sim["run_id"])  # a retry starts cleanly
+        self.assertEqual(s["status"], "ACTIVE")
+
     def test_partial_offer_triggers_replan_and_new_enquiry(self):
         sim = self._simulate(1)
         self._start(sim["run_id"])
