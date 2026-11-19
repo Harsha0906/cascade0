@@ -547,6 +547,103 @@ def call_function(name: str, params: dict[str, Any]) -> Any:
         raise _fail("rpc", name, exc) from exc
 
 
+class AlreadyExecutedError(RuntimeError):
+    """A plan for this root run was already executed (idempotency guard tripped)."""
+
+    def __init__(self, root_run_id: str) -> None:
+        self.root_run_id = root_run_id
+        super().__init__(f"root run {root_run_id} already executed")
+
+
+_EXECUTION_TABLES = (
+    "execution_receipts", "purchase_orders", "orders", "suppliers", "production_lines", "agent_logs",
+)
+_execute_lock = threading.Lock()
+
+
+def _error_text(exc: BaseException | None) -> str:
+    if exc is None:
+        return ""
+    return f"{getattr(exc, 'code', '')} {exc!s} {getattr(exc, 'args', '')!r}"
+
+
+def _execute_plan_tx_live(params: dict[str, Any], root_run_id: str) -> dict[str, Any]:
+    try:
+        result = call_function("execute_plan_tx", params)
+    except DatabaseError as exc:
+        cause = exc.__cause__
+        code = str(getattr(cause, "code", "") or "")
+        text = _error_text(cause)
+        if code == "23505" or "23505" in text:
+            raise AlreadyExecutedError(root_run_id) from exc
+        if code == "PGRST202" or "PGRST202" in text or "Could not find the function" in text:
+            logger.error("execute_plan_tx is missing: apply supabase/migrations/004_durable_state.sql")
+        raise
+    return result if isinstance(result, dict) else params["p_receipt"]
+
+
+def execute_plan_tx(
+    po: dict[str, Any],
+    order_id: str,
+    order_status: str,
+    supplier_updates: list[dict[str, Any]],
+    overtime_line_ids: list[str],
+    agent_log: dict[str, Any],
+    root_run_id: str,
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Execute an approved plan atomically; a repeated root_run_id raises AlreadyExecutedError."""
+    client = _get_supabase()
+    if client is not None:
+        return _execute_plan_tx_live({
+            "p_po": po,
+            "p_order_id": order_id,
+            "p_order_status": order_status,
+            "p_supplier_updates": supplier_updates,
+            "p_overtime_line_ids": overtime_line_ids,
+            "p_agent_log": agent_log,
+            "p_root_run_id": root_run_id,
+            "p_receipt": receipt,
+        }, root_run_id)
+
+    # Offline: all-or-nothing on the mirror, same write order as the SQL function.
+    with _execute_lock:
+        mirror = _mirror
+        snapshot = {t: copy.deepcopy(mirror.get_table(t)) for t in _EXECUTION_TABLES}
+        try:
+            if any(r.get("root_run_id") == root_run_id for r in mirror.execution_receipts):
+                raise AlreadyExecutedError(root_run_id)
+            insert_row("execution_receipts", {
+                "root_run_id": root_run_id,
+                "run_id": receipt.get("run_id", root_run_id),
+                "playbook_id": receipt.get("playbook_id", ""),
+                "payload": copy.deepcopy(receipt),
+            })
+            insert_row("purchase_orders", dict(po))
+            now = datetime.now(timezone.utc).isoformat()
+            update_rows("orders", "order_id", order_id, {"status": order_status, "updated_at": now})
+            for upd in supplier_updates:
+                update_rows("suppliers", "id", upd["supplier_id"], {
+                    "status": "PO_DRAFTED", "inbound_qty": upd["inbound_qty"], "updated_at": now,
+                })
+            for lid in overtime_line_ids:
+                update_rows("production_lines", "line_id", lid, {"status": "OVERTIME_SCHEDULED", "updated_at": now})
+            entries = agent_log if isinstance(agent_log, list) else [agent_log] if agent_log else []
+            for entry in entries:
+                insert_row("agent_logs", {"created_at": now, **entry})
+        except BaseException:
+            for t, rows in snapshot.items():
+                setattr(mirror, t, rows)
+            raise
+    return receipt
+
+
+def get_receipt(root_run_id: str) -> dict[str, Any] | None:
+    """Stored execution receipt payload for a root run, or None."""
+    row = fetch_by_id("execution_receipts", "root_run_id", root_run_id)
+    return copy.deepcopy(row["payload"]) if row else None
+
+
 # ─── Table-Specific Helpers ────────────────────────────────────────────────
 
 

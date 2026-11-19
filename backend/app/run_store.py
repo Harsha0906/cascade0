@@ -1,18 +1,15 @@
 """
-Durable store of pipeline runs (table `analysis_runs`) plus in-process execution receipts.
+Durable store of pipeline runs (table `analysis_runs`).
 
 Execution must use the plan the server computed, never numbers echoed back by a client,
 so /execute-plan looks the playbook up here by run_id. Runs live in the database (offline
-mode: the in-memory mirror), so they survive restarts and multiple workers.
-
-Receipts/claims are still process-local; Task 5 moves them to the database.
+mode: the in-memory mirror), so they survive restarts and multiple workers. Execution receipts: db.get_receipt.
 """
 
 from __future__ import annotations
 
 import copy
 import json
-import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -20,8 +17,6 @@ from app import db
 from app.factory_model import FactoryModel
 
 _TABLE = "analysis_runs"
-_lock = threading.Lock()
-_receipts: Dict[str, Dict[str, Any]] = {}
 
 
 def save_run(result: Dict[str, Any]) -> None:
@@ -55,34 +50,3 @@ def get_run(run_id: str) -> Optional[Dict[str, Any]]:
 def latest_run_id() -> Optional[str]:
     rows = db.fetch_ordered(_TABLE, "created_at", desc=True, limit=1)
     return rows[0]["run_id"] if rows else None
-
-
-def get_receipt(run_id: str) -> Optional[Dict[str, Any]]:
-    with _lock:
-        return _receipts.get(run_id)
-
-
-def claim_execution(run_id: str) -> bool:
-    """Atomically mark a run as being executed. Returns False if already claimed."""
-    with _lock:
-        if run_id in _receipts:
-            return False
-        _receipts[run_id] = {"pending": True}
-        return True
-
-
-def store_receipt(run_id: str, receipt: Dict[str, Any]) -> None:
-    with _lock:
-        _receipts[run_id] = receipt
-
-
-def release_claim(run_id: str) -> None:
-    with _lock:
-        if _receipts.get(run_id, {}).get("pending"):
-            _receipts.pop(run_id, None)
-
-
-def clear() -> None:
-    """Clear receipts only; runs are cleared by db.reset_to_seed()."""
-    with _lock:
-        _receipts.clear()

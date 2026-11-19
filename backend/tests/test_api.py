@@ -10,7 +10,9 @@ from unittest import mock
 from tests import _offline_env  # noqa: F401  (must precede app imports)
 from fastapi.testclient import TestClient
 
-from app import main, run_store
+from concurrent.futures import ThreadPoolExecutor
+
+from app import db, main, run_store
 from app.factory_model import FactoryDataError
 
 KEY = {"X-API-Key": "test-operator-key"}
@@ -214,11 +216,50 @@ class ApiTests(unittest.TestCase):
         raw, headers = _signed(_button_payload("911111111111", button))
         self.assertEqual(self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers).json()["status"],
                          "forbidden")
-        self.assertIsNone(run_store.get_receipt(sim["run_id"]))
+        self.assertIsNone(db.get_receipt(sim["run_id"]))
         raw, headers = _signed(_button_payload("919800000000", button))
         self.assertEqual(self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers).json()["action"],
                          "plan_executed")
-        self.assertEqual(run_store.get_receipt(sim["run_id"])["approved_by"], "whatsapp:919800000000")
+        self.assertEqual(db.get_receipt(sim["run_id"])["approved_by"], "whatsapp:919800000000")
+
+    # ── atomic / idempotent execution ──
+    def test_execution_is_atomic(self):
+        sim = self._simulate(1)
+        real_update = db.update_rows
+
+        def fail_on_suppliers(table, *a, **k):
+            if table == "suppliers":
+                raise RuntimeError("mid-transaction failure")
+            return real_update(table, *a, **k)
+
+        with mock.patch("app.db.update_rows", side_effect=fail_on_suppliers):
+            with self.assertRaises(Exception):
+                self.client.post("/api/v1/execute-plan", json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}, headers=KEY)
+        self.assertEqual(db.fetch_all("purchase_orders"), [])
+        self.assertIsNone(db.get_receipt(sim["run_id"]))
+        self.assertNotEqual(db.get_order("EV-402")["status"], "RECOVERY_IN_PROGRESS")
+
+    def test_concurrent_approvals_create_one_po(self):
+        sim = self._simulate(1)
+        body = {"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}
+        with ThreadPoolExecutor(4) as ex:
+            results = list(ex.map(lambda _: self.client.post("/api/v1/execute-plan", json=body, headers=KEY), range(4)))
+        self.assertTrue(all(r.status_code == 200 for r in results))
+        self.assertEqual(len(db.fetch_all("purchase_orders")), 1)
+        self.assertEqual(sum(not r.json()["already_executed"] for r in results), 1)
+
+    def test_missing_rpc_function_is_503(self):
+        with mock.patch("app.db.execute_plan_tx", side_effect=db.DatabaseError("rpc", "execute_plan_tx")):
+            sim = self._simulate(1)
+            r = self.client.post("/api/v1/execute-plan", json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}, headers=KEY)
+        self.assertEqual(r.status_code, 503)
+
+    def test_receipt_carries_run_and_playbook(self):
+        sim = self._simulate(1)
+        self.client.post("/api/v1/execute-plan", json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}, headers=KEY)
+        stored = db.get_receipt(sim["run_id"])
+        self.assertEqual(stored["run_id"], sim["run_id"])
+        self.assertEqual(stored["playbook_id"], sim["recommended_plan_id"])
 
     def test_verify_handshake(self):
         ok = self.client.get("/api/v1/webhooks/whatsapp",

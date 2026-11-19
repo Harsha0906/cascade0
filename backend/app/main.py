@@ -52,9 +52,7 @@ from app.db import (
     default_factory_name,
     get_full_state,
     insert_row,
-    log_agent_step,
     reset_to_seed,
-    save_purchase_order,
     update_rows,
     upsert_row,
 )
@@ -208,12 +206,12 @@ def get_latest_run():
     if not run:
         return {"run_id": None}
     winner = next((p for p in run["playbooks"] if p["id"] == run["recommended_plan_id"]), None)
-    receipt = run_store.get_receipt(run.get("parent_run_id") or run_id)
+    receipt = db.get_receipt(run.get("parent_run_id") or run_id)
     return {
         "run_id": run_id,
         "recommended_plan_id": run["recommended_plan_id"],
         "winner": winner,
-        "executed": bool(receipt and not receipt.get("pending")),
+        "executed": receipt is not None,
         "ai_mode": run.get("ai_mode", {}),
         "parent_run_id": run.get("parent_run_id"),
     }
@@ -599,8 +597,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
     def _same(existing: Dict[str, Any]) -> bool:
         return existing.get("run_id") == req.run_id and existing.get("playbook_id") == req.playbook_id
 
-    existing = run_store.get_receipt(root_id)
-    if existing and not existing.get("pending"):
+    def _already(existing: Dict[str, Any]) -> ExecutionReceiptResponse:
         if not _same(existing):
             raise HTTPException(
                 status_code=409,
@@ -608,92 +605,92 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
                        f"run a new analysis to choose a different plan.",
             )
         return ExecutionReceiptResponse(**{**existing, "already_executed": True})
+
+    existing = db.get_receipt(root_id)
+    if existing:
+        return _already(existing)
     if not playbook.get("feasible", True):
         raise HTTPException(status_code=409, detail="Playbook is infeasible (capacity exhausted); choose another.")
-    if not run_store.claim_execution(root_id):
-        existing = run_store.get_receipt(root_id) or {}
-        if existing.get("pending") or not _same(existing):
-            raise HTTPException(status_code=409, detail="This analysis is already being executed or was executed with another plan.")
-        return ExecutionReceiptResponse(**{**existing, "already_executed": True})
 
-    try:
-        payload = playbook.get("tally_po_payload") or {}
-        po_number = payload.get("po_number") or f"PO-CZ-{uuid.uuid4().hex[:8].upper()}"
-        order_id = run.get("order_id", "EV-402")
-        now = datetime.now(timezone.utc).isoformat()
+    payload = playbook.get("tally_po_payload") or {}
+    po_number = payload.get("po_number") or f"PO-CZ-{uuid.uuid4().hex[:8].upper()}"
+    order_id = run.get("order_id", "EV-402")
+    now = datetime.now(timezone.utc).isoformat()
 
-        save_purchase_order({
+    po_row = {
+        "po_number": po_number,
+        "playbook_id": playbook["id"],
+        "order_id": order_id,
+        "vendor_allocations_json": playbook["vendor_allocations"],
+        "overtime_hours": playbook["overtime_hours"],
+        "total_cost_inr": playbook["total_mitigation_cost_inr"],
+        "net_sla_saved_inr": playbook["net_sla_saved_inr"],
+        "confidence_pct": playbook["confidence_pct"],
+        "tally_xml_payload": payload.get("tally_xml", ""),
+        "shift_broadcast_msg": playbook["shift_broadcast_msg"],
+        "client_sla_notice": playbook["client_sla_notice"],
+        "status": "APPROVED_DRAFT",
+        "approved_by": req.approved_by,
+        "run_id": req.run_id,
+        "created_at": now,
+    }
+    new_order_status = {
+        "SLA_RENEGOTIATION": "EXTENSION_REQUESTED",
+        "NO_ACTION": "RISK_ACCEPTED",
+    }.get(playbook["strategy_type"], "RECOVERY_IN_PROGRESS")
+    supplier_updates = [
+        {"supplier_id": a["supplier_id"], "inbound_qty": a["units_allocated"]}
+        for a in playbook["vendor_allocations"]
+    ]
+    overtime_line_ids = [lid for lid, hrs in (playbook.get("overtime_line_hours") or {}).items() if hrs > 0]
+    agent_log = {
+        "run_id": req.run_id, "step_order": 10,
+        "agent_name": "Human Approver", "agent_role": "HITL Execution", "badge_color": "emerald",
+        "tool_called": "commit_purchase_order()",
+        "tool_output_summary": f"PO {po_number} approved by {req.approved_by}; order #{order_id} → {new_order_status}.",
+        "message": (
+            f"✅ {playbook['id']} approved by {req.approved_by}. Draft Tally PO {po_number}, "
+            f"shift notice ({playbook['overtime_hours']}h) and client notice generated. "
+            f"Nothing has been sent to suppliers automatically."
+        ),
+        "created_at": now,
+    }
+    receipt = ExecutionReceiptResponse(
+        success=True,
+        run_id=req.run_id,
+        po_number=po_number,
+        playbook_id=playbook["id"],
+        order_id=order_id,
+        approved_by=req.approved_by,
+        total_cost_inr=playbook["total_mitigation_cost_inr"],
+        net_sla_saved_inr=playbook["net_sla_saved_inr"],
+        confidence_pct=playbook["confidence_pct"],
+        tally_xml_payload=payload.get("tally_xml", ""),
+        tally_json_payload={
+            "voucher_type": "Purchase Order",
             "po_number": po_number,
-            "playbook_id": playbook["id"],
-            "order_id": order_id,
-            "vendor_allocations_json": playbook["vendor_allocations"],
-            "overtime_hours": playbook["overtime_hours"],
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "company": default_factory_name(),
             "total_cost_inr": playbook["total_mitigation_cost_inr"],
-            "net_sla_saved_inr": playbook["net_sla_saved_inr"],
-            "confidence_pct": playbook["confidence_pct"],
-            "tally_xml_payload": payload.get("tally_xml", ""),
-            "shift_broadcast_msg": playbook["shift_broadcast_msg"],
-            "client_sla_notice": playbook["client_sla_notice"],
-            "status": "APPROVED_DRAFT",
-            "approved_by": req.approved_by,
-            "run_id": req.run_id,
-            "created_at": now,
-        })
-
-        new_order_status = {
-            "SLA_RENEGOTIATION": "EXTENSION_REQUESTED",
-            "NO_ACTION": "RISK_ACCEPTED",
-        }.get(playbook["strategy_type"], "RECOVERY_IN_PROGRESS")
-        update_rows("orders", "order_id", order_id, {"status": new_order_status, "updated_at": now})
-        for a in playbook["vendor_allocations"]:
-            update_rows("suppliers", "id", a["supplier_id"], {
-                "status": "PO_DRAFTED", "inbound_qty": a["units_allocated"], "updated_at": now,
-            })
-        for lid, hrs in (playbook.get("overtime_line_hours") or {}).items():
-            if hrs > 0:
-                update_rows("production_lines", "line_id", lid, {"status": "OVERTIME_SCHEDULED", "updated_at": now})
-
-        log_agent_step(
-            run_id=req.run_id, step_order=10,
-            agent_name="Human Approver", agent_role="HITL Execution", badge_color="emerald",
-            tool_called="commit_purchase_order()",
-            tool_output_summary=f"PO {po_number} approved by {req.approved_by}; order #{order_id} → {new_order_status}.",
-            message=(
-                f"✅ {playbook['id']} approved by {req.approved_by}. Draft Tally PO {po_number}, "
-                f"shift notice ({playbook['overtime_hours']}h) and client notice generated. "
-                f"Nothing has been sent to suppliers automatically."
-            ),
+            "allocations": playbook["vendor_allocations"],
+            "overtime_hours": playbook["overtime_hours"],
+        },
+        shift_broadcast_msg=playbook["shift_broadcast_msg"],
+        client_sla_notice=playbook["client_sla_notice"],
+        executed_at=now,
+    )
+    try:
+        db.execute_plan_tx(
+            po=po_row, order_id=order_id, order_status=new_order_status,
+            supplier_updates=supplier_updates, overtime_line_ids=overtime_line_ids,
+            agent_log=agent_log, root_run_id=root_id, receipt=receipt.model_dump(),
         )
-
-        receipt = ExecutionReceiptResponse(
-            success=True,
-            run_id=req.run_id,
-            po_number=po_number,
-            playbook_id=playbook["id"],
-            order_id=order_id,
-            approved_by=req.approved_by,
-            total_cost_inr=playbook["total_mitigation_cost_inr"],
-            net_sla_saved_inr=playbook["net_sla_saved_inr"],
-            confidence_pct=playbook["confidence_pct"],
-            tally_xml_payload=payload.get("tally_xml", ""),
-            tally_json_payload={
-                "voucher_type": "Purchase Order",
-                "po_number": po_number,
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "company": default_factory_name(),
-                "total_cost_inr": playbook["total_mitigation_cost_inr"],
-                "allocations": playbook["vendor_allocations"],
-                "overtime_hours": playbook["overtime_hours"],
-            },
-            shift_broadcast_msg=playbook["shift_broadcast_msg"],
-            client_sla_notice=playbook["client_sla_notice"],
-            executed_at=now,
-        )
-        run_store.store_receipt(root_id, receipt.model_dump())
-        return receipt
-    except Exception:
-        run_store.release_claim(root_id)
-        raise
+    except db.AlreadyExecutedError:
+        existing = db.get_receipt(root_id)
+        if existing is None:
+            raise HTTPException(status_code=409, detail="This analysis is already being executed; retry shortly.")
+        return _already(existing)
+    return receipt
 
 
 @app.post("/api/v1/execute-plan", dependencies=[Depends(require_api_key)])
@@ -737,7 +734,6 @@ def post_vendor_reply(run_id: str, req: SourcingReplyRequest):
 def reset_factory():
     if settings.is_production:
         raise HTTPException(status_code=403, detail="Reset is disabled in production")
-    run_store.clear()
     return reset_to_seed()
 
 

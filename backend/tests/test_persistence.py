@@ -272,3 +272,42 @@ class DurableStateTests(unittest.TestCase):
             db.reset_to_seed()
         for t in ("analysis_runs", "sourcing_sessions", "execution_receipts", "webhook_events"):
             self.assertIn(t, deleted)
+
+
+class _CodedError(Exception):
+    def __init__(self, code, msg="x"):
+        super().__init__(msg)
+        self.code = code
+
+
+class ExecutePlanTxTests(unittest.TestCase):
+    ARGS = dict(po={"po_number": "PO-1"}, order_id="EV-402", order_status="RECOVERY_IN_PROGRESS",
+                supplier_updates=[], overtime_line_ids=[], agent_log={}, root_run_id="R1",
+                receipt={"run_id": "R1", "playbook_id": "A"})
+
+    def test_unique_violation_is_already_executed(self):
+        stub = StubClient(error=_CodedError("23505"))
+        with mock.patch("app.db._get_supabase", return_value=stub):
+            with self.assertRaises(db.AlreadyExecutedError) as cm:
+                db.execute_plan_tx(**self.ARGS)
+        self.assertEqual(cm.exception.root_run_id, "R1")
+
+    def test_missing_function_is_database_error(self):
+        stub = StubClient(error=_CodedError("PGRST202", "Could not find the function public.execute_plan_tx"))
+        with mock.patch("app.db._get_supabase", return_value=stub):
+            with self.assertRaises(db.DatabaseError) as cm:
+                db.execute_plan_tx(**self.ARGS)
+        self.assertEqual((cm.exception.operation, cm.exception.table), ("rpc", "execute_plan_tx"))
+
+    def test_other_error_is_database_error(self):
+        with mock.patch("app.db._get_supabase", return_value=FailingClient()):
+            with self.assertRaises(db.DatabaseError):
+                db.execute_plan_tx(**self.ARGS)
+
+    def test_offline_duplicate_root_run_id(self):
+        db.reset_to_seed()
+        db.execute_plan_tx(**self.ARGS)
+        with self.assertRaises(db.AlreadyExecutedError):
+            db.execute_plan_tx(**self.ARGS)
+        self.assertEqual(db.get_receipt("R1"), self.ARGS["receipt"])
+        self.assertEqual(len(db.fetch_all("purchase_orders")), 1)
