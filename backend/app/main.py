@@ -738,7 +738,6 @@ def reset_factory():
     if settings.is_production:
         raise HTTPException(status_code=403, detail="Reset is disabled in production")
     run_store.clear()
-    sourcing.clear()
     return reset_to_seed()
 
 

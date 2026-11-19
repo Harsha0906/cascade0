@@ -12,7 +12,7 @@ from tests import _offline_env  # noqa: F401  (must precede app imports)
 from fastapi.testclient import TestClient
 
 from app import main, run_store
-from app.agents import sourcing
+from app.agents import sourcing, sourcing_store
 from app.agents.sourcing import RFQ, _regex_parse
 from app.db import update_rows
 
@@ -97,7 +97,7 @@ class SourcingFlowTests(unittest.TestCase):
         s = self._start(sim["run_id"])
         rfq = s["rfqs"][0]
         self.assertEqual((rfq["supplier_id"], rfq["expected_unit_price_inr"]), ("SUP-PNY-02", 600))
-        session = sourcing._sessions[sim["run_id"]]
+        session = sourcing_store.load(sim["run_id"])
         self.assertEqual(session.model, run_store.get_run(sim["run_id"])["factory_model"])
         self.assertEqual(session.params["line_speeds"], run_store.get_run(sim["run_id"])["line_speeds"])
 
@@ -107,7 +107,7 @@ class SourcingFlowTests(unittest.TestCase):
         run["factory_model"] = dataclasses.replace(run["factory_model"], qa_dispatch_hours=5.0)
         run_store.save_run(run)
         s = self._start(sim["run_id"])
-        deadline = sourcing._sessions[sim["run_id"]].params["deadline_hours"]
+        deadline = sourcing_store.load(sim["run_id"]).params["deadline_hours"]
         self.assertEqual(s["rfqs"][0]["needed_within_hours"], round(deadline - 5.0 - 1, 1))
 
     def test_session_not_registered_when_first_rfq_fails(self):
@@ -115,7 +115,7 @@ class SourcingFlowTests(unittest.TestCase):
         with mock.patch.object(sourcing, "_send_rfq", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
                 sourcing.start_sourcing(sim["run_id"])
-        self.assertNotIn(sim["run_id"], sourcing._sessions)
+        self.assertIsNone(sourcing_store.load(sim["run_id"]))
         s = self._start(sim["run_id"])  # a retry starts cleanly
         self.assertEqual(s["status"], "ACTIVE")
 
@@ -150,8 +150,9 @@ class SourcingFlowTests(unittest.TestCase):
     def test_timeout_drops_vendor(self):
         sim = self._simulate(1)
         self._start(sim["run_id"])
-        session = sourcing._sessions[sim["run_id"]]
+        session = sourcing_store.load(sim["run_id"])
         session.rfqs[0].sent_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        sourcing_store.save(session)
         s = self.client.get(f"/api/v1/sourcing/{sim['run_id']}").json()
         self.assertEqual(s["rfqs"][0]["status"], "NO_REPLY")
         self.assertEqual(s["round"], 2)

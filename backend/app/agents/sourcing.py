@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from app import run_store
+from app.agents import sourcing_store
 from app.config import settings
 from app.db import get_all_suppliers, get_supplier, log_agent_step, upsert_row
 from app.factory_model import FactoryModel, Vendor, load_factory_model
@@ -50,7 +51,7 @@ from app.solver import generate_playbooks
 logger = logging.getLogger("cascadezero.sourcing")
 
 _lock = threading.RLock()
-_sessions: Dict[str, "SourcingSession"] = {}
+_MAX_ATTEMPTS = 3
 
 
 class SourcingError(Exception):
@@ -109,6 +110,42 @@ class SourcingSession:
     events: List[str] = field(default_factory=list)
     sourced_run_id: Optional[str] = None
     log_step: int = 20
+    version: int = 0   # optimistic-concurrency counter; 0 = never saved
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "playbook_id": self.playbook_id,
+            "params": self.params,
+            "model": self.model.to_dict(),
+            "status": self.status,
+            "round": self.round,
+            "rfqs": [asdict(r) for r in self.rfqs],
+            "overrides": self.overrides,
+            "confirmed": sorted(self.confirmed),
+            "events": list(self.events),
+            "sourced_run_id": self.sourced_run_id,
+            "log_step": self.log_step,
+            "version": self.version,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SourcingSession":
+        return cls(
+            run_id=d["run_id"],
+            playbook_id=d["playbook_id"],
+            params=dict(d["params"]),
+            model=FactoryModel.from_dict(d["model"]),
+            status=d.get("status", "ACTIVE"),
+            round=d.get("round", 0),
+            rfqs=[RFQ(**r) for r in d.get("rfqs", [])],
+            overrides={k: dict(v) for k, v in d.get("overrides", {}).items()},
+            confirmed=set(d.get("confirmed", [])),
+            events=list(d.get("events", [])),
+            sourced_run_id=d.get("sourced_run_id"),
+            log_step=d.get("log_step", 20),
+            version=d.get("version", 0),
+        )
 
 
 # ─── Reply parsing (perception) ──────────────────────────────────────────────
@@ -385,7 +422,7 @@ def _advance(session: SourcingSession) -> None:
 
 def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, Any]:
     with _lock:
-        if run_id in _sessions:
+        if sourcing_store.load(run_id) is not None:
             return view(run_id)
         run = run_store.get_run(run_id)
         if run is None:
@@ -422,13 +459,10 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
         if not playbook["vendor_allocations"]:
             result = _solve(session)
             _finish(session, result, "NOTHING_TO_SOURCE", f"{pid} needs no supplier purchase.")
-            _sessions[run_id] = session
-            return view(run_id)
+            return _save_new(session)
 
         session.round = 1
         sent = [_send_rfq(session, a["supplier_id"], a["units_allocated"]) for a in playbook["vendor_allocations"]]
-        # Register only once the first-round enquiries exist: a failure above leaves no half-built session.
-        _sessions[run_id] = session
         names = ", ".join(f"{r.supplier_name.split(' (')[0]} ({r.units_requested}u)" for r in sent)
         _log(session, f"Round 1 ({settings.SOURCING_MODE}): enquiries sent to {names}",
              f"📨 Checking {pid} with suppliers before approval. Enquiries sent to {names} "
@@ -436,56 +470,75 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
              "send_rfq()")
         if any(r.status == "SEND_FAILED" for r in sent):
             _advance(session)
-        return view(run_id)
+        # Persist only once the first-round enquiries exist: a failure above leaves no half-built session.
+        return _save_new(session)
+
+
+def _save_new(session: SourcingSession) -> Dict[str, Any]:
+    try:
+        sourcing_store.save(session)
+    except sourcing_store.ConcurrentUpdateError:
+        pass  # another worker started this run first; serve its session
+    return view(session.run_id)
 
 
 def record_reply(run_id: str, supplier_id: str, text: str, source: str = "operator") -> Dict[str, Any]:
     with _lock:
-        session = _sessions.get(run_id)
-        if session is None:
-            raise SourcingError("No sourcing session for this run.", 404)
-        if session.status != "ACTIVE":
-            raise SourcingError(f"Sourcing already finished ({session.status}).", 409)
-        rfq = next((r for r in reversed(session.rfqs) if r.supplier_id == supplier_id and r.status == "SENT"), None)
-        if rfq is None:
-            raise SourcingError(f"No open enquiry for {supplier_id} in this run.", 409)
+        for _ in range(_MAX_ATTEMPTS):
+            session = sourcing_store.load(run_id)
+            if session is None:
+                raise SourcingError("No sourcing session for this run.", 404)
+            _apply_reply(session, supplier_id, text, source)
+            try:
+                sourcing_store.save(session)
+            except sourcing_store.ConcurrentUpdateError:
+                continue   # the session changed underneath us: reload and re-apply
+            return view(run_id)
+        raise SourcingError("Sourcing session changed concurrently; retry", 409)
 
-        offer, parsed_by = parse_vendor_reply(text, rfq, session.model.stock_item_name)
-        rfq.reply_text = text[:500]
-        rfq.parsed_by = parsed_by
-        rfq.reply_source = source
-        rfq.replied_at = _now().isoformat()
-        units = max(0, int(offer.available_units or 0))
-        if offer.declined or units == 0:
-            rfq.status = "DECLINED"
-            rfq.offered_units = 0
-            session.overrides[supplier_id] = {"max_units": 0}
-            session.confirmed.discard(supplier_id)
+
+def _apply_reply(session: SourcingSession, supplier_id: str, text: str, source: str) -> None:
+    if session.status != "ACTIVE":
+        raise SourcingError(f"Sourcing already finished ({session.status}).", 409)
+    rfq = next((r for r in reversed(session.rfqs) if r.supplier_id == supplier_id and r.status == "SENT"), None)
+    if rfq is None:
+        raise SourcingError(f"No open enquiry for {supplier_id} in this run.", 409)
+
+    offer, parsed_by = parse_vendor_reply(text, rfq, session.model.stock_item_name)
+    rfq.reply_text = text[:500]
+    rfq.parsed_by = parsed_by
+    rfq.reply_source = source
+    rfq.replied_at = _now().isoformat()
+    units = max(0, int(offer.available_units or 0))
+    if offer.declined or units == 0:
+        rfq.status = "DECLINED"
+        rfq.offered_units = 0
+        session.overrides[supplier_id] = {"max_units": 0}
+        session.confirmed.discard(supplier_id)
+    else:
+        vendor = session.model.vendor(supplier_id)
+        rfq.status = "CONFIRMED" if units >= rfq.units_requested else "PARTIAL"
+        rfq.offered_units = units
+        rfq.offered_eta_hours = offer.eta_hours if offer.eta_hours is not None else vendor.lead_hours
+        override: Dict[str, Any] = {"max_units": units, "lead_hours": rfq.offered_eta_hours}
+        if _is_charter(vendor):
+            rfq.offered_unit_price_inr = offer.unit_price_inr or vendor.flat_cost  # quoted as charter total
+            override["flat_cost"] = rfq.offered_unit_price_inr
         else:
-            vendor = session.model.vendor(supplier_id)
-            rfq.status = "CONFIRMED" if units >= rfq.units_requested else "PARTIAL"
-            rfq.offered_units = units
-            rfq.offered_eta_hours = offer.eta_hours if offer.eta_hours is not None else vendor.lead_hours
-            override: Dict[str, Any] = {"max_units": units, "lead_hours": rfq.offered_eta_hours}
-            if _is_charter(vendor):
-                rfq.offered_unit_price_inr = offer.unit_price_inr or vendor.flat_cost  # quoted as charter total
-                override["flat_cost"] = rfq.offered_unit_price_inr
-            else:
-                rfq.offered_unit_price_inr = offer.unit_price_inr or rfq.expected_unit_price_inr
-                override["unit_cost"] = rfq.offered_unit_price_inr
-            session.overrides[supplier_id] = override
-            session.confirmed.add(supplier_id)
-        _persist(rfq)
+            rfq.offered_unit_price_inr = offer.unit_price_inr or rfq.expected_unit_price_inr
+            override["unit_cost"] = rfq.offered_unit_price_inr
+        session.overrides[supplier_id] = override
+        session.confirmed.add(supplier_id)
+    _persist(rfq)
 
-        offer_txt = (
-            "declined" if rfq.status == "DECLINED" else
-            f"{rfq.status.lower()}: {rfq.offered_units}u @ ₹{rfq.offered_unit_price_inr:,} in {rfq.offered_eta_hours:g}h"
-        )
-        _log(session, f"{rfq.supplier_name}: {offer_txt} (parsed by {parsed_by})",
-             f"📩 {rfq.supplier_name.split(' (')[0]} replied \"{text[:80]}\" → {offer_txt}.",
-             f"parse_vendor_reply({parsed_by})")
-        _advance(session)
-        return view(run_id)
+    offer_txt = (
+        "declined" if rfq.status == "DECLINED" else
+        f"{rfq.status.lower()}: {rfq.offered_units}u @ ₹{rfq.offered_unit_price_inr:,} in {rfq.offered_eta_hours:g}h"
+    )
+    _log(session, f"{rfq.supplier_name}: {offer_txt} (parsed by {parsed_by})",
+         f"📩 {rfq.supplier_name.split(' (')[0]} replied \"{text[:80]}\" → {offer_txt}.",
+         f"parse_vendor_reply({parsed_by})")
+    _advance(session)
 
 
 def find_open_rfq_by_number(number: str) -> Optional[Tuple[str, str]]:
@@ -499,22 +552,29 @@ def find_open_rfq_by_number(number: str) -> Optional[Tuple[str, str]]:
     }
     if not supplier_ids:
         return None
-    with _lock:
-        for session in reversed(list(_sessions.values())):
-            if session.status != "ACTIVE":
-                continue
-            for rfq in reversed(session.rfqs):
-                if rfq.supplier_id in supplier_ids and rfq.status == "SENT":
-                    return session.run_id, rfq.supplier_id
+    for session in sourcing_store.active():
+        for rfq in reversed(session.rfqs):
+            if rfq.supplier_id in supplier_ids and rfq.status == "SENT":
+                return session.run_id, rfq.supplier_id
     return None
 
 
 def view(run_id: str) -> Dict[str, Any]:
     with _lock:
-        session = _sessions.get(run_id)
-        if session is None:
-            raise SourcingError("No sourcing session for this run.", 404)
-        _advance(session)
+        for attempt in range(_MAX_ATTEMPTS):
+            session = sourcing_store.load(run_id)
+            if session is None:
+                raise SourcingError("No sourcing session for this run.", 404)
+            before = session.to_dict()
+            _advance(session)   # may expire timeouts / re-plan; persist whatever changed
+            if session.to_dict() == before:
+                break
+            try:
+                sourcing_store.save(session)
+                break
+            except sourcing_store.ConcurrentUpdateError:
+                if attempt == _MAX_ATTEMPTS - 1:
+                    raise SourcingError("Sourcing session changed concurrently; retry", 409)
         sourced = run_store.get_run(session.sourced_run_id) if session.sourced_run_id else None
         return {
             "run_id": session.run_id,
@@ -530,8 +590,3 @@ def view(run_id: str) -> Dict[str, Any]:
             "playbooks": sourced["playbooks"] if sourced else [],
             "recommended_plan_id": sourced["recommended_plan_id"] if sourced else None,
         }
-
-
-def clear() -> None:
-    with _lock:
-        _sessions.clear()

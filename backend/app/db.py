@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -459,6 +460,33 @@ def update_rows(
             row.update(updates)
             updated.append(copy.deepcopy(row))
     return updated
+
+
+_conditional_lock = threading.Lock()
+
+
+def update_rows_where(
+    table_name: str, match: dict[str, Any], updates: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Update rows matching ALL `match` equalities and return the updated rows
+    (empty list when nothing matched): the compare-and-set primitive behind optimistic
+    concurrency. Offline mode does it under a lock on the mirror."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            query = client.table(table_name).update(updates)
+            for column, value in match.items():
+                query = query.eq(column, value)
+            return query.execute().data or []
+        except Exception as exc:
+            raise _fail("update", table_name, exc) from exc
+    with _conditional_lock:
+        updated = []
+        for row in _mirror.get_table(table_name):
+            if all(row.get(c) == v for c, v in match.items()):
+                row.update(updates)
+                updated.append(copy.deepcopy(row))
+        return updated
 
 
 def delete_all(table_name: str) -> bool:

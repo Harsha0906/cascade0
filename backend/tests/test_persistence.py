@@ -9,6 +9,7 @@ from tests import _offline_env  # noqa: F401  (must precede app imports)
 from fastapi.testclient import TestClient
 
 from app import db, main, run_store
+from app.agents import sourcing_store
 from app.factory_model import FactoryModel
 from tests.fake_supabase import FailingClient, MissingTableError, StubClient
 
@@ -120,6 +121,80 @@ class RunPersistenceTests(unittest.TestCase):
         child.update(run_id="RUN-CHILD", parent_run_id=sim["run_id"])
         run_store.save_run(child)
         self.assertEqual(run_store.latest_run_id(), "RUN-CHILD")
+
+
+class SourcingPersistenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(main.app)
+
+    def setUp(self):
+        self.client.post("/api/v1/reset", headers=KEY)
+
+    def _simulate(self, scenario=1):
+        r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": scenario}, headers=KEY)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _start(self, run_id):
+        r = self.client.post("/api/v1/sourcing/start", json={"run_id": run_id}, headers=KEY)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _reply(self, run_id, supplier_id, text):
+        r = self.client.post(f"/api/v1/sourcing/{run_id}/vendor-reply",
+                             json={"supplier_id": supplier_id, "text": text}, headers=KEY)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_sourcing_survives_restart_mid_round(self):  # Review Focus 4
+        sim = self._simulate(1)
+        self._start(sim["run_id"])
+        importlib.reload(sourcing_store)  # drop any process state
+        s = self._reply(sim["run_id"], "SUP-PNY-02", "YES 150 pcs @600 in 4h")
+        self.assertEqual(s["status"], "COMPLETE")
+
+    def test_stale_save_is_rejected(self):
+        sim = self._simulate(1)
+        self._start(sim["run_id"])
+        a = sourcing_store.load(sim["run_id"])
+        b = sourcing_store.load(sim["run_id"])
+        sourcing_store.save(a)
+        with self.assertRaises(sourcing_store.ConcurrentUpdateError):
+            sourcing_store.save(b)
+
+    def test_reply_retries_after_conflict(self):
+        sim = self._simulate(1)
+        self._start(sim["run_id"])
+        real_save = sourcing_store.save
+        calls = {"n": 0}
+
+        def flaky(session):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sourcing_store.ConcurrentUpdateError()
+            return real_save(session)
+
+        with mock.patch.object(sourcing_store, "save", side_effect=flaky):
+            s = self._reply(sim["run_id"], "SUP-PNY-02", "YES 150 pcs @600 in 4h")
+        self.assertEqual(s["status"], "COMPLETE")
+
+    def test_persistent_conflict_is_409(self):
+        sim = self._simulate(1)
+        self._start(sim["run_id"])
+        with mock.patch.object(sourcing_store, "save", side_effect=sourcing_store.ConcurrentUpdateError()):
+            r = self.client.post(f"/api/v1/sourcing/{sim['run_id']}/vendor-reply",
+                                 json={"supplier_id": "SUP-PNY-02", "text": "YES"}, headers=KEY)
+        self.assertEqual(r.status_code, 409)
+
+    def test_session_round_trips_and_active_lists_it(self):
+        sim = self._simulate(1)
+        self._start(sim["run_id"])
+        s = sourcing_store.load(sim["run_id"])
+        self.assertEqual(s.version, 1)
+        self.assertEqual(type(s).from_dict(s.to_dict()).to_dict(), s.to_dict())
+        self.assertEqual([x.run_id for x in sourcing_store.active()], [sim["run_id"]])
+        self.assertIsNone(sourcing_store.load("RUN-NOPE"))
 
 
 if __name__ == "__main__":
