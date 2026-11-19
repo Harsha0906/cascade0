@@ -162,7 +162,7 @@ WhatsApp approver allowlist, idempotent execution and CSV import.
 
 | Component | Status |
 |---|---|
-| MILP allocation (vendors, overtime, deadline feasibility, Line 2 throughput gap) | Real (PuLP + HiGHS/CBC). Infeasible inputs are reported, not hidden |
+| MILP allocation (vendors, per-line overtime, deadline feasibility, throughput gap computed from the factory's line data; LINE-2 speed is the only disruption input until Phase 3) | Real (PuLP + HiGHS/CBC). Infeasible inputs are reported, not hidden |
 | Plan ranking | Real: argmin of `cost + (1 − P_on_time) × SLA penalty` |
 | Monte Carlo on-time probability | Real, seeded; distributions are **assumptions** for the demo plant |
 | **Sourcing Agent** | Real agent loop: sends enquiries (not orders) to the vendors in a plan, reads replies (Gemini or regex, English/Hinglish), and re-plans with confirmed capacity/price/ETA, asking the next vendor when one declines, offers less, or times out (max 3 rounds). WhatsApp or simulated channel |
