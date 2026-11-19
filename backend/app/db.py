@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -559,6 +560,7 @@ _EXECUTION_TABLES = (
     "execution_receipts", "purchase_orders", "orders", "suppliers", "production_lines", "agent_logs",
 )
 _execute_lock = threading.Lock()
+_RECEIPTS_CONSTRAINT = "execution_receipts_pkey"
 
 
 def _error_text(exc: BaseException | None) -> str:
@@ -574,9 +576,10 @@ def _execute_plan_tx_live(params: dict[str, Any], root_run_id: str) -> dict[str,
         cause = exc.__cause__
         code = str(getattr(cause, "code", "") or "")
         text = _error_text(cause)
-        if code == "23505" or "23505" in text:
-            raise AlreadyExecutedError(root_run_id) from exc
-        if code == "PGRST202" or "PGRST202" in text or "Could not find the function" in text:
+        if code == "23505" or (not code and re.search(r"23505", text)):
+            if _RECEIPTS_CONSTRAINT in text:
+                raise AlreadyExecutedError(root_run_id) from exc
+        elif code == "PGRST202" or (not code and re.search(r"PGRST202", text))\n                or "Could not find the function" in text:
             logger.error("execute_plan_tx is missing: apply supabase/migrations/004_durable_state.sql")
         raise
     return result if isinstance(result, dict) else params["p_receipt"]

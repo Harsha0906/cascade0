@@ -286,7 +286,7 @@ class ExecutePlanTxTests(unittest.TestCase):
                 receipt={"run_id": "R1", "playbook_id": "A"})
 
     def test_unique_violation_is_already_executed(self):
-        stub = StubClient(error=_CodedError("23505"))
+        stub = StubClient(error=_CodedError("23505", 'violates unique constraint "execution_receipts_pkey"'))
         with mock.patch("app.db._get_supabase", return_value=stub):
             with self.assertRaises(db.AlreadyExecutedError) as cm:
                 db.execute_plan_tx(**self.ARGS)
@@ -311,3 +311,59 @@ class ExecutePlanTxTests(unittest.TestCase):
             db.execute_plan_tx(**self.ARGS)
         self.assertEqual(db.get_receipt("R1"), self.ARGS["receipt"])
         self.assertEqual(len(db.fetch_all("purchase_orders")), 1)
+
+
+class _RecordingClient:
+    def __init__(self, data=None, error=None):
+        self.calls, self._data, self._error = [], data, error
+
+    def rpc(self, name, params):
+        self.calls.append((name, params))
+        outer = self
+
+        class _Q:
+            def execute(self):
+                if outer._error is not None:
+                    raise outer._error
+                return type("R", (), {"data": outer._data})()
+        return _Q()
+
+
+class ExecutePlanTxClassificationTests(unittest.TestCase):
+    ARGS = ExecutePlanTxTests.ARGS
+
+    def _run(self, error):
+        with mock.patch("app.db._get_supabase", return_value=StubClient(error=error)):
+            return db.execute_plan_tx(**self.ARGS)
+
+    def test_receipts_pkey_violation_is_already_executed(self):
+        err = _CodedError("23505", 'duplicate key value violates unique constraint "execution_receipts_pkey"')
+        with self.assertRaises(db.AlreadyExecutedError):
+            self._run(err)
+
+    def test_other_unique_violation_is_database_error(self):
+        err = _CodedError("23505", 'duplicate key value violates unique constraint "purchase_orders_pkey"')
+        with self.assertRaises(db.DatabaseError):
+            self._run(err)
+
+    def test_code_lookalike_in_message_is_database_error(self):
+        err = Exception('error 123505 on execution_receipts_pkey')
+        with self.assertRaises(db.DatabaseError):
+            self._run(err)
+
+    def test_rpc_name_and_params(self):
+        client = _RecordingClient(data={"ok": 1})
+        args = dict(self.ARGS, overtime_line_ids=["L1"], supplier_updates=[{"supplier_id": "S", "inbound_qty": 3}],
+                    agent_log={"run_id": "R1"})
+        with mock.patch("app.db._get_supabase", return_value=client):
+            db.execute_plan_tx(**args)
+        (name, params), = client.calls
+        self.assertEqual(name, "execute_plan_tx")
+        self.assertEqual(set(params), {"p_po", "p_order_id", "p_order_status", "p_supplier_updates",
+                                       "p_overtime_line_ids", "p_agent_log", "p_root_run_id", "p_receipt"})
+        self.assertIsInstance(params["p_po"], dict)
+        self.assertIsInstance(params["p_supplier_updates"], list)
+        self.assertIsInstance(params["p_overtime_line_ids"], list)
+        self.assertIsInstance(params["p_agent_log"], dict)
+        self.assertEqual(params["p_receipt"]["run_id"], "R1")
+        self.assertEqual(params["p_receipt"]["playbook_id"], "A")
