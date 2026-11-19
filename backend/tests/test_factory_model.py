@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest import mock
 
@@ -5,7 +6,7 @@ from tests import _offline_env  # noqa: F401
 
 from app.agents.graph import run_cascade_pipeline
 from app.db import _SEED_SUPPLIERS, fetch_all, get_agent_logs, get_all_production_lines, get_all_suppliers
-from app.factory_model import FactoryDataError, load_factory_model
+from app.factory_model import FactoryDataError, FactoryModel, load_factory_model
 from tests.factories import small_factory
 
 
@@ -14,6 +15,10 @@ class FactoryModelTests(unittest.TestCase):
         self.assertEqual(small_factory().throughput_gap({"L-A": 50}), 50)  # 10*0.5*10
         self.assertEqual(small_factory().throughput_gap({"L-A": 50, "L-B": 80}), 70)
         self.assertEqual(small_factory().throughput_gap({"L-A": 100}), 0)
+
+    def test_factory_model_roundtrip(self):
+        m = load_factory_model()
+        self.assertEqual(FactoryModel.from_dict(json.loads(json.dumps(m.to_dict()))), m)
 
     def test_unknown_line_rejected(self):
         with self.assertRaises(FactoryDataError):

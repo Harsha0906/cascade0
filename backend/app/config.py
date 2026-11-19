@@ -99,7 +99,14 @@ class Settings:
             problems.append("ALLOWED_ORIGINS contains '*'")
         if self.has_supabase and not self.SUPABASE_SERVICE_ROLE_KEY:
             problems.append("SUPABASE_SERVICE_ROLE_KEY is not set: backend writes use the anon key (incompatible with RLS)")
+        if self.is_production and self.storage_mode == "offline":
+            problems.append("offline storage in production: Supabase is not configured, so state would be lost on restart")
         return problems
+
+    @property
+    def storage_mode(self) -> str:
+        """'supabase' when credentials are configured, otherwise 'offline' (in-memory mirror)."""
+        return "supabase" if self.has_supabase else "offline"
 
     @property
     def has_supabase(self) -> bool:
