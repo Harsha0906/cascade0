@@ -158,7 +158,7 @@ class RankingTests(unittest.TestCase):
         plan_b = next(p for p in res.playbooks if p.id == "PLAN_B")
         self.assertFalse(plan_b.feasible)
         self.assertEqual(plan_b.confidence_pct, 0.0)
-        self.assertNotEqual(res.recommended_plan_id, "PLAN_B")
+        self.assertEqual(res.recommended_plan_id, "PLAN_C")  # golden: renegotiate when capacity is exhausted
 
     def test_demo_scenarios_regression(self):
         r1 = generate_playbooks(DEMO, 150, 48, S(50), **ORDER)
