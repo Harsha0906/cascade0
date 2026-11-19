@@ -76,6 +76,49 @@ class ApiTests(unittest.TestCase):
         self.assertEqual((lines["LINE-1"], lines["LINE-3"]), ("OVERTIME_SCHEDULED", "OVERTIME_SCHEDULED"))
         self.assertNotEqual(lines["LINE-2"], "OVERTIME_SCHEDULED")
 
+    # ── factory-data error handling ──
+    def _meta_text(self, sender, text):
+        raw, headers = _signed({"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {
+            "messages": [{"from": sender, "type": "text", "text": {"body": text}}]}}]}]})
+        return self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers)
+
+    def test_factory_endpoint_503_on_invalid_data(self):
+        with mock.patch.object(main, "load_factory_model", side_effect=FactoryDataError("bad lines")):
+            r = self.client.get("/api/v1/factory")
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.json()["detail"], "Factory data invalid: bad lines")
+
+    def test_sourcing_start_503_on_invalid_factory_data(self):
+        sim = self._simulate(1)
+        with mock.patch("app.agents.sourcing.load_factory_model", side_effect=FactoryDataError("bad vendors")):
+            r = self.client.post("/api/v1/sourcing/start",
+                                 json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}, headers=KEY)
+        self.assertEqual(r.status_code, 503, r.text)
+        self.assertIn("Factory data invalid: bad vendors", r.json()["detail"])
+
+    def test_meta_pipeline_factory_error_is_not_500(self):
+        before = len(self.sent)
+        with mock.patch("app.agents.graph.load_factory_model", side_effect=FactoryDataError("bad data")):
+            r = self._meta_text("919000000001", "Flood on NH48, 48h delay, 150 casings short")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "error")
+        self.assertIn("Factory data invalid", r.json()["detail"])
+        self.assertGreater(len(self.sent), before)
+
+    def test_meta_vendor_reply_factory_error_is_not_500(self):
+        with mock.patch.object(main.sourcing, "find_open_rfq_by_number", return_value=("run-x", "SUP-X")),              mock.patch.object(main.sourcing, "record_reply", side_effect=FactoryDataError("bad data")):
+            r = self._meta_text("919000000002", "ok 100 units at 500")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "error")
+        self.assertEqual(r.json()["run_id"], "run-x")
+
+    def test_twilio_pipeline_factory_error_is_not_500(self):
+        with mock.patch("app.agents.graph.load_factory_model", side_effect=FactoryDataError("bad data")):
+            r = self.client.post("/api/v1/webhooks/whatsapp",
+                                 data={"Body": "Flood on NH48, 48h delay", "From": "whatsapp:+1"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("factory data invalid", r.text)
+
     # ── auth ──
     def test_mutating_endpoints_require_api_key(self):
         for path, body in [

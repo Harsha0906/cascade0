@@ -359,7 +359,15 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     open_rfq = sourcing.find_open_rfq_by_number(sender)
     if open_rfq:
         run_id, supplier_id = open_rfq
-        await run_in_threadpool(sourcing.record_reply, run_id, supplier_id, body_text, f"whatsapp:{sender}")
+        try:
+            await run_in_threadpool(sourcing.record_reply, run_id, supplier_id, body_text, f"whatsapp:{sender}")
+        except (FactoryDataError, sourcing.SourcingError) as exc:
+            logger.error("Vendor reply from %s could not be processed: %s", sender, exc)
+            await run_in_threadpool(
+                send_whatsapp_text, sender,
+                "⚠️ We could not process your reply right now. Please contact the plant team directly.",
+            )
+            return {"status": "error", "detail": str(exc), "run_id": run_id}
         await run_in_threadpool(send_whatsapp_text, sender, "🙏 Thank you — your reply has been recorded. This is not yet a purchase order.")
         return {"status": "success", "action": "vendor_reply_recorded", "run_id": run_id}
     if body_text.lower() in ("status", "plant", "check"):
