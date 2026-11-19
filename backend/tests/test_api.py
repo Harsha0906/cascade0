@@ -116,6 +116,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.json()["status"], "error")
         self.assertIn("Factory data invalid", r.json()["detail"])
         self.assertGreater(len(self.sent), before)
+        sender, text = self.sent[-1][:2]
+        self.assertEqual(sender, "919000000001")
+        self.assertIn("misconfigured", text)
+        self.assertNotIn("bad data", text)  # no internal detail goes to WhatsApp senders
 
     def test_meta_vendor_reply_factory_error_is_not_500(self):
         with mock.patch.object(main.sourcing, "find_open_rfq_by_number", return_value=("run-x", "SUP-X")),              mock.patch.object(main.sourcing, "record_reply", side_effect=FactoryDataError("bad data")):
@@ -129,7 +133,8 @@ class ApiTests(unittest.TestCase):
             r = self.client.post("/api/v1/webhooks/whatsapp",
                                  data={"Body": "Flood on NH48, 48h delay", "From": "whatsapp:+1"})
         self.assertEqual(r.status_code, 200)
-        self.assertIn("factory data invalid", r.text)
+        self.assertIn("misconfigured", r.text)
+        self.assertNotIn("bad data", r.text)  # no internal detail goes to WhatsApp senders
 
     # ── auth ──
     def test_mutating_endpoints_require_api_key(self):

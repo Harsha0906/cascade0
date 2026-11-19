@@ -157,6 +157,10 @@ def get_state():
     return get_full_state()
 
 
+# Sent to WhatsApp senders when factory data is invalid; the detail stays in the server log.
+_MISCONFIGURED_REPLY = "Sorry — the planning service is misconfigured; the operator has been notified."
+
+
 def _factory_503(exc: Exception) -> HTTPException:
     logger.error("Factory data invalid: %s", exc)
     return HTTPException(status_code=503, detail=f"Factory data invalid: {exc}")
@@ -378,8 +382,8 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         result = await run_in_threadpool(_run_pipeline, body_text, "META_WHATSAPP_CLOUD_API")
     except FactoryDataError as exc:
         logger.error("WhatsApp pipeline failed, factory data invalid: %s", exc)
-        await run_in_threadpool(send_whatsapp_text, sender, f"⚠️ Cannot plan right now: factory data invalid — {exc}")
-        return {"status": "error", "detail": f"Factory data invalid: {exc}"}
+        await run_in_threadpool(send_whatsapp_text, sender, _MISCONFIGURED_REPLY)
+        return {"status": "error", "detail": "Factory data invalid (details in server log)"}
     except SolverInputError as exc:
         logger.warning("WhatsApp pipeline rejected inputs: %s", exc)
         await run_in_threadpool(send_whatsapp_text, sender, f"⚠️ Cannot plan for these inputs: {exc}")
@@ -446,7 +450,7 @@ async def whatsapp_webhook(request: Request):
             reply = _winner_summary(result) + "\nApprove from the dashboard."
         except FactoryDataError as exc:
             logger.error("Twilio pipeline failed, factory data invalid: %s", exc)
-            reply = f"⚠️ Cannot plan right now: factory data invalid — {exc}"
+            reply = _MISCONFIGURED_REPLY
         except SolverInputError as exc:
             reply = f"⚠️ Cannot plan for these inputs: {exc}"
     logger.info("Twilio reply to %s", sender)
