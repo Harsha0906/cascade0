@@ -98,13 +98,14 @@ class SourcingFlowTests(unittest.TestCase):
         rfq = s["rfqs"][0]
         self.assertEqual((rfq["supplier_id"], rfq["expected_unit_price_inr"]), ("SUP-PNY-02", 600))
         session = sourcing._sessions[sim["run_id"]]
-        self.assertIs(session.model, run_store.get_run(sim["run_id"])["factory_model"])
+        self.assertEqual(session.model, run_store.get_run(sim["run_id"])["factory_model"])
         self.assertEqual(session.params["line_speeds"], run_store.get_run(sim["run_id"])["line_speeds"])
 
     def test_rfq_deadline_uses_the_factory_qa_time(self):
         sim = self._simulate(1)
         run = run_store.get_run(sim["run_id"])
         run["factory_model"] = dataclasses.replace(run["factory_model"], qa_dispatch_hours=5.0)
+        run_store.save_run(run)
         s = self._start(sim["run_id"])
         deadline = sourcing._sessions[sim["run_id"]].params["deadline_hours"]
         self.assertEqual(s["rfqs"][0]["needed_within_hours"], round(deadline - 5.0 - 1, 1))

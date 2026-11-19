@@ -1,12 +1,15 @@
 """Fail-loud database layer: live-DB failures raise, never fall back to the mirror."""
 
+import importlib
+import json
 import unittest
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
 from fastapi.testclient import TestClient
 
-from app import db, main
+from app import db, main, run_store
+from app.factory_model import FactoryModel
 from tests.fake_supabase import FailingClient, MissingTableError, StubClient
 
 KEY = {"X-API-Key": "test-operator-key"}
@@ -75,6 +78,48 @@ class FailLoudTests(unittest.TestCase):
     def test_production_refuses_offline_storage(self):
         with mock.patch.object(db.settings, "CASCADE_ENV", "production"):
             self.assertTrue(any("offline storage" in p for p in db.settings.security_problems()))
+
+
+class RunPersistenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(main.app)
+
+    def setUp(self):
+        self.client.post("/api/v1/reset", headers=KEY)
+
+    def _simulate(self, scenario=1):
+        r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": scenario}, headers=KEY)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_run_survives_module_reload(self):  # no process-local state
+        sim = self._simulate(1)
+        importlib.reload(run_store)
+        run = run_store.get_run(sim["run_id"])
+        self.assertIsInstance(run["factory_model"], FactoryModel)
+        self.assertEqual(run["recommended_plan_id"], sim["recommended_plan_id"])
+        self.assertEqual(run_store.latest_run_id(), sim["run_id"])
+
+    def test_unknown_run_is_none(self):
+        self.assertIsNone(run_store.get_run("RUN-NOPE"))
+
+    def test_persisted_payload_is_json_stable(self):
+        sim = self._simulate(1)
+        payload = db.fetch_by_id("analysis_runs", "run_id", sim["run_id"])["payload"]
+        self.assertEqual(json.loads(json.dumps(payload)), payload)
+
+    def test_non_serialisable_payload_rejected(self):
+        with self.assertRaises(ValueError):
+            run_store.save_run({"run_id": "RUN-BAD", "blob": object()})
+        self.assertIsNone(run_store.get_run("RUN-BAD"))
+
+    def test_latest_is_most_recently_saved(self):
+        sim = self._simulate(1)
+        child = run_store.get_run(sim["run_id"])
+        child.update(run_id="RUN-CHILD", parent_run_id=sim["run_id"])
+        run_store.save_run(child)
+        self.assertEqual(run_store.latest_run_id(), "RUN-CHILD")
 
 
 if __name__ == "__main__":

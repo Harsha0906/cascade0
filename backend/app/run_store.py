@@ -1,47 +1,60 @@
 """
-In-process store of recent pipeline runs.
+Durable store of pipeline runs (table `analysis_runs`) plus in-process execution receipts.
 
 Execution must use the plan the server computed, never numbers echoed back by a client,
-so /execute-plan looks the playbook up here by run_id. Each run can be executed at most
-once (idempotency): a repeat request returns the original receipt.
+so /execute-plan looks the playbook up here by run_id. Runs live in the database (offline
+mode: the in-memory mirror), so they survive restarts and multiple workers.
 
-Limitation: this lives in memory, so runs are lost on restart and it does not work across
-multiple worker processes. Persist runs in the database before scaling out.
+Receipts/claims are still process-local; Task 5 moves them to the database.
 """
 
 from __future__ import annotations
 
+import copy
+import json
 import threading
-from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-_MAX_RUNS = 100
+from app import db
+from app.factory_model import FactoryModel
+
+_TABLE = "analysis_runs"
 _lock = threading.Lock()
-_runs: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _receipts: Dict[str, Dict[str, Any]] = {}
-_latest_run_id: Optional[str] = None
 
 
 def save_run(result: Dict[str, Any]) -> None:
-    global _latest_run_id
-    run_id = result["run_id"]
-    with _lock:
-        _runs[run_id] = result
-        _runs.move_to_end(run_id)
-        while len(_runs) > _MAX_RUNS:
-            old, _ = _runs.popitem(last=False)
-            _receipts.pop(old, None)
-        _latest_run_id = run_id
+    payload = dict(result)
+    model = payload.get("factory_model")
+    if isinstance(model, FactoryModel):
+        payload["factory_model"] = model.to_dict()
+    try:
+        payload = json.loads(json.dumps(payload))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"run payload is not JSON-serialisable: {exc}") from exc
+    db.upsert_row(_TABLE, {
+        "run_id": result["run_id"],
+        "parent_run_id": result.get("parent_run_id"),
+        "factory_id": result.get("factory_id") or (model.factory_id if isinstance(model, FactoryModel) else None),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "payload": payload,
+    })
 
 
 def get_run(run_id: str) -> Optional[Dict[str, Any]]:
-    with _lock:
-        return _runs.get(run_id)
+    row = db.fetch_by_id(_TABLE, "run_id", run_id)
+    if row is None:
+        return None
+    payload = copy.deepcopy(row["payload"])
+    if isinstance(payload.get("factory_model"), dict):
+        payload["factory_model"] = FactoryModel.from_dict(payload["factory_model"])
+    return payload
 
 
 def latest_run_id() -> Optional[str]:
-    with _lock:
-        return _latest_run_id
+    rows = db.fetch_ordered(_TABLE, "created_at", desc=True, limit=1)
+    return rows[0]["run_id"] if rows else None
 
 
 def get_receipt(run_id: str) -> Optional[Dict[str, Any]]:
@@ -70,8 +83,6 @@ def release_claim(run_id: str) -> None:
 
 
 def clear() -> None:
-    global _latest_run_id
+    """Clear receipts only; runs are cleared by db.reset_to_seed()."""
     with _lock:
-        _runs.clear()
         _receipts.clear()
-        _latest_run_id = None

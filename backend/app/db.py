@@ -371,6 +371,30 @@ def fetch_by_id(table_name: str, pk_column: str, pk_value: str) -> dict[str, Any
     return None
 
 
+def fetch_ordered(
+    table_name: str, order_column: str, *, desc: bool = True, limit: int = 1
+) -> list[dict[str, Any]]:
+    """Fetch up to `limit` rows ordered by a column. Offline mode orders the mirror
+    (ties keep insertion order, so the last inserted row is newest)."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            response = (
+                client.table(table_name)
+                .select("*")
+                .order(order_column, desc=desc)
+                .limit(limit)
+                .execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            raise _fail("fetch_ordered", table_name, exc) from exc
+    rows = sorted(_mirror.get_table(table_name), key=lambda r: r.get(order_column) or "")
+    if desc:
+        rows.reverse()
+    return copy.deepcopy(rows[:limit])
+
+
 def upsert_row(table_name: str, row: dict[str, Any]) -> dict[str, Any]:
     """Insert or update a row. Offline mode writes the in-memory mirror."""
     client = _get_supabase()

@@ -101,7 +101,9 @@ class ApiTests(unittest.TestCase):
     def test_sourcing_start_503_on_invalid_factory_data(self):
         sim = self._simulate(1)
         # Runs carry their factory snapshot; only a run without one reloads (and can fail) here.
-        run_store.get_run(sim["run_id"]).pop("factory_model")
+        run = run_store.get_run(sim["run_id"])
+        run.pop("factory_model")
+        run_store.save_run(run)
         with mock.patch("app.agents.sourcing.load_factory_model", side_effect=FactoryDataError("bad vendors")):
             r = self.client.post("/api/v1/sourcing/start",
                                  json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}, headers=KEY)

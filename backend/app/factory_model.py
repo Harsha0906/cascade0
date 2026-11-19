@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping, Optional
 
 from app.config import settings
@@ -53,6 +54,23 @@ class FactoryModel:
     production_hours_in_window: float
     vendors: tuple[Vendor, ...]
     lines: tuple[ProductionLine, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe representation (tuples become lists)."""
+        return json.loads(json.dumps(asdict(self)))
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> "FactoryModel":
+        def vendor(v: Mapping[str, Any]) -> Vendor:
+            v = dict(v)
+            v["delay_shock_range"] = tuple(v["delay_shock_range"])
+            v["unreliability_delay_range"] = tuple(v["unreliability_delay_range"])
+            return Vendor(**v)
+
+        d = dict(d)
+        d["vendors"] = tuple(vendor(v) for v in d["vendors"])
+        d["lines"] = tuple(ProductionLine(**l) for l in d["lines"])
+        return cls(**d)
 
     def vendor(self, supplier_id: str) -> Vendor:
         for v in self.vendors:
