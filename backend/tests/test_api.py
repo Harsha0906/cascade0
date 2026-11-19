@@ -1,5 +1,6 @@
 """API tests (offline: in-memory DB mirror, no LLM, outbound WhatsApp stubbed)."""
 
+import copy
 import hashlib
 import hmac
 import json
@@ -71,9 +72,18 @@ class ApiTests(unittest.TestCase):
 
     def test_execution_marks_only_scheduled_overtime_lines(self):
         sim = self._simulate(2)
-        self.client.post("/api/v1/execute-plan", json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}, headers=KEY)
+        # Store a run whose chosen plan schedules overtime on LINE-1 only.
+        run = copy.deepcopy(run_store.get_run(sim["run_id"]))
+        run["run_id"] = "RUN-OT-LINE1"
+        playbook = next(p for p in run["playbooks"] if p["id"] == sim["recommended_plan_id"])
+        playbook.update(overtime_line_hours={"LINE-1": 2}, overtime_hours=2, feasible=True)
+        run_store.save_run(run)
+        r = self.client.post("/api/v1/execute-plan",
+                             json={"run_id": "RUN-OT-LINE1", "playbook_id": playbook["id"]}, headers=KEY)
+        self.assertEqual(r.status_code, 200, r.text)
         lines = {l["line_id"]: l["status"] for l in self.client.get("/api/v1/state").json()["production_lines"]}
-        self.assertEqual((lines["LINE-1"], lines["LINE-3"]), ("OVERTIME_SCHEDULED", "OVERTIME_SCHEDULED"))
+        self.assertEqual(lines["LINE-1"], "OVERTIME_SCHEDULED")
+        self.assertNotEqual(lines["LINE-3"], "OVERTIME_SCHEDULED")
         self.assertNotEqual(lines["LINE-2"], "OVERTIME_SCHEDULED")
 
     # ── factory-data error handling ──
