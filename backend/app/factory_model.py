@@ -62,6 +62,7 @@ class FactoryModel:
 
     @property
     def expedite_vendor_id(self) -> Optional[str]:
+        """The first EXPEDITE vendor by supplier id (vendors are kept sorted by id), or None."""
         for v in self.vendors:
             if v.sourcing_role == "EXPEDITE":
                 return v.supplier_id
@@ -177,7 +178,7 @@ def _load_vendor(row: Mapping[str, Any], history: Optional[Mapping[str, Any]],
     max_units = _num(row, t, "max_available_qty", label, p, minimum=0)
     unit_cost = _num(row, t, "extra_cost_per_unit_inr", label, p, minimum=0)
     flat_cost = _num(row, t, "flat_charter_cost_inr", label, p, minimum=0)
-    lead = _num(row, t, "lead_time_hours", label, p, minimum=0)
+    lead = _num(row, t, "lead_time_hours", label, p, strictly_positive=True)
     sigma = _num(row, t, "lead_time_sigma_hours", label, p, minimum=0)
     traffic = _num(row, t, "traffic_risk_pct", label, p, minimum=0, maximum=100)
     weather = _num(row, t, "weather_risk_pct", label, p, minimum=0, maximum=100)
@@ -185,7 +186,7 @@ def _load_vendor(row: Mapping[str, Any], history: Optional[Mapping[str, Any]],
     s_max = _num(row, t, "delay_shock_max_hours", label, p, minimum=0)
     u_min = _num(row, t, "unreliable_delay_min_hours", label, p, minimum=0)
     u_max = _num(row, t, "unreliable_delay_max_hours", label, p, minimum=0)
-    min_lead = _num(row, t, "min_lead_hours", label, p, minimum=0)
+    min_lead = _num(row, t, "min_lead_hours", label, p, strictly_positive=True)
 
     shock_pct = None
     if traffic is not None and weather is not None:
@@ -301,5 +302,8 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
     return FactoryModel(
         factory_id=factory_id, name=name, stock_item_name=stock_item,
         qa_dispatch_hours=qa, safety_stock_units=int(round(safety)),
-        production_hours_in_window=window, vendors=tuple(vendors), lines=tuple(lines),
+        production_hours_in_window=window,
+        # Sorted so the expedite choice and MILP tie-breaks never depend on database row order.
+        vendors=tuple(sorted(vendors, key=lambda v: v.supplier_id)),
+        lines=tuple(sorted(lines, key=lambda l: l.line_id)),
     )

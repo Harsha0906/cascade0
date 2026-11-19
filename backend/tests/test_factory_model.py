@@ -4,7 +4,7 @@ from unittest import mock
 from tests import _offline_env  # noqa: F401
 
 from app.agents.graph import run_cascade_pipeline
-from app.db import _SEED_SUPPLIERS
+from app.db import _SEED_SUPPLIERS, fetch_all, get_all_production_lines, get_all_suppliers
 from app.factory_model import FactoryDataError, load_factory_model
 from tests.factories import small_factory
 
@@ -54,12 +54,34 @@ class FactoryModelTests(unittest.TestCase):
 
     def test_invalid_values_all_reported(self):
         bad = {**_SEED_SUPPLIERS[1], "max_available_qty": -5,
-               "delay_shock_min_hours": 3.0, "delay_shock_max_hours": 1.0}
-        with mock.patch("app.factory_model.get_all_suppliers", return_value=[bad]):
+               "delay_shock_min_hours": 3.0, "delay_shock_max_hours": 1.0,
+               "lead_time_hours": 0, "min_lead_hours": 0}
+        history = [{**h, "reliability_score_pct": 120} if h["supplier_id"] == bad["id"] else h
+                   for h in fetch_all("vendor_history")]
+        with mock.patch("app.factory_model.get_all_suppliers", return_value=[bad]),                 mock.patch("app.factory_model.fetch_all", return_value=history):
             with self.assertRaises(FactoryDataError) as ctx:
                 load_factory_model()
-        self.assertIn("max_available_qty", str(ctx.exception))
-        self.assertIn("delay_shock", str(ctx.exception))
+        msg = str(ctx.exception)
+        for field in ("max_available_qty", "delay_shock", "lead_time_hours", "min_lead_hours",
+                      "reliability_score_pct"):
+            self.assertIn(field, msg)
+
+    def test_row_order_does_not_change_the_model(self):
+        forward = load_factory_model()
+        extra_air = {**_SEED_SUPPLIERS[3], "id": "SUP-AIR-01", "name": "Another Air Charter"}
+        history = fetch_all("vendor_history") + [
+            {**next(h for h in fetch_all("vendor_history") if h["supplier_id"] == "SUP-AIR-04"),
+             "supplier_id": "SUP-AIR-01"}]
+        suppliers = get_all_suppliers() + [extra_air]
+        with mock.patch("app.factory_model.fetch_all", return_value=history):
+            with mock.patch("app.factory_model.get_all_suppliers", return_value=suppliers):
+                a = load_factory_model()
+            with mock.patch("app.factory_model.get_all_suppliers", return_value=list(reversed(suppliers))),                     mock.patch("app.factory_model.get_all_production_lines",
+                               return_value=list(reversed(get_all_production_lines()))):
+                b = load_factory_model()
+        self.assertEqual(a, b)
+        self.assertEqual(a.expedite_vendor_id, "SUP-AIR-01")  # first EXPEDITE vendor by id
+        self.assertEqual([l.line_id for l in b.lines], [l.line_id for l in forward.lines])
 
     def test_invalid_sourcing_role_reported(self):
         bad = {**_SEED_SUPPLIERS[1], "sourcing_role": "WIZARD"}
