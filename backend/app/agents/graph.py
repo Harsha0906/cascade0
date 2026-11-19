@@ -32,15 +32,13 @@ from langgraph.graph import END, StateGraph
 
 from app.config import settings
 from app.agents.tools import (
-    check_air_charter_and_max_overtime,
     extract_disruption_entities,
     query_blast_radius_sql,
-    query_regional_vendors_and_memory,
     run_pulp_milp_and_monte_carlo,
 )
 from app.db import log_agent_step
+from app.factory_model import FactoryModel, load_factory_model
 from app.solver import (
-    VENDORS,
     simulate_monte_carlo,
     solve_pulp_milp,
 )
@@ -51,7 +49,6 @@ RELIABILITY_FLOOR_PCT = 85.0          # Ops challenges CFO plans that rely on ve
 CONFIDENCE_GAP_TRIGGER_PCT = 2.0      # ...or whose P(on-time) trails the Ops plan by more than this
 MAX_REBUTTAL_ROUNDS = 1
 
-_VENDOR_BY_ID = {v.supplier_id: v for v in VENDORS}
 _genai_client = None
 _gemini_failure_logged = False
 
@@ -105,9 +102,10 @@ def _trace(state: Dict[str, Any], node: str, mode: str) -> List[Dict[str, str]]:
 
 # ─── Proposal helpers (numbers come from the solver) ─────────────────────────
 
-def _score_proposal(lp: Dict[str, Any], deadline: float, delay: int, penalty: int) -> Dict[str, Any]:
+def _score_proposal(model: FactoryModel, lp: Dict[str, Any], deadline: float, delay: int,
+                    penalty: int) -> Dict[str, Any]:
     mc = simulate_monte_carlo(
-        "PROPOSAL", lp["units_by_vendor"], lp["overtime_hours"],
+        model, "PROPOSAL", lp["units_by_vendor"], lp["overtime_hours"],
         deadline_hours=deadline, fully_covered=lp["feasible"], delay_hours=delay,
     )
     p = mc["confidence_pct"] / 100.0
@@ -118,16 +116,16 @@ def _score_proposal(lp: Dict[str, Any], deadline: float, delay: int, penalty: in
     }
 
 
-def _fmt_units(units_by_vendor: Dict[str, int]) -> str:
-    parts = [f"{n}u {_VENDOR_BY_ID[sid].name.split(' (')[0]}" for sid, n in units_by_vendor.items()]
+def _fmt_units(model: FactoryModel, units_by_vendor: Dict[str, int]) -> str:
+    parts = [f"{n}u {model.vendor(sid).name.split(' (')[0]}" for sid, n in units_by_vendor.items()]
     return ", ".join(parts) or "no vendors"
 
 
-def _weak_vendors(units_by_vendor: Dict[str, int]) -> List[str]:
+def _weak_vendors(model: FactoryModel, units_by_vendor: Dict[str, int]) -> List[str]:
     return [
-        f"{_VENDOR_BY_ID[sid].name.split(' (')[0]} ({_VENDOR_BY_ID[sid].reliability_pct}%)"
+        f"{model.vendor(sid).name.split(' (')[0]} ({model.vendor(sid).reliability_pct}%)"
         for sid in units_by_vendor
-        if _VENDOR_BY_ID[sid].reliability_pct < RELIABILITY_FLOOR_PCT
+        if model.vendor(sid).reliability_pct < RELIABILITY_FLOOR_PCT
     ]
 
 
@@ -135,6 +133,9 @@ def _weak_vendors(units_by_vendor: Dict[str, int]) -> List[str]:
 
 class CascadeGraphState(TypedDict, total=False):
     run_id: str
+    factory_id: str
+    factory_model: FactoryModel
+    line_speeds: Dict[str, int]
     raw_message: str
     source_channel: str
 
@@ -148,7 +149,7 @@ class CascadeGraphState(TypedDict, total=False):
 
     blast_radius: Dict[str, Any]
 
-    ops_proposal: Dict[str, Any]
+    ops_proposal: Optional[Dict[str, Any]]
     cfo_proposal: Dict[str, Any]
     rebuttal_count: int
     rebuttal_pending: bool
@@ -180,6 +181,7 @@ def _ctx(state: CascadeGraphState) -> Tuple[float, int, int]:
 
 def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
+    model = load_factory_model(state.get("factory_id"))   # FactoryDataError propagates (-> 503 in main)
     extraction, source = extract_disruption_entities(state["raw_message"])
 
     # Explicit overrides (scenario presets / sliders) win over extraction, and we say so.
@@ -231,6 +233,9 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     trace = [{"node": "detective_extraction", "mode": "gemini" if source.startswith("gemini") else "regex-fallback"}]
     trace.append({"node": "detective", "mode": mode})
     return {
+        "factory_id": model.factory_id,
+        "factory_model": model,
+        "line_speeds": {"LINE-2": line2_speed},
         "delay_hours": delay_hours,
         "line2_speed_pct": line2_speed,
         "line2_temp_celsius": line2_temp,
@@ -251,14 +256,31 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
 def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
     deadline, delay, penalty = _ctx(state)
-    shortfall, speed = state["shortfall_units"], state["line2_speed_pct"]
+    shortfall, line_speeds = state["shortfall_units"], state["line_speeds"]
+    model = state["factory_model"]
 
     if not state.get("rebuttal_pending"):
-        check_air_charter_and_max_overtime()
-        lp = solve_pulp_milp(shortfall, delay, speed, deadline, force_air=True)
-        prop = _score_proposal(lp, deadline, delay, penalty)
+        expedite_id = model.expedite_vendor_id
+        if expedite_id is None:
+            log_agent_step(
+                run_id=run_id, step_order=3,
+                agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
+                tool_called="factory_model.expedite_vendor_id",
+                tool_output_summary=f"{model.name} has no expedite vendor available",
+                message=(f"🔥 {model.name} has no expedite option (no vendor with a flat charter cost and "
+                         f"capacity), so I have no maximum-speed proposal to make."),
+            )
+            return {"ops_proposal": None, "llm_trace": _trace(state, "ops_hawk", "template")}
+        expedite = model.vendor(expedite_id)
+        ot_lines = ", ".join(f"{l.line_id} (<={l.max_ot_hours}h OT, {l.ot_units_per_hour}u/h)"
+                             for l in model.overtime_lines) or "none"
+        lp = solve_pulp_milp(model, shortfall, line_speeds, deadline, force_vendor_id=expedite_id)
+        prop = _score_proposal(model, lp, deadline, delay, penalty)
         facts = {
-            "plan": _fmt_units(prop["units_by_vendor"]), "overtime_hours": prop["overtime_hours"],
+            "expedite_vendor": f"{expedite.name} (flat ₹{expedite.flat_cost:,}, {expedite.lead_hours:g}h lead, "
+                               f"cap {expedite.max_units}u, {expedite.reliability_pct}% reliable)",
+            "overtime_lines": ot_lines,
+            "plan": _fmt_units(model, prop["units_by_vendor"]), "overtime_hours": prop["overtime_hours"],
             "cost_inr": prop["total_cost_inr"], "p_on_time_pct": prop["confidence_pct"],
             "feasible": prop["feasible"],
         }
@@ -272,9 +294,9 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
         log_agent_step(
             run_id=run_id, step_order=3,
             agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
-            tool_called="solve_pulp_milp(force_air=True) + simulate_monte_carlo()",
+            tool_called=f"solve_pulp_milp(force_vendor_id={expedite_id}) + simulate_monte_carlo()",
             tool_output_summary=(
-                f"{facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
+                f"Expedite {facts['expedite_vendor']}; OT lines {ot_lines} | {facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
                 f"P(on-time) {prop['confidence_pct']}% | E[cost] ₹{prop['expected_cost_inr']:,}"
             ),
             message=msg,
@@ -282,20 +304,20 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
         return {"ops_proposal": prop, "llm_trace": _trace(state, "ops_hawk", mode)}
 
     # Rebuttal turn: challenge the CFO plan with computed evidence.
-    cfo, ops = state["cfo_proposal"], state["ops_proposal"]
-    weak = _weak_vendors(cfo["units_by_vendor"])
+    cfo, ops = state["cfo_proposal"], state.get("ops_proposal")
+    weak = _weak_vendors(model, cfo["units_by_vendor"])
     reasons = []
     if weak:
         reasons.append(f"relies on {', '.join(weak)} below the {RELIABILITY_FLOOR_PCT:g}% reliability floor")
     if not cfo["feasible"]:
         reasons.append("leaves units uncovered")
-    if ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT:
+    if ops is not None and ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT:
         reasons.append(f"P(on-time) {cfo['confidence_pct']}% vs my {ops['confidence_pct']}%")
     challenge = "CFO plan " + "; ".join(reasons) + "."
     msg, mode = _llm_agent_reason(
         "Operations Hawk", "Chief of Manufacturing Operations",
         "Challenge the CFO plan using only the computed risk evidence.",
-        {"challenge": challenge, "cfo_plan": _fmt_units(cfo["units_by_vendor"])},
+        {"challenge": challenge, "cfo_plan": _fmt_units(model, cfo["units_by_vendor"])},
         f"⚡ REBUTTAL: {challenge} Re-plan without the weak link.",
     )
     log_agent_step(
@@ -312,48 +334,49 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
 
 # ─── Node 3: CFO Watchdog ────────────────────────────────────────────────────
 
-def _needs_rebuttal(cfo: Dict[str, Any], ops: Dict[str, Any]) -> bool:
-    return bool(
-        _weak_vendors(cfo["units_by_vendor"])
-        or not cfo["feasible"]
-        or ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT
-    )
+def _needs_rebuttal(model: FactoryModel, cfo: Dict[str, Any], ops: Optional[Dict[str, Any]]) -> bool:
+    gap = ops is not None and ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT
+    return bool(_weak_vendors(model, cfo["units_by_vendor"]) or not cfo["feasible"] or gap)
 
 
 def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
     deadline, delay, penalty = _ctx(state)
-    shortfall, speed = state["shortfall_units"], state["line2_speed_pct"]
+    shortfall, line_speeds = state["shortfall_units"], state["line_speeds"]
+    model = state["factory_model"]
     rounds = state.get("rebuttal_count", 0)
-    query_regional_vendors_and_memory(shortfall)
 
     if rounds == 0:
-        lp = solve_pulp_milp(shortfall, delay, speed, deadline)
-        prop = _score_proposal(lp, deadline, delay, penalty)
-        ops = state["ops_proposal"]
-        saving = ops["total_cost_inr"] - prop["total_cost_inr"]
+        lp = solve_pulp_milp(model, shortfall, line_speeds, deadline)
+        prop = _score_proposal(model, lp, deadline, delay, penalty)
+        ops = state.get("ops_proposal")
+        saving = None if ops is None else ops["total_cost_inr"] - prop["total_cost_inr"]
+        regional = [f"{v.name.split(' (')[0]} (cap {v.max_units}u, ₹{v.unit_cost}/u, {v.reliability_pct}% reliable)"
+                    for v in model.vendors if v.supplier_id != model.expedite_vendor_id]
         facts = {
-            "plan": _fmt_units(prop["units_by_vendor"]), "overtime_hours": prop["overtime_hours"],
+            "regional_vendors": regional,
+            "plan": _fmt_units(model, prop["units_by_vendor"]), "overtime_hours": prop["overtime_hours"],
             "cost_inr": prop["total_cost_inr"], "p_on_time_pct": prop["confidence_pct"],
             "saving_vs_ops_inr": saving,
         }
+        saving_txt = f" (₹{saving:,} less than Ops)" if saving is not None else ""
         msg, mode = _llm_agent_reason(
             "CFO Watchdog", "VP of Finance",
             "Argue for the lowest-cost plan that still protects the order.", facts,
             f"💰 Cost-minimal plan: {facts['plan']} + {prop['overtime_hours']}h overtime = "
-            f"₹{prop['total_cost_inr']:,} (₹{saving:,} less than Ops), P(on-time) {prop['confidence_pct']}%.",
+            f"₹{prop['total_cost_inr']:,}{saving_txt}, P(on-time) {prop['confidence_pct']}%.",
         )
         log_agent_step(
             run_id=run_id, step_order=4,
             agent_name="CFO Watchdog", agent_role="VP of Finance", badge_color="cyan",
             tool_called="solve_pulp_milp(min cost) + simulate_monte_carlo()",
             tool_output_summary=(
-                f"{facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
+                f"Vendors: {'; '.join(regional) or 'none'} | {facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
                 f"P(on-time) {prop['confidence_pct']}% | E[cost] ₹{prop['expected_cost_inr']:,}"
             ),
             message=msg,
         )
-        pending = _needs_rebuttal(prop, ops) and MAX_REBUTTAL_ROUNDS > 0
+        pending = _needs_rebuttal(model, prop, ops) and MAX_REBUTTAL_ROUNDS > 0
         return {
             "cfo_proposal": prop,
             "rebuttal_pending": pending,
@@ -363,12 +386,13 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
 
     # Response to the rebuttal: re-solve without low-reliability vendors, keep the better E[cost].
     original = state["cfo_proposal"]
-    lp = solve_pulp_milp(shortfall, delay, speed, deadline, min_vendor_reliability_pct=RELIABILITY_FLOOR_PCT)
-    revised = _score_proposal(lp, deadline, delay, penalty)
+    lp = solve_pulp_milp(model, shortfall, line_speeds, deadline,
+                         min_vendor_reliability_pct=RELIABILITY_FLOOR_PCT)
+    revised = _score_proposal(model, lp, deadline, delay, penalty)
     concede = revised["expected_cost_inr"] < original["expected_cost_inr"]
     chosen = revised if concede else original
     verdict = (
-        f"Conceded: revised plan {_fmt_units(revised['units_by_vendor'])} has lower E[cost] "
+        f"Conceded: revised plan {_fmt_units(model, revised['units_by_vendor'])} has lower E[cost] "
         f"(₹{revised['expected_cost_inr']:,} vs ₹{original['expected_cost_inr']:,})."
         if concede else
         f"Held position: excluding weak vendors raises E[cost] to ₹{revised['expected_cost_inr']:,} "
@@ -407,9 +431,10 @@ def arbitrator_node(state: CascadeGraphState) -> Dict[str, Any]:
     deadline, delay, penalty = _ctx(state)
     br = state.get("blast_radius", {})
     solver_dict = run_pulp_milp_and_monte_carlo(
+        state["factory_model"],
         shortfall_units=state["shortfall_units"],
         delay_hours=delay,
-        line2_speed_pct=state["line2_speed_pct"],
+        line_speeds=state["line_speeds"],
         order_id=state.get("order_id", "EV-402"),
         sla_penalty_inr=penalty,
         partial_penalty_inr=int(_default(br.get("partial_delay_penalty_inr"), 500_000)),
@@ -498,10 +523,12 @@ def run_cascade_pipeline(
     override_shortfall_units: Optional[int] = None,
     override_line2_speed_pct: Optional[int] = None,
     order_id: str = "EV-402",
+    factory_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     run_id = f"RUN-{uuid.uuid4().hex[:8].upper()}"
     initial: CascadeGraphState = {
         "run_id": run_id,
+        "factory_id": factory_id,
         "raw_message": raw_message,
         "source_channel": source_channel,
         "delay_hours": override_delay_hours,

@@ -43,12 +43,12 @@ from pydantic import BaseModel, Field
 from app import run_store
 from app.config import settings
 from app.db import get_all_suppliers, get_supplier, log_agent_step, upsert_row
+from app.factory_model import FactoryModel, Vendor, load_factory_model
 from app.meta_whatsapp import send_whatsapp_template, send_whatsapp_text
-from app.solver import AIR, VENDORS, generate_playbooks
+from app.solver import generate_playbooks
 
 logger = logging.getLogger("cascadezero.sourcing")
 
-_VENDOR_BY_ID = {v.supplier_id: v for v in VENDORS}
 _lock = threading.RLock()
 _sessions: Dict[str, "SourcingSession"] = {}
 
@@ -100,6 +100,7 @@ class SourcingSession:
     run_id: str
     playbook_id: str
     params: Dict[str, Any]
+    model: Optional[FactoryModel] = None   # loaded once at session start
     status: str = "ACTIVE"   # ACTIVE | COMPLETE | COMPLETE_UNCONFIRMED | NOTHING_TO_SOURCE
     round: int = 0
     rfqs: List[RFQ] = field(default_factory=list)
@@ -157,7 +158,7 @@ def _regex_parse(text: str, rfq: RFQ) -> VendorOffer:
     return VendorOffer(declined=units == 0, available_units=units, unit_price_inr=price, eta_hours=eta, notes=t[:200])
 
 
-def parse_vendor_reply(text: str, rfq: RFQ) -> Tuple[VendorOffer, str]:
+def parse_vendor_reply(text: str, rfq: RFQ, item: str = "units") -> Tuple[VendorOffer, str]:
     """Returns (offer, parsed_by) where parsed_by is 'gemini:<model>' or 'regex-fallback'."""
     if settings.has_gemini:
         try:
@@ -166,7 +167,7 @@ def parse_vendor_reply(text: str, rfq: RFQ) -> Tuple[VendorOffer, str]:
             client = genai.Client(api_key=settings.GEMINI_API_KEY, http_options={"timeout": 10000})
             prompt = (
                 "A supplier replied to our purchase enquiry. Extract their offer.\n"
-                f"Our enquiry: {rfq.units_requested} aluminium battery casings within "
+                f"Our enquiry: {rfq.units_requested} {item} within "
                 f"{rfq.needed_within_hours:g} hours at about ₹{rfq.expected_unit_price_inr}/unit.\n"
                 f'Supplier reply: "{text}"\n'
                 "Rules: if they accept without a quantity, available_units = our requested quantity. "
@@ -210,17 +211,23 @@ def _persist(rfq: RFQ) -> None:
     upsert_row("sourcing_rfqs", row)
 
 
-def _rfq_text(rfq: RFQ) -> str:
-    vendor = _VENDOR_BY_ID.get(rfq.supplier_id)
-    if vendor is AIR or rfq.supplier_id == AIR.supplier_id:
-        ask = f"an air charter for {rfq.units_requested} aluminium battery casings"
-        price = f"(our reference: ₹{AIR.flat_cost:,} total)"
+def _is_charter(vendor: Vendor) -> bool:
+    """A charter vendor is paid a flat fee, not per unit: its quoted price is the charter total."""
+    return vendor.flat_cost > 0 and vendor.unit_cost == 0
+
+
+def _rfq_text(model: FactoryModel, rfq: RFQ) -> str:
+    vendor = model.vendor(rfq.supplier_id)
+    item = model.stock_item_name
+    if _is_charter(vendor):
+        ask = f"an air charter for {rfq.units_requested} {item}"
+        price = f"(our reference: ₹{vendor.flat_cost:,} total)"
     else:
-        ask = f"{rfq.units_requested} aluminium battery casings"
+        ask = f"{rfq.units_requested} {item}"
         price = f"at about ₹{rfq.expected_unit_price_inr}/unit"
     return (
-        f"Namaste {rfq.supplier_name.split(' (')[0]} team — Apex Volt purchase desk here.\n"
-        f"ENQUIRY (not a purchase order): can you deliver {ask} to our Bengaluru Unit-2 "
+        f"Namaste {rfq.supplier_name.split(' (')[0]} team — {model.name} purchase desk here.\n"
+        f"ENQUIRY (not a purchase order): can you deliver {ask} to our plant "
         f"within {rfq.needed_within_hours:g} hours {price}?\n"
         f"Please reply with quantity, price and delivery time, e.g. \"YES 150 pcs @600 in 4h\" or \"NO\".\n"
         f"Ref: {rfq.id}"
@@ -228,7 +235,8 @@ def _rfq_text(rfq: RFQ) -> str:
 
 
 def _send_rfq(session: SourcingSession, supplier_id: str, units: int) -> RFQ:
-    vendor = next(v for v in VENDORS if v.supplier_id == supplier_id)
+    model = session.model
+    vendor = model.vendor(supplier_id)
     override = session.overrides.get(supplier_id, {})
     rfq = RFQ(
         id=f"RFQ-{uuid.uuid4().hex[:6].upper()}",
@@ -241,7 +249,7 @@ def _send_rfq(session: SourcingSession, supplier_id: str, units: int) -> RFQ:
         needed_within_hours=max(1.0, round(session.params["deadline_hours"] - 2.5 - 1, 1)),
         channel=settings.SOURCING_MODE,
     )
-    rfq.message = _rfq_text(rfq)
+    rfq.message = _rfq_text(model, rfq)
 
     if settings.SOURCING_MODE == "whatsapp":
         number = _digits((get_supplier(supplier_id) or {}).get("whatsapp_number", ""))
@@ -250,7 +258,7 @@ def _send_rfq(session: SourcingSession, supplier_id: str, units: int) -> RFQ:
             rfq.reply_text = "No WhatsApp number on file for this vendor."
         else:
             if settings.SOURCING_RFQ_TEMPLATE:
-                price = (f"Rs {AIR.flat_cost:,} total" if supplier_id == AIR.supplier_id
+                price = (f"Rs {vendor.flat_cost:,} total" if _is_charter(vendor)
                          else f"Rs {rfq.expected_unit_price_inr}/unit")
                 sent = send_whatsapp_template(
                     number, settings.SOURCING_RFQ_TEMPLATE,
@@ -289,9 +297,10 @@ def _expire_timeouts(session: SourcingSession) -> List[RFQ]:
 def _solve(session: SourcingSession):
     p = session.params
     return generate_playbooks(
+        model=session.model,
         shortfall_units=p["shortfall_units"],
         delay_hours=p["delay_hours"],
-        line2_speed_pct=p["line2_speed_pct"],
+        line_speeds={"LINE-2": p["line2_speed_pct"]},
         order_id=p["order_id"],
         sla_penalty_inr=p["sla_penalty_inr"],
         partial_penalty_inr=p["partial_penalty_inr"],
@@ -390,10 +399,13 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
 
         br = run.get("blast_radius", {})
         sr = run.get("solver_result", {})
+        factory_id = run.get("factory_id")
         session = SourcingSession(
             run_id=run_id,
             playbook_id=pid,
+            model=load_factory_model(factory_id),   # FactoryDataError propagates
             params={
+                "factory_id": factory_id,
                 "shortfall_units": run["shortfall_units"],
                 "delay_hours": run["delay_hours"],
                 "line2_speed_pct": run["line2_speed_pct"],
@@ -434,7 +446,7 @@ def record_reply(run_id: str, supplier_id: str, text: str, source: str = "operat
         if rfq is None:
             raise SourcingError(f"No open enquiry for {supplier_id} in this run.", 409)
 
-        offer, parsed_by = parse_vendor_reply(text, rfq)
+        offer, parsed_by = parse_vendor_reply(text, rfq, session.model.stock_item_name)
         rfq.reply_text = text[:500]
         rfq.parsed_by = parsed_by
         rfq.reply_source = source
@@ -446,13 +458,13 @@ def record_reply(run_id: str, supplier_id: str, text: str, source: str = "operat
             session.overrides[supplier_id] = {"max_units": 0}
             session.confirmed.discard(supplier_id)
         else:
-            vendor = _VENDOR_BY_ID[supplier_id]
+            vendor = session.model.vendor(supplier_id)
             rfq.status = "CONFIRMED" if units >= rfq.units_requested else "PARTIAL"
             rfq.offered_units = units
             rfq.offered_eta_hours = offer.eta_hours if offer.eta_hours is not None else vendor.lead_hours
             override: Dict[str, Any] = {"max_units": units, "lead_hours": rfq.offered_eta_hours}
-            if supplier_id == AIR.supplier_id:
-                rfq.offered_unit_price_inr = offer.unit_price_inr or AIR.flat_cost  # quoted as charter total
+            if _is_charter(vendor):
+                rfq.offered_unit_price_inr = offer.unit_price_inr or vendor.flat_cost  # quoted as charter total
                 override["flat_cost"] = rfq.offered_unit_price_inr
             else:
                 rfq.offered_unit_price_inr = offer.unit_price_inr or rfq.expected_unit_price_inr

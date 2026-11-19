@@ -3,9 +3,7 @@ CascadeZero — Autonomous Agent Tools
 Defines tools bound to the 4 LangGraph agents:
   1. extract_disruption_entities (Gemini structured extraction + regex fallback; reports which ran)
   2. query_blast_radius_sql (Supabase blast-radius calculation & state updates)
-  3. check_air_charter_and_max_overtime (Ops Hawk air & overtime capacity query)
-  4. query_regional_vendors_and_memory (CFO Watchdog regional vendors + episodic memory)
-  5. run_pulp_milp_and_monte_carlo (Arbitrator PuLP MILP solver & Monte Carlo engine)
+  3. run_pulp_milp_and_monte_carlo (Arbitrator PuLP MILP solver & Monte Carlo engine)
 """
 
 from __future__ import annotations
@@ -13,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from app.config import settings
 from app.db import (
@@ -22,12 +20,11 @@ from app.db import (
     get_all_production_lines,
     get_all_suppliers,
     get_order,
-    get_supplier,
-    get_vendor_history,
     update_rows,
     upsert_row,
 )
 from app.schemas import DisruptionExtraction
+from app.factory_model import FactoryModel
 from app.solver import generate_playbooks
 
 logger = logging.getLogger("cascadezero.tools")
@@ -181,125 +178,27 @@ def query_blast_radius_sql(
     }
 
 
-# ─── 3. Ops Hawk: Air Charter & Overtime Query ───────────────────────────────
-
-def check_air_charter_and_max_overtime() -> Dict[str, Any]:
-    """
-    Queries emergency air charter availability and maximum shift overtime capacity.
-    Used by Operations Hawk to formulate Plan A (Max Speed).
-    """
-    air_sup = get_supplier("SUP-AIR-04") or {
-        "name": "BlueDart Aviation Charter",
-        "flat_charter_cost_inr": 600000,
-        "lead_time_hours": 6,
-        "max_available_qty": 500,
-        "weather_risk_pct": 2.0,
-    }
-
-    air_history = get_vendor_history("SUP-AIR-04") or {
-        "reliability_score_pct": 98.5,
-        "on_time_deliveries": 5,
-        "past_orders_count": 5,
-    }
-
-    return {
-        "air_charter": {
-            "supplier_id": "SUP-AIR-04",
-            "name": air_sup.get("name", "BlueDart Aviation Charter"),
-            "flat_cost_inr": air_sup.get("flat_charter_cost_inr", 600000),
-            "lead_time_hours": air_sup.get("lead_time_hours", 6),
-            "capacity_units": air_sup.get("max_available_qty", 500),
-            "reliability_pct": air_history.get("reliability_score_pct", 98.5),
-        },
-        "parallel_lines": {
-            "lines": ["LINE-1", "LINE-3"],
-            "ot_rate_per_hour_inr": 22500,
-            "units_per_ot_hour": 38,
-            "max_ot_hours": 8,
-            "max_extra_units": 304,
-        },
-    }
-
-
-# ─── 4. CFO Watchdog: Regional Vendors & Episodic Memory ─────────────────────
-
-def query_regional_vendors_and_memory(shortfall_units: int) -> Dict[str, Any]:
-    """
-    Queries Tier-2 Peenya & Tier-3 Hosur suppliers AND audits their episodic
-    memory history in Supabase. Used by CFO Watchdog to challenge air freight spend.
-    """
-    peenya_sup = get_supplier("SUP-PNY-02") or {
-        "name": "Peenya Rapid Metals",
-        "max_available_qty": 200,
-        "extra_cost_per_unit_inr": 600,
-        "lead_time_hours": 4,
-    }
-    peenya_hist = get_vendor_history("SUP-PNY-02") or {
-        "reliability_score_pct": 93.3,
-        "quality_rejection_rate_pct": 0.8,
-        "last_incident_note": "Consistent 4h delivery via Tumkur Road; max batch 200 units.",
-    }
-
-    hosur_sup = get_supplier("SUP-HSR-03") or {
-        "name": "Hosur Precision Castings",
-        "max_available_qty": 180,
-        "extra_cost_per_unit_inr": 850,
-        "lead_time_hours": 8,
-    }
-    hosur_hist = get_vendor_history("SUP-HSR-03") or {
-        "reliability_score_pct": 81.8,
-        "quality_rejection_rate_pct": 2.1,
-        "last_incident_note": "Border toll bottleneck at Attibele during peak hours.",
-    }
-
-    exceeds_peenya_cap = shortfall_units > peenya_sup.get("max_available_qty", 200)
-
-    return {
-        "peenya": {
-            "id": "SUP-PNY-02",
-            "name": peenya_sup.get("name"),
-            "max_cap": peenya_sup.get("max_available_qty", 200),
-            "cost_per_unit": peenya_sup.get("extra_cost_per_unit_inr", 600),
-            "lead_time_hours": peenya_sup.get("lead_time_hours", 4),
-            "reliability_pct": peenya_hist.get("reliability_score_pct", 93.3),
-            "rejection_rate_pct": peenya_hist.get("quality_rejection_rate_pct", 0.8),
-            "memory_note": peenya_hist.get("last_incident_note", ""),
-        },
-        "hosur": {
-            "id": "SUP-HSR-03",
-            "name": hosur_sup.get("name"),
-            "max_cap": hosur_sup.get("max_available_qty", 180),
-            "cost_per_unit": hosur_sup.get("extra_cost_per_unit_inr", 850),
-            "lead_time_hours": hosur_sup.get("lead_time_hours", 8),
-            "reliability_pct": hosur_hist.get("reliability_score_pct", 81.8),
-            "rejection_rate_pct": hosur_hist.get("quality_rejection_rate_pct", 2.1),
-            "memory_note": hosur_hist.get("last_incident_note", ""),
-        },
-        "shortfall_units": shortfall_units,
-        "exceeds_peenya_cap": exceeds_peenya_cap,
-    }
-
-
-# ─── 5. Arbitrator: PuLP MILP Solver & Monte Carlo Engine ────────────────────
+# ─── 3. Arbitrator: PuLP MILP Solver & Monte Carlo Engine ────────────────────
 
 def run_pulp_milp_and_monte_carlo(
+    model: FactoryModel,
     shortfall_units: int,
     delay_hours: int,
-    line2_speed_pct: int,
-    order_id: str = "EV-402",
+    line_speeds: Mapping[str, int],
     **solver_kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Invokes the PuLP mixed-integer program and Monte Carlo simulation and
-    returns all 3 playbooks ranked by risk-adjusted expected cost.
-    Extra keyword arguments (sla_penalty_inr, deadline_hours, client,
-    cfo_min_vendor_reliability_pct, ...) are passed through to generate_playbooks.
+    returns the playbooks ranked by risk-adjusted expected cost.
+    Keyword arguments (order_id, sla_penalty_inr, partial_penalty_inr, deadline_hours,
+    client, cfo_min_vendor_reliability_pct, ...) are passed through to generate_playbooks.
+    FactoryDataError propagates to the caller.
     """
     result = generate_playbooks(
+        model=model,
         shortfall_units=shortfall_units,
         delay_hours=delay_hours,
-        line2_speed_pct=line2_speed_pct,
-        order_id=order_id,
+        line_speeds=line_speeds,
         **solver_kwargs,
     )
     return result.model_dump()

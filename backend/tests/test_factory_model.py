@@ -3,6 +3,7 @@ from unittest import mock
 
 from tests import _offline_env  # noqa: F401
 
+from app.agents.graph import run_cascade_pipeline
 from app.db import _SEED_SUPPLIERS
 from app.factory_model import FactoryDataError, load_factory_model
 from tests.factories import small_factory
@@ -74,6 +75,16 @@ class FactoryModelTests(unittest.TestCase):
     def test_unknown_factory_id(self):
         with self.assertRaisesRegex(FactoryDataError, "no-such-plant"):
             load_factory_model("no-such-plant")
+
+    def test_pipeline_runs_for_factory_without_expedite_vendor(self):
+        demo = load_factory_model()
+        no_air = demo.with_vendor_overrides({"SUP-AIR-04": {"max_units": 0}})
+        with mock.patch("app.agents.graph.load_factory_model", return_value=no_air):
+            r = run_cascade_pipeline("x", override_shortfall_units=150, override_delay_hours=48,
+                                     override_line2_speed_pct=50)
+        self.assertIsNone(r["ops_proposal"])
+        self.assertNotIn("PLAN_A", [p["id"] for p in r["playbooks"]])
+        self.assertIn(r["recommended_plan_id"], {"PLAN_B", "PLAN_C", "PLAN_D"})
 
 
 if __name__ == "__main__":
