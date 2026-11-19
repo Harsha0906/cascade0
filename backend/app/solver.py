@@ -41,11 +41,21 @@ from app.schemas import (
 UNCOVERED_UNIT_PENALTY = 1_000_000
 
 # Objective tie-breaks (never part of any reported cost):
-#   ₹1 per hour of elapsed overtime window → prefer balancing overtime across lines.
-#   ₹0.01 per sourced unit → never allocate more units than needed from a zero-unit-cost
+#   per hour of elapsed overtime window → prefer balancing overtime across lines;
+#   per sourced unit → never allocate more units than needed from a zero-unit-cost
 #   (flat-fee) vendor.
-_WINDOW_TIE_BREAK_PER_HOUR = 1.0
-_UNIT_TIE_BREAK = 0.01
+# All real cost coefficients are whole rupees, so any two plans with different real cost
+# differ by >= ₹1. The weights are sized from the model so that the tie-breaks' worst case
+# (longest possible window, every vendor at capacity) stays below ₹1 in total; with a zero
+# MIP gap they can therefore only choose among plans of equal real cost.
+_TIE_BREAK_BUDGET_INR = 0.4   # per term; two terms -> worst case 0.8 < ₹1
+
+
+def _tie_break_weights(model: FactoryModel) -> tuple[float, float]:
+    """(₹ per overtime-window hour, ₹ per sourced unit), each term's worst case <= ₹0.4."""
+    max_window = max((l.max_ot_hours for l in model.overtime_lines), default=0)
+    max_units = sum(v.max_units for v in model.vendors)
+    return _TIE_BREAK_BUDGET_INR / max(1, max_window), _TIE_BREAK_BUDGET_INR / max(1, max_units)
 
 
 class SolverInputError(ValueError):
@@ -107,7 +117,7 @@ def solve_pulp_milp(
 ) -> Dict[str, Any]:
     """
     Minimise   Σ unit_cost_v·x_v + Σ flat_cost_v·y_v + Σ ot_cost_l·h_l
-               + BIG·(u_mat + u_cap) + 1·H + 0.01·Σ x_v              (last two: tie-breaks only)
+               + BIG·(u_mat + u_cap) + w_H·H + w_x·Σ x_v       (last two: tie-breaks < ₹1 total)
     subject to
       Σ x_v + u_mat               >= material_shortfall          (units to source)
       Σ ot_units_l·h_l + u_cap    >= throughput_gap(line_speeds) (lost line output)
@@ -145,7 +155,8 @@ def solve_pulp_milp(
     x = {v.supplier_id: _new_var(prob, _var_name("x", v.supplier_id), 0, v.max_units, "Integer") for v in vendors}
     y = {v.supplier_id: _new_var(prob, _var_name("y", v.supplier_id), cat="Binary") for v in vendors}
     h = {l.line_id: _new_var(prob, _var_name("h", l.line_id), 0, l.max_ot_hours, "Integer") for l in lines}
-    window = _new_var(prob, "H_ot_window", 0, None)
+    window = _new_var(prob, "H_ot_window", 0, max((l.max_ot_hours for l in lines), default=0))
+    w_window, w_unit = _tie_break_weights(model)
     u_mat = _new_var(prob, "u_material", 0, None)
     u_cap = _new_var(prob, "u_capacity", 0, None)
 
@@ -153,8 +164,8 @@ def solve_pulp_milp(
         pulp.lpSum(v.unit_cost * x[v.supplier_id] + v.flat_cost * y[v.supplier_id] for v in vendors)
         + pulp.lpSum(l.ot_cost_per_hour * h[l.line_id] for l in lines)
         + UNCOVERED_UNIT_PENALTY * (u_mat + u_cap)
-        + _WINDOW_TIE_BREAK_PER_HOUR * window
-        + _UNIT_TIE_BREAK * pulp.lpSum(x.values()),
+        + w_window * window
+        + w_unit * pulp.lpSum(x.values()),
         "Total_Recovery_Cost",
     )
     prob += (pulp.lpSum(x.values()) + u_mat >= shortfall_units, "Material_Coverage")
@@ -172,13 +183,16 @@ def solve_pulp_milp(
         if shortfall_units > 0:
             prob += (x[force_vendor_id] >= 1, "Policy_Forced_Vendor_Used")
 
+    # Relative MIP gap 0: the tie-break terms are < ₹1, so any gap tolerance could hide a
+    # cheaper plan behind them.
     solver = None
     if hasattr(pulp, "HiGHS"):
-        highs = pulp.HiGHS(msg=False)
+        highs = pulp.HiGHS(msg=False, gapRel=0)
         if highs.available():
             solver = highs
     if solver is None:
-        solver = pulp.PULP_CBC_CMD(msg=False)
+        cbc = getattr(pulp, "PULP_CBC_CMD", None) or pulp.COIN_CMD   # PuLP >= 3 has no bundled CBC
+        solver = cbc(msg=False, gapRel=0)
     status = _status_name(prob.solve(solver), prob)
     if status == "Infeasible":
         # Coverage has slack, so this can only come from a hard rule: a policy (e.g. a forced

@@ -95,6 +95,30 @@ class MilpTests(unittest.TestCase):
         self.assertEqual(lp["overtime_line_hours"], {"LINE-1": 4, "LINE-3": 4})
         self.assertEqual(lp["overtime_hours"], 4)
 
+    def test_tie_breaks_never_outweigh_one_rupee_of_real_cost(self):
+        # LINE-X loses 80 units. OT-1: ₹1000/h, 10 u/h -> 8h = ₹8000 (8h window).
+        # OT-2: ₹4001/h, 40 u/h -> 2h = ₹8002 (2h window). A ₹1/h window tie-break would pick
+        # OT-2 (8002 + 2 < 8000 + 8); the real cost minimum is OT-1.
+        m = replace(small_factory(), production_hours_in_window=16.0, lines=(
+            ProductionLine("LINE-X", "X", 10, 0, 0, 0),
+            ProductionLine("OT-1", "OT 1", 10, 10, 1000, 8),
+            ProductionLine("OT-2", "OT 2", 10, 40, 4001, 8),
+        ))
+        lp = solve_pulp_milp(m, 0, {"LINE-X": 50}, 24)
+        self.assertTrue(lp["feasible"])
+        self.assertEqual(lp["overtime_line_hours"], {"OT-1": 8})
+        self.assertEqual(lp["total_cost_inr"], 8000)
+
+    def test_tie_break_worst_case_is_below_one_rupee(self):
+        from app.solver import _tie_break_weights
+        for m in (DEMO, small_factory()):
+            w_window, w_unit = _tie_break_weights(m)
+            max_window = max((l.max_ot_hours for l in m.overtime_lines), default=0)
+            max_units = sum(v.max_units for v in m.vendors)
+            self.assertLess(w_window * max_window + w_unit * max_units, 1.0)
+            self.assertGreater(w_window, 0)
+            self.assertGreater(w_unit, 0)
+
     def test_factory_without_overtime_lines_reports_gap_uncovered(self):   # Review Focus 3
         m = replace(small_factory(), lines=(ProductionLine("L-A", "A", 10, 0, 0, 0),))
         lp = solve_pulp_milp(m, 0, {"L-A": 50}, 24)
