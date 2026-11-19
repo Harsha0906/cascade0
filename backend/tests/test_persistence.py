@@ -430,6 +430,16 @@ class WebhookDedupeHealthTests(unittest.TestCase):
         with mock.patch("app.db._get_supabase", return_value=StubClient(error=_UniqueViolation("dup"))):
             self.assertFalse(db.record_webhook_event("wamid.A"))
 
+    def test_record_webhook_event_codeless_unique_violation_is_false(self):
+        exc = Exception('duplicate key value violates unique constraint "webhook_events_pkey" (23505)')
+        with mock.patch("app.db._get_supabase", return_value=StubClient(error=exc)):
+            self.assertFalse(db.record_webhook_event("wamid.A"))
+
+    def test_record_webhook_event_codeless_lookalike_raises(self):
+        with mock.patch("app.db._get_supabase", return_value=StubClient(error=Exception("error 123505"))):
+            with self.assertRaises(db.DatabaseError):
+                db.record_webhook_event("wamid.A")
+
     def test_record_webhook_event_other_error_raises(self):
         with mock.patch("app.db._get_supabase", return_value=FailingClient()):
             with self.assertRaises(db.DatabaseError):
