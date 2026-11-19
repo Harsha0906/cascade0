@@ -152,6 +152,43 @@ def root():
     return {"app": "CascadeZero", "status": "online", "factory": default_factory_name(), "docs_url": "/docs"}
 
 
+@app.get("/healthz")
+def healthz():
+    """Readiness probe: database reachable and migrations applied. Never raises, no secrets."""
+    required = db.REQUIRED_MIGRATION_LEVEL
+    try:
+        level, db_status = db.migration_level(), "ok"
+    except db.DatabaseError:
+        level, db_status = 0, "error"
+    ready = db_status == "ok" and level >= required
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"storage": settings.storage_mode, "db": db_status, "migration_level": level,
+                 "required_migration_level": required, "ready": ready},
+    )
+
+
+def _check_migration_level() -> None:
+    """Startup check: complain when the database schema is behind; refuse to start in production."""
+    required = db.REQUIRED_MIGRATION_LEVEL
+    try:
+        level = db.migration_level()
+    except db.DatabaseError as exc:
+        level, problem = 0, f"database unreachable at startup ({exc})"
+    else:
+        problem = f"database migration level {level} is below required {required}: apply supabase/migrations"
+    if level < required:
+        logger.error("STARTUP: %s", problem)
+        if settings.is_production:
+            raise RuntimeError("Refusing to start in production: " + problem)
+
+
+@app.on_event("startup")
+def _startup_migration_check() -> None:
+    if settings.storage_mode == "supabase":
+        _check_migration_level()
+
+
 @app.get("/api/v1/state")
 def get_state():
     return get_full_state()
@@ -336,6 +373,14 @@ async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     msg = messages[0]
     sender = msg.get("from", "")
+
+    # De-duplicate Meta retries/redeliveries. Recorded before processing: a retry of a message
+    # whose processing failed is dropped (the sender is told to resend), but a replayed approval
+    # or vendor reply can never run twice.
+    message_id = msg.get("id")
+    if message_id and not await run_in_threadpool(db.record_webhook_event, str(message_id)):
+        logger.info("Duplicate WhatsApp message %s ignored", message_id)
+        return {"status": "duplicate"}
 
     if msg.get("type") == "interactive":
         button_id = msg.get("interactive", {}).get("button_reply", {}).get("id", "")

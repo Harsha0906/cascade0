@@ -537,6 +537,28 @@ def migration_level() -> int:
     return max((r["version"] for r in _mirror.schema_migrations), default=0)
 
 
+def record_webhook_event(message_id: str) -> bool:
+    """Record a Meta webhook message id. True when newly recorded, False when already seen
+    (a duplicate delivery). Other database failures raise DatabaseError."""
+    row = {"message_id": message_id, "received_at": datetime.now(timezone.utc).isoformat()}
+    client = _get_supabase()
+    if client is not None:
+        try:
+            client.table("webhook_events").insert(row).execute()
+        except Exception as exc:
+            code = str(getattr(exc, "code", "") or "")
+            text = _error_text(exc)
+            if code == "23505" or (not code and re.search(r"23505", text)):
+                return False
+            raise _fail("insert", "webhook_events", exc) from exc
+        return True
+    with _conditional_lock:
+        if any(r["message_id"] == message_id for r in _mirror.webhook_events):
+            return False
+        _mirror.webhook_events.append(row)
+        return True
+
+
 def call_function(name: str, params: dict[str, Any]) -> Any:
     """Call a Postgres function via supabase rpc. Not available offline."""
     client = _get_supabase()

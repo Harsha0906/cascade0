@@ -367,3 +367,100 @@ class ExecutePlanTxClassificationTests(unittest.TestCase):
         self.assertIsInstance(params["p_agent_log"], dict)
         self.assertEqual(params["p_receipt"]["run_id"], "R1")
         self.assertEqual(params["p_receipt"]["playbook_id"], "A")
+
+
+def _meta_text(sender, text, msg_id=None):
+    msg = {"from": sender, "type": "text", "text": {"body": text}}
+    if msg_id:
+        msg["id"] = msg_id
+    return {"object": "whatsapp_business_account",
+            "entry": [{"changes": [{"value": {"messages": [msg]}}]}]}
+
+
+class _UniqueViolation(Exception):
+    code = "23505"
+
+
+class WebhookDedupeHealthTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(main.app)
+        cls._patches = [
+            mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: True),
+            mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: True),
+        ]
+        for p in cls._patches:
+            p.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        for p in cls._patches:
+            p.stop()
+
+    def setUp(self):
+        self.client.post("/api/v1/reset", headers=KEY)
+
+    def _post_signed(self, body):
+        import hashlib
+        import hmac
+        raw = json.dumps(body).encode()
+        sig = "sha256=" + hmac.new(b"test-app-secret", raw, hashlib.sha256).hexdigest()
+        return self.client.post("/api/v1/webhooks/whatsapp", content=raw,
+                                headers={"content-type": "application/json", "x-hub-signature-256": sig})
+
+    def test_duplicate_webhook_processed_once(self):
+        body = _meta_text("919800000001", "Truck stuck, 150 casings short, line 2 at 50%", msg_id="wamid.X1")
+        with mock.patch.object(main, "_run_pipeline", wraps=main._run_pipeline) as spy:
+            for _ in range(2):
+                r = self._post_signed(body)
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(r.json()["status"], "duplicate")
+
+    def test_messages_without_id_are_not_deduped(self):
+        body = _meta_text("919800000001", "status")
+        for _ in range(2):
+            self.assertNotEqual(self._post_signed(body).json()["status"], "duplicate")
+
+    def test_record_webhook_event_offline(self):
+        self.assertTrue(db.record_webhook_event("wamid.A"))
+        self.assertFalse(db.record_webhook_event("wamid.A"))
+        self.assertTrue(db.record_webhook_event("wamid.B"))
+
+    def test_record_webhook_event_unique_violation_is_false(self):
+        with mock.patch("app.db._get_supabase", return_value=StubClient(error=_UniqueViolation("dup"))):
+            self.assertFalse(db.record_webhook_event("wamid.A"))
+
+    def test_record_webhook_event_other_error_raises(self):
+        with mock.patch("app.db._get_supabase", return_value=FailingClient()):
+            with self.assertRaises(db.DatabaseError):
+                db.record_webhook_event("wamid.A")
+
+    def test_healthz_offline_ready(self):
+        r = self.client.get("/healthz")
+        self.assertEqual((r.status_code, r.json()["storage"], r.json()["ready"]), (200, "offline", True))
+        self.assertEqual(r.json()["required_migration_level"], 4)
+
+    def test_healthz_reports_old_migration_level(self):
+        with mock.patch("app.db.migration_level", return_value=3):
+            r = self.client.get("/healthz")
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.json()["migration_level"], 3)
+
+    def test_healthz_db_error(self):
+        with mock.patch("app.db.migration_level", side_effect=db.DatabaseError("select", "schema_migrations")):
+            r = self.client.get("/healthz")
+        self.assertEqual((r.status_code, r.json()["db"]), (503, "error"))
+
+    def test_startup_check_warns_below_required(self):
+        with mock.patch("app.db.migration_level", return_value=3):
+            with self.assertLogs("cascadezero.server", level="ERROR"):
+                main._check_migration_level()
+
+    def test_startup_check_refuses_in_production(self):
+        with mock.patch("app.db.migration_level", return_value=3), \
+                mock.patch.object(type(main.settings), "is_production", new=True):
+            with self.assertRaises(RuntimeError):
+                main._check_migration_level()
+
+    def test_startup_check_ok_offline(self):
+        main._check_migration_level()
