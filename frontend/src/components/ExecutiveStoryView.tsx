@@ -319,7 +319,12 @@ export function ExecutiveStoryView() {
                     <span className="w-4 h-4 rounded-full bg-emerald-100 text-emerald-800 flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">✓</span>
                     <span>
                       {selectedPlan.overtime_hours
-                        ? `Shift notice for Lines 1 & 3: ${selectedPlan.overtime_hours}h overtime.`
+                        ? `Shift notice: ${
+                            Object.entries(selectedPlan.overtime_line_hours ?? {})
+                              .filter(([, h]) => h > 0)
+                              .map(([line, h]) => `${line} ${h}h`)
+                              .join(", ") || `${selectedPlan.overtime_hours}h`
+                          } overtime.`
                         : "No overtime notice needed."}
                     </span>
                   </li>

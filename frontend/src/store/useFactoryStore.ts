@@ -84,6 +84,7 @@ export interface PlaybookOption {
   strategy_type: string;
   vendor_allocations: VendorAllocation[];
   overtime_hours: number;
+  overtime_line_hours?: Record<string, number>;   // overtime hours per production line id
   overtime_cost_inr: number;
   supplier_cost_inr: number;
   total_mitigation_cost_inr: number;

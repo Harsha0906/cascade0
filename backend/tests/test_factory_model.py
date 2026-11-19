@@ -4,7 +4,7 @@ from unittest import mock
 from tests import _offline_env  # noqa: F401
 
 from app.agents.graph import run_cascade_pipeline
-from app.db import _SEED_SUPPLIERS, fetch_all, get_all_production_lines, get_all_suppliers
+from app.db import _SEED_SUPPLIERS, fetch_all, get_agent_logs, get_all_production_lines, get_all_suppliers
 from app.factory_model import FactoryDataError, load_factory_model
 from tests.factories import small_factory
 
@@ -107,6 +107,10 @@ class FactoryModelTests(unittest.TestCase):
         self.assertIsNone(r["ops_proposal"])
         self.assertNotIn("PLAN_A", [p["id"] for p in r["playbooks"]])
         self.assertIn(r["recommended_plan_id"], {"PLAN_B", "PLAN_C", "PLAN_D"})
+        ops = [l for l in get_agent_logs(r["run_id"])
+               if l["agent_name"] == "Operations Hawk" and l["tool_called"] == "factory_model.expedite_vendor_id"]
+        self.assertEqual(len(ops), 1)
+        self.assertIn("no vendor with role EXPEDITE", ops[0]["message"])
 
 
 if __name__ == "__main__":

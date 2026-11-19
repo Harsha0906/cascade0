@@ -3,7 +3,7 @@ CascadeZero — 4-node LangGraph StateGraph (Detective → Ops ⇄ CFO → Arbit
 
 What each node actually does:
   - Detective:   structured extraction (Gemini, or regex fallback), blast-radius DB update.
-  - Ops Hawk:    its proposal is the MILP solved with the air charter forced on
+  - Ops Hawk:    its proposal is the MILP solved with the expedite vendor forced on
                  (maximum-speed position), scored by Monte Carlo.
   - CFO Watchdog: its proposal is the unconstrained cost-minimal MILP, scored by Monte Carlo.
   - Rebuttal:    triggered by *computed* risk, not a fixed threshold — when the CFO plan
@@ -267,8 +267,8 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
                 agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
                 tool_called="factory_model.expedite_vendor_id",
                 tool_output_summary=f"{model.name} has no expedite vendor available",
-                message=(f"🔥 {model.name} has no expedite option (no vendor with a flat charter cost and "
-                         f"capacity), so I have no maximum-speed proposal to make."),
+                message=(f"🔥 {model.name} has no expedite option (no vendor with role EXPEDITE), "
+                         f"so I have no maximum-speed proposal to make."),
             )
             return {"ops_proposal": None, "llm_trace": _trace(state, "ops_hawk", "template")}
         expedite = model.vendor(expedite_id)
@@ -286,7 +286,7 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
         }
         msg, mode = _llm_agent_reason(
             "Operations Hawk", "Chief of Manufacturing Operations",
-            "Argue for the fastest, most reliable recovery (air charter).", facts,
+            "Argue for the fastest, most reliable recovery (expedite option).", facts,
             f"🔥 My position: {facts['plan']} + {prop['overtime_hours']}h overtime. "
             f"Cost ₹{prop['total_cost_inr']:,}, modelled P(on-time) {prop['confidence_pct']}%."
             + ("" if prop["feasible"] else " Even this leaves units uncovered."),
