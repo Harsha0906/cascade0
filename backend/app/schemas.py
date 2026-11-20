@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ─── 1. Gemini Structured Extraction Schemas ─────────────────────────────────
@@ -153,17 +153,29 @@ class AgentLogEntry(BaseModel):
 
 class SimulateCrisisRequest(BaseModel):
     """Payload to trigger crisis simulation."""
-    scenario_id: Optional[int] = Field(default=None, ge=1, le=3, description="1, 2, or 3")
+    scenario_id: Optional[int] = Field(default=None, ge=1, description="Preset scenario id (see GET /api/v1/scenarios)")
     raw_message: Optional[str] = Field(default=None, max_length=2000, description="Custom crisis alert text")
     source_channel: str = Field(default="WEB_DASHBOARD", max_length=64, description="Channel origin")
     override_delay_hours: Optional[int] = Field(default=None, ge=0, le=720)
     override_shortfall_units: Optional[int] = Field(default=None, ge=0, le=100_000)
-    override_line2_speed_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    override_line_speeds: Optional[dict[str, int]] = Field(
+        default=None, description="Line id -> speed % (0-100) overrides"
+    )
+    order_id: Optional[str] = Field(default=None, max_length=32)
+
+    @field_validator("override_line_speeds")
+    @classmethod
+    def _speeds_in_range(cls, value):
+        if value is not None:
+            for line_id, speed in value.items():
+                if not 0 <= speed <= 100:
+                    raise ValueError(f"speed for {line_id} must be between 0 and 100")
+        return value
 
 
 class PlcTelemetryRequest(BaseModel):
     """Shop-floor machine tick from simulator_plc.py."""
-    line_id: str = Field(default="LINE-2", max_length=32)
+    line_id: str = Field(max_length=32)
     speed_pct: int = Field(default=50, ge=0, le=100)
     temp_celsius: float = Field(default=89.0, ge=-50, le=400)
     status: str = Field(default="OVERHEATING_THROTTLED", max_length=64)

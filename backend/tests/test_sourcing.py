@@ -24,6 +24,18 @@ def _rfq(units=150):
                units_requested=units, expected_unit_price_inr=600, needed_within_hours=34, channel="simulated")
 
 
+class RfqWordingTests(unittest.TestCase):
+    def test_flat_fee_vendor_rfq_is_not_an_air_charter(self):
+        from tests.factories import small_factory
+        model = small_factory()
+        rfq = RFQ(id="R", run_id="X", round=1, supplier_id="V3", supplier_name="Vendor V3",
+                  units_requested=120, expected_unit_price_inr=0, needed_within_hours=20, channel="simulated")
+        text = sourcing._rfq_text(model, rfq)
+        self.assertIn("flat fee", text)
+        self.assertNotIn("air charter", text)
+        self.assertIn("120 Widget", text)
+
+
 class ReplyParsingTests(unittest.TestCase):
     def test_english_and_hinglish_replies(self):
         cases = {

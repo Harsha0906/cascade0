@@ -207,9 +207,9 @@ class ResolveDisruptionTests(unittest.TestCase):
 class ExtractionTests(unittest.TestCase):
     def setUp(self):
         from app.agents.tools import extract_disruption_entities
-        from app.main import SCENARIO_PROMPTS
+        from app.db import get_scenarios
         self.extract = extract_disruption_entities
-        self.prompt1 = SCENARIO_PROMPTS[1]
+        self.prompt1 = get_scenarios("apex-volt-blr2")[0]["raw_message"]
         self.model = load_factory_model()
         self.orders = ["EV-402", "EV-405"]
 
@@ -316,10 +316,11 @@ class ExtractionHazardTests(unittest.TestCase):
         self.assertIsNone(e.affected_supplier)
 
     def test_presets(self):
-        from app.main import SCENARIO_PROMPTS
+        from app.db import get_scenarios
+        prompts = {r["scenario_id"]: r["raw_message"] for r in get_scenarios("apex-volt-blr2")}
         exp = {1: (50, 48, 150), 2: (85, 6, 25), 3: (25, 72, 350)}
         for k, (sp, d, sf) in exp.items():
-            e = self.ext(SCENARIO_PROMPTS[k])
+            e = self.ext(prompts[k])
             self.assertEqual(self.speeds(e), [("LINE-2", sp)], k)
             self.assertEqual((e.delay_hours, e.shortfall_units, e.affected_order), (d, sf, "EV-402"), k)
             if k != 2:

@@ -255,8 +255,55 @@ _SEED_FACTORIES: list[dict[str, Any]] = [
     },
 ]
 
+_SEED_SCENARIOS: list[dict[str, Any]] = [
+    {
+        "factory_id": "apex-volt-blr2",
+        "scenario_id": 1,
+        "title": "NH48 flood + Line 2 overheat",
+        "summary": "48h delay, Line 2 at 50%, 150 casings short",
+        "raw_message": (
+            "NH48 Chennai-Bengaluru highway flooding near Vellore delayed shipment of 500 aluminum battery "
+            "casings from Chennai Precision by 48 hours. Simultaneously, Robotic Welding Line 2 overheated "
+            "to 89.0°C and throttled to 50% speed. Current unit shortfall is 150 casings on Order #EV-402."
+        ),
+        "delay_hours": 48,
+        "shortfall_units": 150,
+        "line_speeds": {"LINE-2": 50},
+        "order_id": "EV-402",
+    },
+    {
+        "factory_id": "apex-volt-blr2",
+        "scenario_id": 2,
+        "title": "Minor toll delay",
+        "summary": "6h delay, Line 2 at 85%, 25 casings short",
+        "raw_message": (
+            "Minor toll transit delay on NH48 corridor causing 6 hours shipment delay for 25 units. "
+            "Welding Line 2 slightly throttled to 85% speed (74°C). Shortfall is 25 battery casings on Order #EV-402."
+        ),
+        "delay_hours": 6,
+        "shortfall_units": 25,
+        "line_speeds": {"LINE-2": 85},
+        "order_id": "EV-402",
+    },
+    {
+        "factory_id": "apex-volt-blr2",
+        "scenario_id": 3,
+        "title": "Supplier collapse",
+        "summary": "72h delay, Line 2 at 25%, 350 casings short",
+        "raw_message": (
+            "Severe supplier collapse: Chennai Precision Casings shipment blocked by 72 hours due to "
+            "bridge damage near Ranipet. Robotic Welding Line 2 overheated to 92°C and dropped "
+            "to 25% speed. Compound shortfall of 350 battery casings on Order #EV-402."
+        ),
+        "delay_hours": 72,
+        "shortfall_units": 350,
+        "line_speeds": {"LINE-2": 25},
+        "order_id": "EV-402",
+    },
+]
 
-REQUIRED_MIGRATION_LEVEL = 4
+
+REQUIRED_MIGRATION_LEVEL = 5
 
 # Durable-state tables cleared on reset, with their primary-key column.
 _DURABLE_TABLES: tuple[tuple[str, str], ...] = (
@@ -279,6 +326,7 @@ class InMemoryMirror:
         self.vendor_history: list[dict[str, Any]] = copy.deepcopy(_SEED_VENDOR_HISTORY)
         self.production_lines: list[dict[str, Any]] = copy.deepcopy(_SEED_PRODUCTION_LINES)
         self.orders: list[dict[str, Any]] = copy.deepcopy(_SEED_ORDERS)
+        self.scenarios: list[dict[str, Any]] = copy.deepcopy(_SEED_SCENARIOS)
         self.disruption_events: list[dict[str, Any]] = []
         self.agent_logs: list[dict[str, Any]] = []
         self.purchase_orders: list[dict[str, Any]] = []
@@ -702,6 +750,22 @@ def default_factory_name() -> str:
     return (row or {}).get("name") or settings.DEFAULT_FACTORY_ID
 
 
+def get_scenarios(factory_id: str) -> list[dict[str, Any]]:
+    """Preset disruption scenarios of one factory, ordered by scenario_id."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            response = (
+                client.table("scenarios").select("*").eq("factory_id", factory_id)
+                .order("scenario_id").execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            raise _fail("get_scenarios", "scenarios", exc) from exc
+    rows = [r for r in _mirror.scenarios if r.get("factory_id") == factory_id]
+    return copy.deepcopy(sorted(rows, key=lambda r: r["scenario_id"]))
+
+
 def get_all_suppliers() -> list[dict[str, Any]]:
     """Fetch all suppliers."""
     return fetch_all("suppliers")
@@ -848,6 +912,7 @@ def reset_to_seed() -> dict[str, str]:
             ("suppliers", _SEED_SUPPLIERS),
             ("production_lines", _SEED_PRODUCTION_LINES),
             ("orders", _SEED_ORDERS),
+            ("scenarios", _SEED_SCENARIOS),
         ):
             for row in seed:
                 client.table(tbl).upsert(row).execute()
