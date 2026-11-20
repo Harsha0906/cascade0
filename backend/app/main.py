@@ -123,10 +123,10 @@ def _run_pipeline(
         "raw_message": message,
         "delay_hours": result["delay_hours"],
         "shortfall_units": result["shortfall_units"],
-        "factory_id": result.get("factory_id"),
-        "order_id": result.get("order_id"),
-        "affected_supplier_id": result.get("affected_supplier_id"),
-        "line_impacts": result.get("line_impacts", []),
+        "factory_id": result["factory_id"],
+        "order_id": result["order_id"],
+        "affected_supplier_id": result["affected_supplier_id"],
+        "line_impacts": result["line_impacts"],
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return result
@@ -265,9 +265,9 @@ def simulate_crisis(req: SimulateCrisisRequest):
     if req.raw_message:
         message = req.raw_message
     else:
-        preset = scenarios.get(req.scenario_id if req.scenario_id is not None else 1)
-        if preset is None:
-            raise HTTPException(status_code=422, detail="Provide raw_message or a valid scenario_id")
+        if req.scenario_id is None:
+            raise HTTPException(status_code=422, detail="Provide scenario_id or raw_message")
+        preset = scenarios[req.scenario_id]
         message = preset["raw_message"]
 
     delay, shortfall = req.override_delay_hours, req.override_shortfall_units
@@ -299,13 +299,13 @@ def simulate_crisis(req: SimulateCrisisRequest):
             "line_impacts": [
                 {
                     "line_id": li["line_id"],
-                    "name": line_names.get(li["line_id"], li["line_id"]),
+                    "name": line_names[li["line_id"]],
                     "speed_pct": li["speed_pct"],
-                    "temp_celsius": li.get("temp_celsius"),
+                    "temp_celsius": li["temp_celsius"],
                 }
-                for li in result.get("line_impacts", [])
+                for li in result["line_impacts"]
             ],
-            "affected_supplier_id": result.get("affected_supplier_id"),
+            "affected_supplier_id": result["affected_supplier_id"],
             "shortfall_units": result["shortfall_units"],
             "affected_order_id": result["order_id"],
             "source": result.get("extraction_source", "unknown"),
@@ -533,7 +533,7 @@ async def whatsapp_webhook(request: Request):
     body_text = str(form.get("Body", "")).strip()
     sender = str(form.get("From", "")).strip()
     if not body_text or body_text.lower() in ("hi", "hello", "ping", "test") or "join" in body_text.lower():
-        reply = "✅ CascadeZero connected. Send a disruption alert, e.g. 'Flood on NH48, 48h delay, 150 units short, Line 2 at 50%'."
+        reply = "✅ CascadeZero connected. Send a disruption alert, e.g. state the delay in hours, the units short, the affected line and order."
     else:
         try:
             result = await run_in_threadpool(_run_pipeline, body_text, "TWILIO_WHATSAPP_SANDBOX")

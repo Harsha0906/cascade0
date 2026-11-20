@@ -352,6 +352,18 @@ class ApiTests(unittest.TestCase):
         r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 9}, headers=KEY)
         self.assertEqual(r.status_code, 404)
 
+    def test_no_scenario_and_no_message_is_422(self):
+        r = self.client.post("/api/v1/simulate-crisis", json={}, headers=KEY)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("scenario_id or raw_message", r.json()["detail"])
+
+    def test_twilio_hello_has_no_demo_names(self):
+        r = self.client.post("/api/v1/webhooks/whatsapp", data={"Body": "hello", "From": "x"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("connected", r.text)
+        self.assertNotIn("EV-402", r.text)
+        self.assertNotIn("Line 2", r.text)
+
     def test_line_speed_override_validation(self):
         r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 1,
                              "override_line_speeds": {"LINE-1": 120}}, headers=KEY)
@@ -403,9 +415,9 @@ class ApiTests(unittest.TestCase):
             r = self.client.post("/api/v1/execute-plan",
                                  json={"run_id": result["run_id"], "playbook_id": pid}, headers=KEY)
             self.assertEqual(r.status_code, 200, r.text)
-            self.assertIn(db.get_order("WO-77")["status"],
-                          {"RECOVERY_IN_PROGRESS", "EXTENSION_REQUESTED", "RISK_ACCEPTED"})
-            self.assertNotIn(db.get_order("WO-77")["status"], {"ON_TRACK", "BREACH_RISK"})
+            expected = {"SLA_RENEGOTIATION": "EXTENSION_REQUESTED", "NO_ACTION": "RISK_ACCEPTED"}.get(
+                next(p for p in result["playbooks"] if p["id"] == pid)["strategy_type"], "RECOVERY_IN_PROGRESS")
+            self.assertEqual(db.get_order("WO-77")["status"], expected)
         finally:
             db.reset_to_seed()
 

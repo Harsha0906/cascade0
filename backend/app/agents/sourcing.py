@@ -434,8 +434,10 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
         if playbook is None:
             raise SourcingError(f"Playbook {pid} not in run {run_id}", 404)
 
-        br = run.get("blast_radius", {})
-        sr = run.get("solver_result", {})
+        br = run.get("blast_radius") or {}
+        for key in ("sla_penalty_inr", "partial_delay_penalty_inr", "hours_remaining", "client"):
+            if key not in br:
+                raise SourcingError(f"Run {run_id} has no blast_radius.{key}; run the analysis again.", 409)
         factory_id = run.get("factory_id")
         # Source against the factory data the plan was solved on, not today's database rows.
         model = run.get("factory_model") or load_factory_model(factory_id)   # FactoryDataError propagates
@@ -450,10 +452,10 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
                 "delay_hours": run["delay_hours"],
                 "line_speeds": dict(line_speeds),
                 "order_id": run["order_id"],
-                "sla_penalty_inr": int(br.get("sla_penalty_inr", sr.get("total_sla_exposure_inr", 2_500_000))),
-                "partial_penalty_inr": int(br.get("partial_delay_penalty_inr", 500_000)),
-                "deadline_hours": float(sr.get("deadline_hours", br.get("hours_remaining", 38))),
-                "client": br.get("client", "Ather-Grid Mobility Corp"),
+                "sla_penalty_inr": int(br["sla_penalty_inr"]),
+                "partial_penalty_inr": int(br["partial_delay_penalty_inr"]),
+                "deadline_hours": float(br["hours_remaining"]),
+                "client": br["client"],
             },
         )
         if not playbook["vendor_allocations"]:

@@ -113,6 +113,33 @@ class SourcingFlowTests(unittest.TestCase):
         self.assertEqual(session.model, run_store.get_run(sim["run_id"])["factory_model"])
         self.assertEqual(session.params["line_speeds"], run_store.get_run(sim["run_id"])["line_speeds"])
 
+    def test_run_missing_blast_radius_field_is_rejected(self):
+        sim = self._simulate(1)
+        run = run_store.get_run(sim["run_id"])
+        del run["blast_radius"]["sla_penalty_inr"]
+        run_store.save_run(run)
+        with self.assertRaisesRegex(sourcing.SourcingError, "sla_penalty_inr"):
+            sourcing.start_sourcing(sim["run_id"])
+
+    def test_second_factory_run_sources_with_its_own_order_terms(self):
+        from tests.factories import seed_second_factory
+        from app.agents.graph import run_cascade_pipeline
+        from app.db import reset_to_seed
+        seed_second_factory()
+        try:
+            result = run_cascade_pipeline(
+                "L-B at 40%, 80 units short on WO-77, 5h delay from Vendor V1", factory_id="test-plant")
+            run_store.save_run(result)
+            sourcing.start_sourcing(result["run_id"])
+            params = sourcing_store.load(result["run_id"]).params
+            self.assertEqual(params["order_id"], "WO-77")
+            self.assertEqual(params["sla_penalty_inr"], 400_000)
+            self.assertEqual(params["partial_penalty_inr"], 80_000)
+            self.assertEqual(params["deadline_hours"], 30.0)
+            self.assertEqual(params["client"], "Test Client")
+        finally:
+            reset_to_seed()
+
     def test_rfq_deadline_uses_the_factory_qa_time(self):
         sim = self._simulate(1)
         run = run_store.get_run(sim["run_id"])
