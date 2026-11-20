@@ -35,7 +35,7 @@ import logging
 import math
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import httpx
@@ -320,6 +320,8 @@ def simulate_crisis(req: SimulateCrisisRequest):
             "shortfall_breakdown": result["shortfall_breakdown"],
             "alert_stated_shortfall": result["alert_stated_shortfall"],
             "affected_order_id": result["order_id"],
+            "order_selection": result["order_selection"],
+            "other_order_shortfalls": result["other_order_shortfalls"],
             "source": result.get("extraction_source", "unknown"),
             "overridden_by_preset_or_slider": any(v is not None for v in (delay, shortfall, line_speeds)),
         },
@@ -601,13 +603,20 @@ def _int_field(row: Dict[str, str], key: str, default: Optional[int] = None) -> 
     return int(number)
 
 
+# Priority of a new order imported without a `priority` column: the lowest (same as the
+# database DEFAULT), so an unranked order never reserves stock ahead of a ranked one.
+DEFAULT_ORDER_PRIORITY = 100
+
+
 @app.post("/api/v1/ingest/erp-csv", dependencies=[Depends(require_api_key)])
 def ingest_erp_csv(payload: ErpCsvSyncRequest):
     """Upsert orders from a Tally/Excel CSV export. New orders are inserted, existing ones updated.
 
-    required_qty and sla_penalty_inr are always required; partial_delay_penalty_inr and
-    hours_remaining are required for a new order (an existing order keeps its value when the
-    column is blank). Updates never overwrite the order's status or shortfall_units.
+    required_qty and sla_penalty_inr are always required; partial_delay_penalty_inr and a deadline
+    (`due_date`, IST, or `hours_remaining` from now) are required for a new order (an existing order
+    keeps its value when the column is blank). The deadline is stored as the absolute `due_at`.
+    `priority` is optional (lower ranks first); a new order without it gets DEFAULT_ORDER_PRIORITY.
+    Updates never overwrite the order's status or shortfall_units.
     """
     if not payload.csv_content.strip():
         raise HTTPException(status_code=400, detail="Empty CSV content")
@@ -629,10 +638,24 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
                 "factory_id": settings.DEFAULT_FACTORY_ID,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            for key in ("partial_delay_penalty_inr", "hours_remaining"):
-                if existing is not None and not (row.get(key) or "").strip():
-                    continue  # keep the stored value
-                record[key] = _int_field(row, key)
+            if existing is None or (row.get("partial_delay_penalty_inr") or "").strip():
+                record["partial_delay_penalty_inr"] = _int_field(row, "partial_delay_penalty_inr")
+            due_text = (row.get("due_date") or row.get("due_at") or "").strip()
+            if due_text:
+                due_at = importers.parse_eta(due_text)
+                record["due_at"] = due_at.isoformat()
+                hours = (due_at - datetime.now(timezone.utc)).total_seconds() / 3600.0
+                record["hours_remaining"] = max(0, int(round(hours)))  # display only; recomputed on read
+            elif (row.get("hours_remaining") or "").strip():
+                record["hours_remaining"] = _int_field(row, "hours_remaining")
+                record["due_at"] = (datetime.now(timezone.utc)
+                                    + timedelta(hours=record["hours_remaining"])).isoformat()
+            elif existing is None:
+                raise ValueError("due_date or hours_remaining is required")
+            if (row.get("priority") or "").strip():
+                record["priority"] = _int_field(row, "priority")
+            elif existing is None:
+                record["priority"] = DEFAULT_ORDER_PRIORITY
             for key in ("client", "deadline_label"):
                 value = (row.get(key) or "").strip()
                 if value or existing is None:  # blank on update keeps the stored value
@@ -675,23 +698,41 @@ def _factory_item_codes(factory_id: str) -> set[str]:
     return {i["item_code"] for i in db.get_items(factory_id)}
 
 
+def _snapshot_warning(text: str) -> Dict[str, Any]:
+    return {"line": None, "warning": text}
+
+
 @app.post("/api/v1/ingest/stock-summary", dependencies=[Depends(require_api_key)])
 def ingest_stock_summary(payload: ErpCsvSyncRequest):
-    """Upsert on-hand stock from a Tally Stock Summary export (creates items with new codes)."""
+    """Replace on-hand stock from a Tally Stock Summary export (creates items with new codes).
+
+    The file is a full snapshot of the factory's stock: an item it does not mention has its
+    stock row removed (reported in warnings). An item on a row with an error is left unchanged.
+    """
     _require_csv(payload)
     factory_id = settings.DEFAULT_FACTORY_ID
     result = importers.parse_stock_summary(payload.csv_content, factory_id, _factory_item_codes(factory_id))
+    before = set(db.get_stock_levels(factory_id)) if result.header_ok else set()
     now = datetime.now(timezone.utc).isoformat()
     for item in result.items:
         upsert_row("items", item, key_columns=("factory_id", "item_code"))
     for row in result.rows:
         upsert_row("stock_levels", {**row, "as_of": now}, key_columns=("factory_id", "item_code"))
+    for code in sorted(before - result.mentioned):
+        db.delete_rows_where("stock_levels", {"factory_id": factory_id, "item_code": code})
+        result.warnings.append(_snapshot_warning(
+            f"item {code} is not in this stock summary: its stock row was removed "
+            f"(each file is a full snapshot)"))
     return _import_response(payload, result)
 
 
 @app.post("/api/v1/ingest/open-purchase-orders", dependencies=[Depends(require_api_key)])
 def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
-    """Upsert open inbound shipments from a pending purchase orders export (dates are IST)."""
+    """Import open inbound shipments from a pending purchase orders export (dates are IST).
+
+    The file is a full snapshot of the factory's pending POs: an OPEN shipment it does not
+    mention is marked CLOSED (received or cancelled) and listed in warnings.
+    """
     _require_csv(payload)
     factory_id = settings.DEFAULT_FACTORY_ID
     suppliers = {s["id"] for s in db.get_all_suppliers()
@@ -701,20 +742,41 @@ def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
         datetime.now(timezone.utc),
         existing_shipments={r["shipment_id"]: r for r in db.fetch_all("inbound_shipments")},
     )
+    before = ({s["shipment_id"] for s in db.get_inbound_shipments(factory_id)}
+              if result.header_ok else set())
     for row in result.rows:
         upsert_row("inbound_shipments", row, key_columns=("shipment_id",))
+    closed = sorted(before - result.mentioned)
+    for sid in closed:
+        db.update_rows_where("inbound_shipments", {"shipment_id": sid, "factory_id": factory_id},
+                             {"status": "CLOSED"})
+    if closed:
+        result.warnings.append(_snapshot_warning(
+            f"{len(closed)} open PO(s) not in this file marked CLOSED (received or cancelled; "
+            f"each file is a full snapshot of pending POs): {', '.join(closed)}"))
     return _import_response(payload, result)
 
 
 @app.post("/api/v1/ingest/sales-order-lines", dependencies=[Depends(require_api_key)])
 def ingest_sales_order_lines(payload: ErpCsvSyncRequest):
-    """Upsert order lines (item quantities per sales order) from a sales order export."""
+    """Import order lines (item quantities per sales order) from a sales order export.
+
+    For every order the file lists, the file replaces that order's lines: a line of that order
+    the file does not mention is removed (reported in warnings). Other orders are untouched.
+    """
     _require_csv(payload)
     factory_id = settings.DEFAULT_FACTORY_ID
     orders = {o["order_id"] for o in db.get_all_orders() if o.get("factory_id") == factory_id}
     result = importers.parse_sales_order_lines(payload.csv_content, orders, _factory_item_codes(factory_id))
+    in_file = sorted({oid for oid, _ in result.mentioned}) if result.header_ok else []
+    stale = [l for l in db.get_order_lines(in_file) if (l["order_id"], l["item_code"]) not in result.mentioned]
     for row in result.rows:
         upsert_row("order_lines", row, key_columns=("order_id", "item_code"))
+    for line in stale:
+        db.delete_rows_where("order_lines", {"order_id": line["order_id"], "item_code": line["item_code"]})
+        result.warnings.append(_snapshot_warning(
+            f"order {line['order_id']} line for item {line['item_code']} is not in this file: removed "
+            f"(the file replaces all lines of each order it lists)"))
     return _import_response(payload, result)
 
 

@@ -1,7 +1,7 @@
 """Pipeline tests: the shortfall is computed from inventory (offline mirror, no LLM)."""
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
@@ -101,7 +101,8 @@ class InventoryPipelineTests(unittest.TestCase):
                 self.assertEqual(d["recommended_plan_id"], plan)
 
     def test_csv_import_then_alert(self):
-        """Done-when: import the three sample CSVs into a fresh mirror, then the alert yields 150."""
+        """Done-when: import the three sample CSVs into a fresh mirror, then the literal alert
+        "Chennai shipment delayed 48h" (no order named) resolves to EV-402, 150 short."""
         for t in ("order_lines", "stock_levels", "inbound_shipments"):
             db.delete_all(t)
         for path, fname in (("stock-summary", "stock_summary.csv"),
@@ -110,9 +111,16 @@ class InventoryPipelineTests(unittest.TestCase):
             body = {"filename": fname, "csv_content": (SAMPLES / fname).read_text(encoding="utf-8")}
             data = self.client.post(f"/api/v1/ingest/{path}", json=body, headers=KEY).json()
             self.assertEqual(data["errors"], [], path)
-        # the sample PO is due 21-Nov-2026 (IST): evaluate the alert at 2026-11-20 00:00 UTC
-        r = run_cascade_pipeline(TEXT, now=datetime(2026, 11, 20, tzinfo=timezone.utc))
-        self.assertEqual((r["shortfall_units"], r["shortfall_source"]), (150, "inventory"))
+        # the sample PO is due 21-Nov-2026 (IST): evaluate the alert at 2026-11-20 00:00 UTC,
+        # with the orders due 38h and 110h after that
+        now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        for oid, hours in (("EV-402", 38), ("EV-405", 110)):
+            db.update_rows("orders", "order_id", oid, {"due_at": (now + timedelta(hours=hours)).isoformat()})
+        r = run_cascade_pipeline("Chennai shipment delayed 48h", now=now)
+        self.assertEqual((r["order_id"], r["shortfall_units"], r["shortfall_source"]),
+                         ("EV-402", 150, "inventory"))
+        self.assertEqual(r["order_selection"], "inventory")
+        self.assertEqual(r["other_order_shortfalls"], [{"order_id": "EV-405", "shortfall": 0}])
 
 
 if __name__ == "__main__":
