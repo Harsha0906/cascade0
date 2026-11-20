@@ -39,6 +39,25 @@ def run(order="EV-402", orders=None, lines=None, stock=None, ships=None, **kw):
 
 
 class ShortfallTests(unittest.TestCase):
+    def test_overdue_open_po_not_counted(self):
+        b = run(ships=[_ship(eta_h=-5)])
+        self.assertEqual((b.shortfall, b.inbound_before_deadline, b.overdue_qty), (150, 0, 500))
+        self.assertTrue(b.shipments[0].overdue)
+        self.assertFalse(b.shipments[0].counted)
+        self.assertTrue(b.explanation().endswith(" (500 overdue on open POs not counted)"))
+        self.assertEqual(b.to_dict()["overdue_qty"], 500)
+
+    def test_not_overdue_has_no_suffix(self):
+        b = run()
+        self.assertEqual(b.overdue_qty, 0)
+        self.assertFalse(b.shipments[0].overdue)
+        self.assertNotIn("overdue", b.explanation())
+
+    def test_delay_does_not_make_future_shipment_overdue(self):
+        b = run(delayed_supplier_id="chennai", delay_hours=48)
+        self.assertFalse(b.shipments[0].overdue)
+        self.assertEqual(b.overdue_qty, 0)
+
     def test_demo_delay(self):
         b = run(delayed_supplier_id="chennai", delay_hours=48)
         self.assertEqual(b.shortfall, 150)

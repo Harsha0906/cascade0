@@ -42,6 +42,7 @@ class ShipmentView:
     eta_hours: float
     delayed_by_hours: float
     counted: bool
+    overdue: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class ShortfallBreakdown:
     shortfall: int
     deadline_hours: float
     shipments: tuple
+    overdue_qty: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -68,6 +70,7 @@ class ShortfallBreakdown:
             "available": self.available,
             "shortfall": self.shortfall,
             "deadline_hours": self.deadline_hours,
+            "overdue_qty": self.overdue_qty,
             "shipments": [
                 {
                     "shipment_id": s.shipment_id,
@@ -76,6 +79,7 @@ class ShortfallBreakdown:
                     "eta_hours": s.eta_hours,
                     "delayed_by_hours": s.delayed_by_hours,
                     "counted": s.counted,
+                    "overdue": s.overdue,
                 }
                 for s in self.shipments
             ],
@@ -83,13 +87,16 @@ class ShortfallBreakdown:
         }
 
     def explanation(self) -> str:
-        return (
+        text = (
             f"{self.demand} needed − ({self.on_hand} on hand + "
             f"{self.inbound_before_deadline} inbound before the "
             f"{_hours(self.deadline_hours)}h deadline − "
             f"{self.reserved_for_higher_priority} reserved for higher-priority orders) "
             f"= {self.shortfall} short"
         )
+        if self.overdue_qty > 0:
+            text += f" ({self.overdue_qty} overdue on open POs not counted)"
+        return text
 
 
 def compute_shortfall(
@@ -123,20 +130,24 @@ def compute_shortfall(
 
     views = []
     inbound = 0
+    overdue_qty = 0
     for s in shipments:
         if s.get("item_code") != item_code or s.get("status") != "OPEN":
             continue
         delayed = float(delay_hours) if (delayed_supplier_id is not None
                                          and s.get("supplier_id") == delayed_supplier_id) else 0.0
         eta_hours = (_as_utc(s["eta"]) - now).total_seconds() / 3600.0 + delayed
-        # Already-arrived shipments (eta_hours <= 0) count too; ideally they were
-        # already booked into stock, so this only matters for stale data.
-        counted = eta_hours <= deadline
         qty = int(s["qty"])
+        # An OPEN shipment whose original ETA has already passed is overdue: it has not
+        # arrived (else it would be booked into stock), so it is not counted as inbound.
+        overdue = eta_hours - delayed <= 0
+        counted = (not overdue) and eta_hours <= deadline
         if counted:
             inbound += qty
+        if overdue:
+            overdue_qty += qty
         views.append(ShipmentView(str(s["shipment_id"]), str(s["supplier_id"]), qty,
-                                  eta_hours, delayed, counted))
+                                  eta_hours, delayed, counted, overdue))
 
     def rank(o: dict):
         return (o["priority"], o["hours_remaining"], o["order_id"])
@@ -151,4 +162,5 @@ def compute_shortfall(
 
     available = on_hand + inbound - reserved
     return ShortfallBreakdown(order_id, item_code, demand, on_hand, inbound, reserved,
-                              available, max(0, demand - available), deadline, tuple(views))
+                              available, max(0, demand - available), deadline, tuple(views),
+                              overdue_qty)

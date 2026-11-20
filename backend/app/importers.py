@@ -13,7 +13,7 @@ import io
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Collection
+from typing import Any, Collection, Mapping
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_ETA_TIME = time(17, 0)  # a date alone means 17:00 IST
@@ -34,15 +34,21 @@ class ImportResult:
     rows: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
     items: list[dict[str, Any]] = field(default_factory=list)  # new stock items (stock summary only)
+    warnings: list[dict[str, Any]] = field(default_factory=list)  # {"line", "warning"}; rows still imported/skipped
 
 
 def _norm(header: str) -> str:
     return re.sub(r"[\s_]+", " ", (header or "").strip().lower())
 
 
+def normalize_header(header: str) -> str:
+    """Lower-case, trimmed header with spaces turned into underscores ('Order No' -> 'order_no')."""
+    return _norm(header).replace(" ", "_")
+
+
 def _read(csv_text: str, wanted: dict[str, bool]):
     """Return ([(line, {field: value})], header errors). `wanted` maps field -> required."""
-    reader = csv.reader(io.StringIO((csv_text or "").lstrip("﻿")))
+    reader = csv.reader(io.StringIO((csv_text or "").lstrip("\ufeff")))
     try:
         header = next(reader)
     except StopIteration:
@@ -65,7 +71,7 @@ def _read(csv_text: str, wanted: dict[str, bool]):
     return rows, []
 
 
-_QTY_RE = re.compile(r"^(\d+|\d{1,3}(?:,\d{2,3})*,\d{3})(?:\s+[A-Za-z]+\.?)?$")
+_QTY_RE = re.compile(r"^(\d+|\d{1,3}(?:,\d{2,3})*,\d{3})(?:\.0+)?(?:\s+[A-Za-z]+\.?)?$")
 
 
 def parse_qty(raw: str, allow_zero: bool = False) -> int:
@@ -81,6 +87,7 @@ def parse_qty(raw: str, allow_zero: bool = False) -> int:
     return qty
 
 
+_TOTAL_RE = re.compile(r"^(grand\s+)?total$", re.IGNORECASE)
 _DATE_RE = re.compile(r"^(\S+)(?:\s+(\d{1,2}):(\d{2}))?$")
 _DATE_FORMATS = ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y")
 
@@ -123,6 +130,10 @@ def parse_stock_summary(csv_text: str, factory_id: str, known_items: Collection[
     known, seen = set(known_items), set()
     for line, r in rows:
         code = r["item_code"]
+        name_cell = r.get("item_name", "")
+        if _TOTAL_RE.match(code) or _TOTAL_RE.match(name_cell):
+            result.warnings.append({"line": line, "warning": "total row skipped (not imported)"})
+            continue
         try:
             if not code:
                 raise ValueError("missing item code")
@@ -148,6 +159,7 @@ def parse_open_purchase_orders(
     known_items: Collection[str],
     known_suppliers: Collection[str],
     today: date | datetime,
+    existing_shipments: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> ImportResult:
     result = ImportResult()
     rows, header_errors = _read(csv_text, {
@@ -156,7 +168,10 @@ def parse_open_purchase_orders(
     result.errors.extend(header_errors)
     items, suppliers, seen = set(known_items), set(known_suppliers), set()
     today_ist = _today_ist(today)
+    existing = existing_shipments or {}
     for line, r in rows:
+        warnings: list[str] = []
+        status = "OPEN"
         try:
             sid, code, sup = r["shipment_id"], r["item_code"], r["supplier_id"]
             if not sid:
@@ -169,15 +184,24 @@ def parse_open_purchase_orders(
                 raise ValueError(f"unknown supplier {sup or '(blank)'}")
             qty = parse_qty(r["qty"])
             eta = parse_eta(r["eta"])
-            if eta.astimezone(IST).date() < today_ist:
-                raise ValueError(f"due date {r['eta']} is in the past")
+            due = eta.astimezone(IST).date()
+            if due < today_ist:
+                warnings.append(f"PO {sid} overdue since {due.isoformat()}")
+            prior = existing.get(sid)
+            if prior is not None:
+                if prior.get("factory_id") != factory_id:
+                    raise ValueError(f"PO number {sid} belongs to another factory")
+                if prior.get("status", "OPEN") != "OPEN":
+                    status = prior["status"]
+                    warnings.append(f"PO {sid} is already {status}; status kept (not reopened)")
         except ValueError as exc:
             result.errors.append({"line": line, "error": str(exc)})
             continue
         seen.add(sid)
+        result.warnings.extend({"line": line, "warning": w} for w in warnings)
         result.rows.append({
             "shipment_id": sid, "factory_id": factory_id, "item_code": code, "supplier_id": sup,
-            "qty": qty, "eta": eta.isoformat(), "status": "OPEN",
+            "qty": qty, "eta": eta.isoformat(), "status": status,
         })
     return result
 

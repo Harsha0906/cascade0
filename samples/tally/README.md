@@ -9,8 +9,8 @@ Three CSV exports feed the inventory-based shortfall check. Upload each as
 | `open_purchase_orders.csv` | `POST /api/v1/ingest/open-purchase-orders` |
 | `sales_order_lines.csv` | `POST /api/v1/ingest/sales-order-lines` |
 
-Each response is `{success, filename, imported_count, errors}`. Valid rows are imported even when
-other rows fail; every failed row is listed in `errors` as `{line, error}` (line 1 is the header).
+Each response is `{success, filename, imported_count, errors, warnings}`. Valid rows are imported even when
+other rows fail; every failed row is listed in `errors` as `{line, error}` (line 1 is the header). `warnings` (`{line, warning}`) cover rows that are skipped or imported with a caveat: stock-summary total rows, overdue POs, and re-imported POs that are no longer OPEN (their status is kept).
 
 ## Columns (case-insensitive; any alias works)
 
@@ -38,4 +38,4 @@ The samples reproduce the demo seed data: stock `CASING` 350; PO `SHP-CHN-0001` 
 `SUP-CHN-01`; order lines `EV-402` 500 and `EV-405` 300.
 
 The PO is meant to arrive "tomorrow". **Edit the Due Date in `open_purchase_orders.csv` to a near-future
-date before importing**: open POs whose due date is already in the past are rejected as row errors.
+date before importing**: an open PO whose due date is already past is still imported but reported in `warnings` as overdue, and the shortfall calculation does not count it as inbound.

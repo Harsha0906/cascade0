@@ -610,7 +610,8 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
         raise HTTPException(status_code=400, detail="Empty CSV content")
 
     imported, errors = [], []
-    reader = csv.DictReader(io.StringIO(payload.csv_content))
+    reader = csv.DictReader(io.StringIO(payload.csv_content.lstrip("\ufeff")))
+    reader.fieldnames = [importers.normalize_header(h) for h in (reader.fieldnames or [])]
     for line_no, row in enumerate(reader, start=2):
         order_id = (row.get("order_id") or "").strip()
         if not order_id:
@@ -620,7 +621,6 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
             existing = db.get_order(order_id)
             record = {
                 "order_id": order_id,
-                "client": (row.get("client") or "").strip(),
                 "required_qty": _int_field(row, "required_qty"),
                 "sla_penalty_inr": _int_field(row, "sla_penalty_inr"),
                 "factory_id": settings.DEFAULT_FACTORY_ID,
@@ -630,9 +630,10 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
                 if existing is not None and not (row.get(key) or "").strip():
                     continue  # keep the stored value
                 record[key] = _int_field(row, key)
-            label = (row.get("deadline_label") or "").strip()
-            if label or existing is None:
-                record["deadline_label"] = label
+            for key in ("client", "deadline_label"):
+                value = (row.get(key) or "").strip()
+                if value or existing is None:  # blank on update keeps the stored value
+                    record[key] = value
             if existing is None:
                 record["status"] = "ON_TRACK"
                 record["shortfall_units"] = 0
@@ -663,6 +664,7 @@ def _import_response(payload: ErpCsvSyncRequest, result: importers.ImportResult)
         "filename": payload.filename,
         "imported_count": len(result.rows),
         "errors": result.errors,
+        "warnings": result.warnings,
     }
 
 
@@ -694,6 +696,7 @@ def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
     result = importers.parse_open_purchase_orders(
         payload.csv_content, factory_id, _factory_item_codes(factory_id), suppliers,
         datetime.now(timezone.utc),
+        existing_shipments={r["shipment_id"]: r for r in db.fetch_all("inbound_shipments")},
     )
     for row in result.rows:
         upsert_row("inbound_shipments", row, key_columns=("shipment_id",))
