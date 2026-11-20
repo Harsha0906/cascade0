@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, TypedDict
@@ -56,6 +57,9 @@ MAX_REBUTTAL_ROUNDS = 1
 
 _genai_client = None
 _gemini_failure_logged = False
+NARRATION_TIMEOUT_MS = 6000           # one narration call; the model usually answers in ~2 s
+NARRATION_COOLDOWN_S = 60.0           # after a failure, use templates for this long (no repeated timeouts)
+_narration_down_until = 0.0
 
 
 # ─── LLM narration (optional) ────────────────────────────────────────────────
@@ -64,7 +68,8 @@ def _get_genai_client():
     global _genai_client
     if _genai_client is None:
         from google import genai
-        _genai_client = genai.Client(api_key=settings.GEMINI_API_KEY, http_options={"timeout": 12000})
+        _genai_client = genai.Client(api_key=settings.GEMINI_API_KEY,
+                                     http_options={"timeout": NARRATION_TIMEOUT_MS})
     return _genai_client
 
 
@@ -79,8 +84,8 @@ def _llm_agent_reason(
     Ask Gemini to narrate a decision that has already been computed.
     Returns (text, mode) where mode is "gemini" or "template".
     """
-    global _gemini_failure_logged
-    if not settings.has_gemini:
+    global _gemini_failure_logged, _narration_down_until
+    if not settings.has_gemini or time.monotonic() < _narration_down_until:
         return fallback_message, "template"
     try:
         prompt = (
@@ -95,6 +100,8 @@ def _llm_agent_reason(
         if resp.text and len(resp.text.strip()) > 15:
             return resp.text.strip(), "gemini"
     except Exception as exc:
+        # One slow or failed call should not make every remaining step wait for its own timeout.
+        _narration_down_until = time.monotonic() + NARRATION_COOLDOWN_S
         if not _gemini_failure_logged:
             logger.warning("Gemini narration unavailable (%s) — using templated narration", exc)
             _gemini_failure_logged = True
