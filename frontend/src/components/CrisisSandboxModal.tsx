@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useFactoryStore } from "@/store/useFactoryStore";
 import {
   AlertTriangle,
@@ -39,10 +39,19 @@ export function CrisisSandboxModal() {
   const [delayHours, setDelayHours] = useState(48);
   const [lineSpeeds, setLineSpeeds] = useState<Record<string, number>>({});
 
+  const factoryId = factory?.factory_id;
+  useEffect(() => {
+    setTargetOrder(null);
+    setLineSpeeds({});
+  }, [factoryId]);
+
   if (!isCustomCrisisModalOpen) return null;
 
   const lines = factory?.lines ?? [];
-  const targetOrder = targetOrderChoice ?? orders[0]?.order_id ?? "";
+  const targetOrder =
+    targetOrderChoice && orders.some((o) => o.order_id === targetOrderChoice)
+      ? targetOrderChoice
+      : orders[0]?.order_id ?? "";
   const speedOf = (lineId: string) => lineSpeeds[lineId] ?? 100;
   const placeholder = `e.g. Truck breakdown, 120 units short on ${orders[0]?.order_id ?? "an order"}, ${lines[0]?.name ?? "a line"} running at 50%...`;
 
@@ -93,7 +102,7 @@ export function CrisisSandboxModal() {
                 </span>
               </div>
               <p className="text-xs text-charcoal-600 font-medium">
-                Inject any real-world disruption & watch the 4-Agent PuLP solver optimize on the fly.
+                Inject any real-world disruption & watch the solver rank recovery plans on the fly.
               </p>
             </div>
           </div>
@@ -196,7 +205,7 @@ export function CrisisSandboxModal() {
               <div className="p-3 rounded-xl bg-forest/5 border border-forest/15 text-[11px] text-charcoal-700 leading-relaxed flex items-start gap-2">
                 <Sparkles className="w-4 h-4 text-forest shrink-0 mt-0.5" />
                 <span>
-                  The <strong>Blast-Radius Detective</strong> uses Gemini entity extraction to dynamically parse your text, extract numbers/suppliers, and pass them directly to the PuLP solver.
+                  The <strong>Blast-Radius Detective</strong> uses AI or rule-based extraction to parse your text, extract numbers/suppliers, and pass them directly to the PuLP solver.
                 </span>
               </div>
               <button
@@ -205,7 +214,7 @@ export function CrisisSandboxModal() {
                 className="w-full py-3 rounded-xl bg-acid hover:bg-acid-hover text-charcoal-950 font-mono font-extrabold text-xs shadow-pill transition-all active:scale-95 flex items-center justify-center gap-2"
               >
                 <Zap className="w-4 h-4 fill-current" />
-                <span>Inject Prompt & Run 4-Agent Debate</span>
+                <span>Inject Prompt & Run Analysis</span>
               </button>
             </div>
           )}

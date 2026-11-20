@@ -3,7 +3,6 @@
 import React, { useState } from "react";
 import { useFactoryStore } from "@/store/useFactoryStore";
 import {
-  CloudSun,
   Flame,
   MessageSquare,
   Radio,
@@ -14,33 +13,11 @@ import {
 export function WebhookBar() {
   const { simulateCrisis, isSimulating, scenarios, scenariosError } = useFactoryStore();
   const [customInput, setCustomInput] = useState("");
-  const [isPollingWeather, setIsPollingWeather] = useState(false);
-  const [weatherData, setWeatherData] = useState<any>(null);
 
   const handleCustomSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!customInput.trim()) return;
     simulateCrisis(undefined, customInput.trim());
-  };
-
-  const pollHighwayWeather = async () => {
-    setIsPollingWeather(true);
-    try {
-      const API_BASE = typeof window !== "undefined" ? "" : (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000");
-      const res = await fetch(`${API_BASE}/api/v1/ingest/live-highway-check`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ corridor: "NH48 Chennai-Bengaluru", city: "Vellore" }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setWeatherData(data);
-      }
-    } catch {
-      // Fallback
-    } finally {
-      setIsPollingWeather(false);
-    }
   };
 
   return (
@@ -68,21 +45,6 @@ export function WebhookBar() {
             </button>
           ))}
 
-          {/* Highway Weather Pill */}
-          <button
-            onClick={pollHighwayWeather}
-            disabled={isPollingWeather}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/30 hover:bg-white/60 text-charcoal-800 border border-white/40 font-medium transition-all active:scale-95"
-          >
-            <CloudSun className="w-3.5 h-3.5 text-sky-700" />
-            <span>
-              {isPollingWeather
-                ? "Checking NH48..."
-                : weatherData
-                ? `NH48: ${weatherData.weather} (${weatherData.temp_c}°C)`
-                : "NH48 Corridor Check"}
-            </span>
-          </button>
         </div>
 
         {/* ─── Right: Custom WhatsApp Ingestion Input ──────────────────────── */}
@@ -93,7 +55,7 @@ export function WebhookBar() {
               type="text"
               value={customInput}
               onChange={(e) => setCustomInput(e.target.value)}
-              placeholder="Driver alert: 'NH48 waterlogging, 48h delay'..."
+              placeholder={scenarios[0]?.raw_message ?? "Type a disruption alert..."}
               className="w-full pl-8 pr-3 py-1.5 rounded-full bg-white/50 border border-white/60 text-xs text-charcoal-900 placeholder:text-charcoal-600 focus:outline-none focus:bg-white/80 focus:border-charcoal-800 transition-all font-sans"
             />
           </div>

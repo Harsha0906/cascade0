@@ -50,7 +50,7 @@ export default function MobileControllerPage() {
   const [summary, setSummary] = useState<FactoryStateSummary>({
     statusMode: "NORMAL",
     orderClient: "",
-    orderLabel: "",
+    orderLabel: "Loading…",
     orderShortfall: 0,
     contractRiskInr: 0,
     lastAgentLog: "All systems operating within nominal tolerances.",
@@ -429,7 +429,7 @@ export default function MobileControllerPage() {
             </h3>
           </div>
           <p className="text-[11px] text-charcoal-600 font-medium leading-snug">
-            Type a disruption in plain language. Gemini extracts the numbers when available (regex fallback otherwise); the solver ranks the plans.
+            Type a disruption in plain language. AI or rule-based extraction pulls out the numbers; the solver ranks the plans.
           </p>
 
           <textarea

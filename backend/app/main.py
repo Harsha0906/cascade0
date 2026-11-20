@@ -628,7 +628,7 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
 # ─── 6. Highway weather ──────────────────────────────────────────────────────
 
 @app.post("/api/v1/ingest/live-highway-check")
-def live_highway_check(req: LiveHighwayCheckRequest = LiveHighwayCheckRequest()):
+def live_highway_check(req: LiveHighwayCheckRequest):
     if settings.has_weather:
         try:
             resp = httpx.get(

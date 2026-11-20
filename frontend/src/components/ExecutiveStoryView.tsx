@@ -43,6 +43,8 @@ export function ExecutiveStoryView() {
     executionReceipt,
     openReceiptModal,
     activeOrderId,
+    factory,
+    factoryName,
   } = useFactoryStore();
 
   const isCrisis = statusMode === "CRISIS";
@@ -53,6 +55,9 @@ export function ExecutiveStoryView() {
   const opsPlan = playbooks.find((p) => p.id === "PLAN_A");
   const cfoPlan = playbooks.find((p) => p.id === "PLAN_B");
   const throttled = throttledLinesText(productionLines);
+  const atRiskOrders = orders.filter((o) => o.status !== "ON_TRACK");
+  const exposureInr = atRiskOrders.reduce((sum, o) => sum + (o.sla_penalty_inr ?? 0), 0);
+  const maxTemp = productionLines.length ? Math.max(...productionLines.map((l) => l.temp_celsius)) : null;
   const totalUnits = orders.reduce((sum, o) => sum + o.required_qty, 0);
   const dailyCapacity = productionLines.reduce((sum, l) => sum + l.daily_capacity_units, 0);
   const normalTemps = productionLines.map((l) => l.temp_celsius);
@@ -110,7 +115,7 @@ export function ExecutiveStoryView() {
                 </span>
 
                 <span className="text-xs font-mono text-charcoal-500">
-                  Apex Volt EV Battery Plant • Bengaluru Unit-2
+                  {factory?.name || factoryName || "Loading factory…"}
                 </span>
               </div>
 
@@ -119,7 +124,7 @@ export function ExecutiveStoryView() {
                   ? `Compound Risk: ${lakh(focus?.sla_penalty_inr ?? 0)} SLA Penalty on Order #${focus?.order_id ?? "?"}`
                   : isProtected
                   ? "Recovery Plan Approved: Draft PO & Notices Generated"
-                  : "Zero Contractual Exposure • All Production Lines Running"}
+                  : `${atRiskOrders.length ? `${lakh(exposureInr)} exposure across ${atRiskOrders.length} at-risk order(s)` : "No at-risk orders"} • ${throttled ? `Throttled: ${throttled}` : "All production lines running"}`}
               </h2>
 
               <p className="text-xs sm:text-sm text-charcoal-700 font-medium max-w-2xl mt-1 leading-relaxed">
@@ -397,17 +402,17 @@ export function ExecutiveStoryView() {
               {productionLines.length} Lines Active
             </div>
             <p className="text-xs text-charcoal-600 mt-1">
-              {productionLines.map((l) => l.name).join(", ")} operating at nominal temperatures ({tempRange}).
+              {productionLines.map((l) => l.name).join(", ")} temperatures {tempRange}{maxTemp !== null ? ` (max ${maxTemp}°C)` : ""}.
             </p>
           </div>
 
           <div className="island-card p-6 border border-white/60">
             <div className="flex items-center justify-between text-xs font-mono text-charcoal-600">
               <span className="font-bold uppercase">Multi-Agent Control</span>
-              <span className="text-forest font-bold">4-STEP PIPELINE</span>
+              <span className="text-forest font-bold">{atRiskOrders.length} AT RISK</span>
             </div>
             <div className="text-3xl font-extrabold font-mono text-charcoal-900 mt-2">
-              0 Violations
+              {atRiskOrders.length} At-Risk Orders
             </div>
             <p className="text-xs text-charcoal-600 mt-1">
               Ready to rank recovery plans when a disruption is reported.

@@ -30,6 +30,8 @@ export function TopKpiBar() {
     setDashboardViewMode,
     openCustomCrisisModal,
     activeOrderId,
+    factory,
+    factoryName,
   } = useFactoryStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -86,7 +88,7 @@ export function TopKpiBar() {
               </span>
             </div>
             <p className="text-xs text-charcoal-700 font-medium tracking-tight hidden sm:block">
-              Apex Volt EV Battery Plant • Bengaluru Unit-2
+              {factory?.name || factoryName || "Loading factory…"}
             </p>
           </div>
 

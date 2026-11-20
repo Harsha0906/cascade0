@@ -189,8 +189,8 @@ class ErpCsvSyncRequest(BaseModel):
 
 class LiveHighwayCheckRequest(BaseModel):
     """Highway corridor check."""
-    corridor: str = "NH48 Chennai-Bengaluru"
-    city: str = "Vellore"
+    corridor: str
+    city: str
 
 
 class ExecutePlanRequest(BaseModel):
