@@ -20,6 +20,7 @@ export function FlowCanvas() {
     closeInspectionDrawer,
     vendorHistory,
     factoryError,
+    retryFactoryLoad,
   } = useFactoryStore();
 
   // Find relevant vendor history if node is a supplier
@@ -34,6 +35,12 @@ export function FlowCanvas() {
           <AlertTriangle className="w-6 h-6 text-coral mx-auto mb-2" />
           <h3 className="font-bold text-sm text-charcoal-900 mb-1">Digital twin unavailable</h3>
           <p className="text-xs text-charcoal-800 font-mono break-words">{factoryError}</p>
+          <button
+            onClick={() => void retryFactoryLoad()}
+            className="mt-3 px-4 py-1.5 rounded-full bg-charcoal-900 text-white text-xs font-bold hover:bg-charcoal-800"
+          >
+            Retry
+          </button>
         </div>
       </div>
     );

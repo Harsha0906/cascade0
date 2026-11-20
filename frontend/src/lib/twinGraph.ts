@@ -57,8 +57,10 @@ export interface TwinGraphInput {
 const COL_X = { supplier: 0, line: 400, order: 800 } as const;
 const ROW_Y = 180;
 
-/** Statuses that mean a node is currently a problem for everything downstream. */
-const PROBLEM_STATUSES = ["DELAYED", "THROTTLED"];
+/** Line statuses that mean the line is a problem for everything downstream (single source of truth). */
+export const PROBLEM_LINE_STATUSES = ["THROTTLED", "OVERHEATING_THROTTLED", "DOWN", "OVERHEATING"];
+/** Supplier statuses that are a problem for everything downstream. */
+export const PROBLEM_SUPPLIER_STATUSES = ["DELAYED"];
 
 export function focusOrder(orders: OrderRow[], preferredOrderId?: string | null): OrderRow | null {
   if (!orders.length) return null;
@@ -166,7 +168,9 @@ export function buildTwinGraph(input: TwinGraphInput): { nodes: Node[]; edges: E
 
   const edges: Edge[] = [];
   const edgeFor = (source: Node, target: Node): Edge => {
-    const problem = PROBLEM_STATUSES.includes(String(source.data.status));
+    const status = String(source.data.status);
+    const problem =
+      source.type === "line" ? PROBLEM_LINE_STATUSES.includes(status) : PROBLEM_SUPPLIER_STATUSES.includes(status);
     return {
       id: `${source.id}->${target.id}`,
       source: source.id,

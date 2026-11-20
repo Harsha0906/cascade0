@@ -197,11 +197,14 @@ interface FactoryState {
   isCustomCrisisModalOpen: boolean;
   factory: FactoryInfo | null;
   factoryError: string | null;
+  scenariosError: string | null;
   scenarios: Scenario[];
   activeOrderId: string | null;
 
   // Actions
   fetchInitialState: () => Promise<void>;
+  /** Re-run the factory/scenarios load now (the Retry button); resets the backoff. */
+  retryFactoryLoad: () => Promise<void>;
   initRealtimeSubscriptions: () => () => void;
   simulateCrisis: (scenarioId?: number, customText?: string) => Promise<void>;
   simulateCustom: (input: {
@@ -242,6 +245,47 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
         selectedPlaybookId: data.recommended_plan_id,
       });
       get().updateNodesAndEdges();
+    }
+  };
+
+  /** Backoff delays (ms) between automatic retries of a failed factory/scenarios load; then stop. */
+  const RETRY_DELAYS_MS = [2000, 4000, 8000];
+  let retryAttempt = 0;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const errMsg = async (res: Response, what: string) => {
+    const detail = await res.json().catch(() => ({}));
+    return detail.detail || `${what} unavailable (HTTP ${res.status})`;
+  };
+
+  /** Load /factory and /scenarios independently; schedule bounded retries for whichever failed. */
+  const loadFactoryData = async () => {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    if (!get().factory) {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/factory`);
+        if (!res.ok) throw new Error(await errMsg(res, "Factory model"));
+        set({ factory: (await res.json()) as FactoryInfo, factoryError: null });
+      } catch (err) {
+        set({ factoryError: err instanceof Error ? err.message : "Factory model unavailable" });
+      }
+    }
+    if (get().scenarios.length === 0 || get().scenariosError) {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/scenarios`);
+        if (!res.ok) throw new Error(await errMsg(res, "Scenario presets"));
+        set({ scenarios: (await res.json()) as Scenario[], scenariosError: null });
+      } catch (err) {
+        set({ scenariosError: err instanceof Error ? err.message : "Scenario presets unavailable" });
+      }
+    }
+    get().updateNodesAndEdges();
+    if ((get().factoryError || get().scenariosError) && retryAttempt < RETRY_DELAYS_MS.length) {
+      const delay = RETRY_DELAYS_MS[retryAttempt++];
+      retryTimer = setTimeout(() => void loadFactoryData(), delay);
     }
   };
 
@@ -288,7 +332,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
   };
 
   return {
-  factoryName: "Apex Volt EV Battery Plant (Bengaluru Unit-2)",
+  factoryName: "",
   statusMode: "NORMAL",
   activeScenarioId: null,
   suppliers: [],
@@ -319,6 +363,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
   isCustomCrisisModalOpen: false,
   factory: null,
   factoryError: null,
+  scenariosError: null,
   scenarios: [],
   activeOrderId: null,
 
@@ -340,26 +385,14 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
       console.warn("FastAPI /state unreachable — using existing state", err);
     }
 
-    // The twin is built from the factory model; load it (and the presets) until it succeeds.
-    if (!get().factory) {
-      try {
-        const res = await fetch(`${API_BASE}/api/v1/factory`);
-        if (!res.ok) {
-          const detail = await res.json().catch(() => ({}));
-          throw new Error(detail.detail || `Factory model unavailable (HTTP ${res.status})`);
-        }
-        set({ factory: (await res.json()) as FactoryInfo, factoryError: null });
-      } catch (err) {
-        set({ factoryError: err instanceof Error ? err.message : "Factory model unavailable" });
-      }
-      try {
-        const res = await fetch(`${API_BASE}/api/v1/scenarios`);
-        if (res.ok) set({ scenarios: (await res.json()) as Scenario[] });
-      } catch {
-        // presets are optional; custom disruptions still work
-      }
-    }
+    await loadFactoryData();
     get().updateNodesAndEdges();
+  },
+
+  retryFactoryLoad: async () => {
+    retryAttempt = 0;
+    set({ factoryError: null, scenariosError: null });
+    await loadFactoryData();
   },
 
   initRealtimeSubscriptions: () => {

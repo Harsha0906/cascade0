@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTwinGraph, focusOrder, type FactoryInfo } from "./twinGraph";
+import { PROBLEM_LINE_STATUSES, buildTwinGraph, focusOrder, type FactoryInfo } from "./twinGraph";
 import type { Order, PlaybookOption, ProductionLine, Supplier } from "../store/useFactoryStore";
 
 const vendor = (id: string, role = "BACKUP") => ({
@@ -87,6 +87,16 @@ describe("buildTwinGraph", () => {
     input.lines[1] = line("L2", { status: "THROTTLED", speed_pct: 50 });
     const g = buildTwinGraph(input);
     expect(g.edges.filter((e) => e.source === "line:L2").every((e) => e.animated)).toBe(true);
+  });
+
+  it("treats every problem line status as a problem (incl. legacy OVERHEATING_THROTTLED)", () => {
+    for (const status of ["OVERHEATING_THROTTLED", "DOWN", "OVERHEATING", "THROTTLED"]) {
+      expect(PROBLEM_LINE_STATUSES).toContain(status);
+      const input = demoInput();
+      input.lines[0] = line("L1", { status });
+      const g = buildTwinGraph(input);
+      expect(g.edges.filter((e) => e.source === "line:L1").every((e) => e.animated)).toBe(true);
+    }
   });
 
   it("shows playbook allocations and overtime hours", () => {

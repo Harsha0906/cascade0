@@ -3,6 +3,7 @@
 import React, { memo } from "react";
 import { Handle, Position } from "@xyflow/react";
 import { AlertTriangle, CheckCircle2, Clock, Flame, ShieldCheck, Truck, Zap } from "lucide-react";
+import { PROBLEM_LINE_STATUSES, PROBLEM_SUPPLIER_STATUSES } from "@/lib/twinGraph";
 import { RECOVERY_STATUSES, useFactoryStore } from "@/store/useFactoryStore";
 
 type Tone = "ok" | "bad" | "good" | "neutral";
@@ -30,12 +31,12 @@ const HANDLE = "!w-2.5 !h-2.5 !border-2 !border-white";
 const label = (s: string) => s.replace(/_/g, " ");
 
 function supplierTone(status: string): Tone {
-  if (status === "DELAYED") return "bad";
+  if (PROBLEM_SUPPLIER_STATUSES.includes(status)) return "bad";
   if (status === "PO_DRAFTED") return "good";
   return "ok";
 }
 function lineTone(status: string): Tone {
-  if (status === "THROTTLED") return "bad";
+  if (PROBLEM_LINE_STATUSES.includes(status)) return "bad";
   if (status === "OVERTIME_SCHEDULED") return "good";
   return "ok";
 }
