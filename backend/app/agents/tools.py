@@ -81,6 +81,22 @@ _SHORT_CUE_RES = (
 _SUPPLIER_DELAY_CUE_RE = re.compile(r"\b(?:delay(?:ed)?|late|blocked|stuck|held)\b", re.I)
 # The alert says something is delayed, even when it gives no duration.
 _DELAY_MENTION_RE = re.compile(r"\b(?:delay(?:s|ed)?|late|blocked|stuck|held\s+up)\b", re.I)
+# "stuck at 50%" / "held at 50%" describe a line's speed, not a shipment delay.
+_SPEED_AFTER_CUE_RE = re.compile(r"\s*(?:(?:at|to)\s*)?\d{1,3}\s*%", re.I)
+# "no delays", "not delayed", "without delay", "never late": negated, not a delay.
+_NEGATED_BEFORE_RE = re.compile(r"\b(?:no|not|without|never|zero)\s+(?:[A-Za-z]+\s+)?$", re.I)
+
+
+def _mentions_delay(text: str) -> bool:
+    for m in _DELAY_MENTION_RE.finditer(text):
+        if _SPEED_AFTER_CUE_RE.match(text, m.end()):
+            continue
+        if _NEGATED_BEFORE_RE.search(text[max(0, m.start() - 30):m.start()]):
+            continue
+        return True
+    return False
+
+
 # A speed cue right after a line mention ("line a at 40%", "line a running at 40%").
 _IMMEDIATE_SPEED_CUE_RE = re.compile(
     r"\s*(?:(?:is|was|now|running|down|dropped|slowed)\s+){0,2}(?:at|to)\s*\d{1,3}\s*%", re.I)
@@ -111,7 +127,7 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         vals = ({_to_int(x) for x in re.findall(rf"{_NUM}\s*{_HOURS}", text, re.I)}
                 | {_to_int(x) * 24 for x in re.findall(rf"{_NUM}\s*{_DAYS}", text, re.I)})
     delay_hours = next(iter(vals)) if len(vals) == 1 else None
-    delay_mentioned = bool(_DELAY_MENTION_RE.search(text))
+    delay_mentioned = _mentions_delay(text)
 
     # Shortfall: a number bound to a shortfall cue; else the only units-count number; else unknown.
     vals = _cue_values(_SHORT_CUE_RES, text)

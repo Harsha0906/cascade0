@@ -125,6 +125,21 @@ class DelayDaysTests(unittest.TestCase):
         r = resolve_disruption(e, load_factory_model(), ORDERS)
         self.assertEqual(r.delay_hours, 0)
 
+    def test_speed_phrase_is_not_a_delay(self):
+        for text in ("Line 2 stuck at 50%, 100 units short on EV-402",
+                     "Line 2 held at 50%, 100 units short on EV-402"):
+            e, _ = _extract(text)
+            self.assertFalse(e.delay_mentioned, text)
+            self.assertEqual(resolve_disruption(e, load_factory_model(), ORDERS).delay_hours, 0)
+
+    def test_negated_delay_is_not_a_delay(self):
+        for text in ("no delays reported, Line 2 at 60%, 80 units short on EV-402",
+                     "shipment not delayed, Line 2 at 60%, 80 units short on EV-402",
+                     "arrived without delay, Line 2 at 60%, 80 units short on EV-402"):
+            e, _ = _extract(text)
+            self.assertFalse(e.delay_mentioned, text)
+            self.assertEqual(resolve_disruption(e, load_factory_model(), ORDERS).delay_hours, 0)
+
     def test_presets_resolve(self):
         prompts = [r["raw_message"] for r in db.get_scenarios("apex-volt-blr2")]
         for p in prompts:
