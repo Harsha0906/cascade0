@@ -11,7 +11,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from app.db import get_all_suppliers
 from app.factory_model import FactoryModel
 from app.schemas import DisruptionExtraction
 from app.solver import SolverInputError
@@ -31,6 +30,10 @@ def _forms(cid: str, name: str) -> set:
     return {f for f in (_norm(cid), _norm(name), _norm(stem)) if f}
 
 
+def _name_forms(name: str) -> set:
+    return {f for f in (_norm(name), _norm(name.split(" (")[0])) if f}
+
+
 def resolve_reference(text: str, candidates: Mapping[str, str], kind: str) -> str:
     t = _norm(text)
     forms = {cid: _forms(cid, name) for cid, name in candidates.items()}
@@ -46,16 +49,24 @@ def resolve_reference(text: str, candidates: Mapping[str, str], kind: str) -> st
         if len(exact) > 1:
             raise ambiguous(exact)
 
-        sub = [cid for cid, f in forms.items() if any(t in x for x in f)]
+        sub = []
+        if len(t) >= 3 and re.search(r"[a-z]", t):
+            sub = [cid for cid, f in forms.items() if any(t in x for x in f)]
         if len(sub) == 1:
             return sub[0]
         if len(sub) > 1:
             raise ambiguous(sub)
 
         by_norm: dict = {}
-        for cid, f in forms.items():
-            for x in f:
+        for cid, name in candidates.items():
+            for x in _name_forms(name):  # fuzzy matching on names only, never ids
                 by_norm.setdefault(x, set()).add(cid)
+                # a typo'd partial name ("chenai precision") is compared with same-length
+                # windows of the name, so it need not be spelled out in full
+                for n in (len(t), len(t) + 1):
+                    for i in range(0, max(len(x) - n, 0) + 1):
+                        if n >= 3 and n < len(x):
+                            by_norm.setdefault(x[i:i + n], set()).add(cid)
         close = difflib.get_close_matches(t, list(by_norm), n=10, cutoff=0.85)
         ids = {cid for x in close for cid in by_norm[x]}
         if len(ids) == 1:
@@ -117,16 +128,6 @@ def _check_speed(line_id: str, speed: Any) -> int:
     return speed
 
 
-def _primary_suppliers(model: FactoryModel) -> dict:
-    """PRIMARY suppliers (id -> name) of the factory. load_factory_model() excludes them
-    from model.vendors (they are the disrupted inbound source), so read them from the data."""
-    return {
-        row["id"]: row.get("name") or row["id"]
-        for row in get_all_suppliers()
-        if row.get("factory_id") == model.factory_id and row.get("sourcing_role") == "PRIMARY"
-    }
-
-
 def resolve_disruption(
     extraction: DisruptionExtraction,
     model: FactoryModel,
@@ -135,16 +136,20 @@ def resolve_disruption(
 ) -> ResolvedDisruption:
     ov = overrides or DisruptionOverrides()
     line_names = {l.line_id: l.name for l in model.lines}
-    primaries = _primary_suppliers(model)
+    primaries = dict(model.primary_suppliers)
     vendor_names = {**primaries, **{v.supplier_id: v.name for v in model.vendors}}
 
     delay = ov.delay_hours if ov.delay_hours is not None else extraction.delay_hours
     if delay is None:
         delay = 0
+    if delay < 0:
+        raise DisruptionResolutionError(f"delay_hours must be >= 0, got {delay}")
 
     shortfall = ov.shortfall_units if ov.shortfall_units is not None else extraction.shortfall_units
     if shortfall is None:
         raise DisruptionResolutionError("shortfall_units not stated")
+    if shortfall < 0:
+        raise DisruptionResolutionError(f"shortfall_units must be >= 0, got {shortfall}")
 
     impacts = []
     if ov.line_speeds is not None:

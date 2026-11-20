@@ -1,10 +1,10 @@
+import json
 import unittest
 
 from tests import _offline_env  # noqa: F401
 from tests.factories import small_factory
 
 from app.disruption import (
-    _primary_suppliers,
     DisruptionOverrides,
     DisruptionResolutionError,
     resolve_disruption,
@@ -20,7 +20,7 @@ def _lines(model):
 
 
 def _vendors(model):
-    return {**_primary_suppliers(model), **{v.supplier_id: v.name for v in model.vendors}}
+    return {**dict(model.primary_suppliers), **{v.supplier_id: v.name for v in model.vendors}}
 
 
 def _ext(**kw):
@@ -148,6 +148,60 @@ class ResolveDisruptionTests(unittest.TestCase):
             resolve_disruption(_ext(affected_order=None), self.model, self.orders)
         self.assertIn("EV-402", str(cm.exception))
         self.assertIn("EV-405", str(cm.exception))
+
+    def test_fuzzy_name_typo(self):
+        self.assertEqual(
+            resolve_reference("Chenai Precision", _vendors(self.model), "supplier"), "SUP-CHN-01")
+
+    def test_single_digit_does_not_match(self):
+        with self.assertRaises(DisruptionResolutionError):
+            resolve_reference("2", _lines(self.model), "line")
+
+    def test_order_override_not_in_orders(self):
+        with self.assertRaises(DisruptionResolutionError):
+            resolve_disruption(_ext(), self.model, self.orders, DisruptionOverrides(order_id="EV-999"))
+
+    def test_empty_order_override_is_unset(self):
+        r = resolve_disruption(_ext(), self.model, self.orders, DisruptionOverrides(order_id=""))
+        self.assertEqual(r.order_id, "EV-402")
+
+    def test_override_line_ids_are_exact_case_sensitive(self):
+        with self.assertRaises(DisruptionResolutionError):
+            resolve_disruption(_ext(), self.model, self.orders,
+                               DisruptionOverrides(line_speeds={"line-2": 50}))
+
+    def test_negative_speed_override(self):
+        with self.assertRaises(DisruptionResolutionError):
+            resolve_disruption(_ext(), self.model, self.orders,
+                               DisruptionOverrides(line_speeds={"LINE-2": -1}))
+
+    def test_extracted_speed_validated(self):
+        e = _ext()
+        e.affected_lines[0].speed_pct = 150  # bypasses pydantic bounds (no validate_assignment)
+        with self.assertRaises(DisruptionResolutionError):
+            resolve_disruption(e, self.model, self.orders)
+
+    def test_negative_delay(self):
+        with self.assertRaises(DisruptionResolutionError) as cm:
+            resolve_disruption(_ext(delay_hours=-1), self.model, self.orders)
+        self.assertIn("delay_hours", str(cm.exception))
+
+    def test_negative_shortfall_but_zero_ok(self):
+        with self.assertRaises(DisruptionResolutionError) as cm:
+            resolve_disruption(_ext(shortfall_units=-5), self.model, self.orders)
+        self.assertIn("shortfall_units", str(cm.exception))
+        self.assertEqual(resolve_disruption(_ext(shortfall_units=0), self.model, self.orders).shortfall_units, 0)
+
+    def test_generated_headline_and_json(self):
+        r = resolve_disruption(_ext(), self.model, self.orders)
+        self.assertEqual(
+            r.headline,
+            "Chennai Precision Casings Ltd +48h; Robotic Welding Line 2 at 50%; 150 short on #EV-402")
+        json.dumps(r.to_dict())
+
+    def test_extraction_headline_wins(self):
+        r = resolve_disruption(_ext(crisis_headline="Flood"), self.model, self.orders)
+        self.assertEqual(r.headline, "Flood")
 
 
 if __name__ == "__main__":

@@ -54,6 +54,8 @@ class FactoryModel:
     production_hours_in_window: float
     vendors: tuple[Vendor, ...]
     lines: tuple[ProductionLine, ...]
+    # (supplier_id, name) of PRIMARY suppliers: the disrupted inbound source, not in `vendors`.
+    primary_suppliers: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe representation (tuples become lists)."""
@@ -70,6 +72,7 @@ class FactoryModel:
         d = dict(d)
         d["vendors"] = tuple(vendor(v) for v in d["vendors"])
         d["lines"] = tuple(ProductionLine(**l) for l in d["lines"])
+        d["primary_suppliers"] = tuple(tuple(x) for x in d.get("primary_suppliers", ()))
         return cls(**d)
 
     def vendor(self, supplier_id: str) -> Vendor:
@@ -284,6 +287,7 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
     history = {h.get("supplier_id"): h for h in fetch_all("vendor_history")}
 
     vendors: list[Vendor] = []
+    primaries: list[tuple[str, str]] = []
     for row in get_all_suppliers():
         if row.get("factory_id") is None:
             p.missing("suppliers", "factory_id")
@@ -299,6 +303,7 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
                   f"{', '.join(_VALID_ROLES)}, got {role!r}")
             continue
         if role == "PRIMARY":
+            primaries.append((row["id"], row.get("name") or row["id"]))
             continue
         v = _load_vendor(row, history.get(row.get("id")), p)
         if v is not None:
@@ -324,4 +329,5 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
         # Sorted so the expedite choice and MILP tie-breaks never depend on database row order.
         vendors=tuple(sorted(vendors, key=lambda v: v.supplier_id)),
         lines=tuple(sorted(lines, key=lambda l: l.line_id)),
+        primary_suppliers=tuple(sorted(primaries)),
     )

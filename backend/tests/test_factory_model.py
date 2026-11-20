@@ -16,6 +16,15 @@ class FactoryModelTests(unittest.TestCase):
         self.assertEqual(small_factory().throughput_gap({"L-A": 50, "L-B": 80}), 70)
         self.assertEqual(small_factory().throughput_gap({"L-A": 100}), 0)
 
+    def test_primary_suppliers_roundtrip(self):
+        m = load_factory_model()
+        self.assertEqual([i for i, _ in m.primary_suppliers], ["SUP-CHN-01"])
+        self.assertEqual(FactoryModel.from_dict(json.loads(json.dumps(m.to_dict()))).primary_suppliers,
+                         m.primary_suppliers)
+        old = m.to_dict()
+        del old["primary_suppliers"]
+        self.assertEqual(FactoryModel.from_dict(old).primary_suppliers, ())
+
     def test_factory_model_roundtrip(self):
         m = load_factory_model()
         self.assertEqual(FactoryModel.from_dict(json.loads(json.dumps(m.to_dict()))), m)
