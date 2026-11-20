@@ -3,422 +3,209 @@
 import React, { memo } from "react";
 import { Handle, Position } from "@xyflow/react";
 import { AlertTriangle, CheckCircle2, Clock, Flame, ShieldCheck, Truck, Zap } from "lucide-react";
-import { useFactoryStore } from "@/store/useFactoryStore";
+import { PROBLEM_LINE_STATUSES, PROBLEM_SUPPLIER_STATUSES } from "@/lib/twinGraph";
+import { RECOVERY_STATUSES, useFactoryStore } from "@/store/useFactoryStore";
 
-// ─── Node 1: NH48 Chennai Supply (Top-Left) ──────────────────────────────────
-export const ChennaiSupplyNode = memo(({ data }: any) => {
+type Tone = "ok" | "bad" | "good" | "neutral";
+
+const TONE_CARD: Record<Tone, string> = {
+  ok: "hover:border-white/70",
+  neutral: "hover:border-white/70",
+  bad: "!border-coral !bg-coral/15 !shadow-[0_18px_40px_rgba(255,71,87,0.3)] ring-2 ring-coral/50",
+  good: "!border-acid/90 !bg-acid/20 !shadow-[0_18px_40px_rgba(229,244,58,0.25)] ring-2 ring-acid",
+};
+const TONE_PILL: Record<Tone, string> = {
+  ok: "bg-forest/15 text-forest-deep border border-forest/30",
+  neutral: "bg-white/40 text-charcoal-700 border border-white/60",
+  bad: "bg-coral text-white border border-coral shadow-pill-coral",
+  good: "bg-acid text-charcoal-950 border border-acid shadow-pill",
+};
+const TONE_ICON: Record<Tone, string> = {
+  ok: "bg-white/50 border border-white/70 text-charcoal-900",
+  neutral: "bg-white/50 border border-white/70 text-charcoal-900",
+  bad: "bg-coral text-white shadow-pill-coral",
+  good: "bg-acid text-charcoal-950 shadow-pill",
+};
+const HANDLE = "!w-2.5 !h-2.5 !border-2 !border-white";
+
+const label = (s: string) => s.replace(/_/g, " ");
+
+function supplierTone(status: string): Tone {
+  if (PROBLEM_SUPPLIER_STATUSES.includes(status)) return "bad";
+  if (status === "PO_DRAFTED") return "good";
+  return "ok";
+}
+function lineTone(status: string): Tone {
+  if (PROBLEM_LINE_STATUSES.includes(status)) return "bad";
+  if (status === "OVERTIME_SCHEDULED") return "good";
+  return "ok";
+}
+function orderTone(status: string): Tone {
+  if (status === "BREACH_RISK") return "bad";
+  if (RECOVERY_STATUSES.includes(status)) return "good";
+  return "ok";
+}
+
+// ─── Supplier ────────────────────────────────────────────────────────────────
+export const SupplierNode = memo(({ data }: any) => {
   const setSelectedNodeData = useFactoryStore((s) => s.setSelectedNodeData);
-  const isCrisis = data.isCrisis || data.status === "DELAYED";
+  const tone = supplierTone(data.status);
 
   return (
     <div
       onClick={() => setSelectedNodeData({ type: "SUPPLIER", ...data })}
-      className={`cursor-pointer rounded-[24px] p-4 w-72 transition-all duration-300 island-card select-none ${
-        isCrisis
-          ? "!border-coral !bg-coral/15 !shadow-[0_18px_40px_rgba(255,71,87,0.3)] ring-2 ring-coral/50"
-          : "hover:border-white/70"
-      }`}
+      className={`cursor-pointer rounded-[24px] p-4 w-72 transition-all duration-300 island-card select-none ${TONE_CARD[tone]}`}
     >
       <div className="flex items-center justify-between mb-2.5">
         <span className="text-[10px] font-bold tracking-wider uppercase px-2.5 py-0.5 rounded-full bg-white/40 border border-white/60 text-charcoal-800">
-          TIER-1 INBOUND
+          {data.role}
         </span>
-        <span
-          className={`flex items-center gap-1 text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full ${
-            isCrisis
-              ? "bg-coral text-white border border-coral shadow-pill-coral"
-              : "bg-forest/15 text-forest-deep border border-forest/30"
-          }`}
-        >
-          {isCrisis ? <AlertTriangle className="w-3 h-3" /> : <CheckCircle2 className="w-3 h-3 text-forest" />}
-          {isCrisis ? `DELAYED (+${data.delayHours || 48}h)` : "ON SCHEDULE"}
+        <span className={`flex items-center gap-1 text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full ${TONE_PILL[tone]}`}>
+          {tone === "bad" ? <AlertTriangle className="w-3 h-3" /> : tone === "good" ? <Clock className="w-3 h-3" /> : <CheckCircle2 className="w-3 h-3" />}
+          {data.status === "DELAYED" ? `DELAYED (+${data.delayHours}h)` : label(data.status)}
         </span>
       </div>
 
       <div className="flex items-center gap-2.5 mb-2.5">
-        <div
-          className={`p-2.5 rounded-2xl flex items-center justify-center transition-colors ${
-            isCrisis
-              ? "bg-coral text-white shadow-pill-coral"
-              : "bg-white/50 border border-white/70 text-charcoal-900"
-          }`}
-        >
+        <div className={`p-2.5 rounded-2xl flex items-center justify-center transition-colors ${TONE_ICON[tone]}`}>
           <Truck className="w-5 h-5" />
         </div>
-        <div>
-          <h3 className="text-sm font-bold text-charcoal-900 tracking-tight leading-tight">NH48 Chennai Logistics</h3>
-          <p className="text-[11px] font-medium text-charcoal-700">SUP-CHN-01 • Chennai Casings</p>
+        <div className="min-w-0">
+          <h3 className="text-sm font-bold text-charcoal-900 tracking-tight leading-tight truncate">{data.name}</h3>
+          <p className="text-[11px] font-medium text-charcoal-700">{data.supplierId}</p>
         </div>
       </div>
 
       <div className="grid grid-cols-2 gap-2 mt-2.5 pt-2.5 border-t border-charcoal-900/10 font-mono text-xs">
         <div>
           <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Inbound Qty</span>
-          <span className="text-charcoal-900 font-bold tabular-nums text-sm">{data.inboundQty || 500} Casings</span>
+          <span className="text-charcoal-900 font-bold tabular-nums text-sm">{data.inboundQty}</span>
         </div>
         <div>
-          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Highway Route</span>
-          <span className="text-charcoal-800 font-medium text-[11px] truncate block">NH48 Chennai-BLR</span>
-        </div>
-      </div>
-
-      <Handle
-        type="source"
-        position={Position.Right}
-        className={`!w-2.5 !h-2.5 !border-2 ${isCrisis ? "!bg-coral !border-white" : "!bg-charcoal-900 !border-white"}`}
-      />
-    </div>
-  );
-});
-ChennaiSupplyNode.displayName = "ChennaiSupplyNode";
-
-
-// ─── Node 2: Peenya + Hosur Backup (Bottom-Left) ────────────────────────────
-export const BackupVendorNode = memo(({ data }: any) => {
-  const setSelectedNodeData = useFactoryStore((s) => s.setSelectedNodeData);
-  const isProtected = data.isProtected;
-  const isCrisis = data.isCrisis;
-
-  return (
-    <div
-      onClick={() => setSelectedNodeData({ type: "BACKUP_VENDORS", ...data })}
-      className={`cursor-pointer rounded-[24px] p-4 w-72 transition-all duration-300 island-card select-none ${
-        isProtected
-          ? "!border-acid/90 !bg-acid/20 !shadow-[0_18px_40px_rgba(229,244,58,0.25)] ring-2 ring-acid"
-          : isCrisis
-          ? "border-amber-400/80 bg-amber-500/10 shadow-[0_14px_30px_rgba(245,158,11,0.2)]"
-          : "hover:border-white/70"
-      }`}
-    >
-      <div className="flex items-center justify-between mb-2.5">
-        <span className="text-[10px] font-bold tracking-wider uppercase px-2.5 py-0.5 rounded-full bg-white/40 border border-white/60 text-charcoal-800">
-          REGIONAL STANDBY
-        </span>
-        <span
-          className={`flex items-center gap-1 text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full ${
-            isProtected
-              ? "bg-acid text-charcoal-950 border border-acid shadow-pill"
-              : isCrisis
-              ? "bg-amber-100 text-amber-900 border border-amber-300"
-              : "bg-white/40 text-charcoal-700 border border-white/60"
-          }`}
-        >
-          <Clock className="w-3 h-3" />
-          {isProtected ? "PO DRAFTED" : isCrisis ? "RECOVERY READY" : "STANDBY (14 KM)"}
-        </span>
-      </div>
-
-      <div className="flex items-center gap-2.5 mb-2.5">
-        <div
-          className={`p-2.5 rounded-2xl flex items-center justify-center transition-colors ${
-            isProtected
-              ? "bg-acid text-charcoal-950 shadow-pill"
-              : "bg-white/50 border border-white/70 text-charcoal-900"
-          }`}
-        >
-          <Zap className="w-5 h-5" />
-        </div>
-        <div>
-          <h3 className="text-sm font-bold text-charcoal-900 tracking-tight leading-tight">Peenya + Hosur SME Network</h3>
-          <p className="text-[11px] font-medium text-charcoal-700">SUP-PNY-02 & SUP-HSR-03</p>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-2 gap-2 mt-2.5 pt-2.5 border-t border-charcoal-900/10 font-mono text-xs">
-        <div>
-          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Peenya @ ₹600</span>
+          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Allocated</span>
           <span className="text-charcoal-900 font-bold tabular-nums text-sm">
-            {data.peenyaAllocated ? `${data.peenyaAllocated} Allocated` : "200 Avail"}
-          </span>
-        </div>
-        <div>
-          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Hosur @ ₹850</span>
-          <span className="text-charcoal-900 font-bold tabular-nums text-sm">
-            {data.hosurAllocated ? `${data.hosurAllocated} Allocated` : "180 Avail"}
+            {data.allocatedUnits ? `${data.allocatedUnits} units` : "-"}
           </span>
         </div>
       </div>
 
-      <Handle
-        type="source"
-        position={Position.Right}
-        className="!w-2.5 !h-2.5 !border-2 !bg-charcoal-900 !border-white"
-      />
+      <Handle type="source" position={Position.Right} className={`${HANDLE} ${tone === "bad" ? "!bg-coral" : "!bg-charcoal-900"}`} />
     </div>
   );
 });
-BackupVendorNode.displayName = "BackupVendorNode";
+SupplierNode.displayName = "SupplierNode";
 
-
-// ─── Node 3: Welding Line 2 (Center-Top) ────────────────────────────────────
-export const WeldingLine2Node = memo(({ data }: any) => {
+// ─── Production line ─────────────────────────────────────────────────────────
+export const LineNode = memo(({ data }: any) => {
   const setSelectedNodeData = useFactoryStore((s) => s.setSelectedNodeData);
-  const isCrisis = data.isCrisis || data.status?.includes("OVERHEAT");
+  const tone = lineTone(data.status);
 
   return (
     <div
       onClick={() => setSelectedNodeData({ type: "PRODUCTION_LINE", ...data })}
-      className={`cursor-pointer rounded-[24px] p-4 w-72 transition-all duration-300 island-card select-none ${
-        isCrisis
-          ? "!border-coral !bg-coral/15 !shadow-[0_18px_40px_rgba(255,71,87,0.35)] ring-2 ring-coral/60"
-          : "hover:border-white/70"
-      }`}
+      className={`cursor-pointer rounded-[24px] p-4 w-72 transition-all duration-300 island-card select-none ${TONE_CARD[tone]}`}
     >
-      <Handle
-        type="target"
-        position={Position.Left}
-        className="!w-2.5 !h-2.5 !border-2 !bg-charcoal-900 !border-white"
-      />
+      <Handle type="target" position={Position.Left} className={`${HANDLE} !bg-charcoal-900`} />
 
       <div className="flex items-center justify-between mb-2.5">
         <span className="text-[10px] font-bold tracking-wider uppercase px-2.5 py-0.5 rounded-full bg-white/40 border border-white/60 text-charcoal-800">
-          PLC-L2 TELEMETRY
+          PRODUCTION LINE
         </span>
-        <span
-          className={`flex items-center gap-1 text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full ${
-            isCrisis
-              ? "bg-coral text-white border border-coral shadow-pill-coral animate-pulse"
-              : "bg-forest/15 text-forest-deep border border-forest/30"
-          }`}
-        >
-          <Flame className="w-3 h-3" />
-          {isCrisis ? "THERMAL THROTTLE" : "NOMINAL SPEED"}
+        <span className={`flex items-center gap-1 text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full ${TONE_PILL[tone]} ${tone === "bad" ? "animate-pulse" : ""}`}>
+          {tone === "good" ? <Zap className="w-3 h-3" /> : <Flame className="w-3 h-3" />}
+          {label(data.status)}
         </span>
       </div>
 
       <div className="flex items-center gap-2.5 mb-2.5">
-        <div
-          className={`p-2.5 rounded-2xl flex items-center justify-center transition-colors ${
-            isCrisis
-              ? "bg-coral text-white shadow-pill-coral"
-              : "bg-white/50 border border-white/70 text-charcoal-900"
-          }`}
-        >
+        <div className={`p-2.5 rounded-2xl flex items-center justify-center transition-colors ${TONE_ICON[tone]}`}>
           <Flame className="w-5 h-5" />
         </div>
-        <div>
-          <h3 className="text-sm font-bold text-charcoal-900 tracking-tight leading-tight">Robotic Welding Line 2</h3>
-          <p className="text-[11px] font-medium text-charcoal-700">LINE-2 • Primary Pack Assembly</p>
+        <div className="min-w-0">
+          <h3 className="text-sm font-bold text-charcoal-900 tracking-tight leading-tight truncate">{data.name}</h3>
+          <p className="text-[11px] font-medium text-charcoal-700">{data.lineId}</p>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-2 mt-2.5 pt-2.5 border-t border-charcoal-900/10 font-mono text-xs">
+      <div className="grid grid-cols-3 gap-2 mt-2.5 pt-2.5 border-t border-charcoal-900/10 font-mono text-xs">
         <div>
-          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Line Speed</span>
-          <span className={`font-bold tabular-nums text-sm ${isCrisis ? "text-coral font-extrabold" : "text-charcoal-900"}`}>
-            {data.speedPct || 100}%
+          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Speed</span>
+          <span className={`font-bold tabular-nums text-sm ${tone === "bad" ? "text-coral font-extrabold" : "text-charcoal-900"}`}>
+            {data.speedPct}%
           </span>
         </div>
         <div>
-          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Operating Temp</span>
-          <span className={`font-bold tabular-nums text-sm ${isCrisis ? "text-coral font-extrabold" : "text-charcoal-900"}`}>
-            {data.tempC || 62.0}°C
-          </span>
+          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Temp</span>
+          <span className="font-bold tabular-nums text-sm text-charcoal-900">{data.tempC}°C</span>
+        </div>
+        <div>
+          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">OT</span>
+          <span className="font-bold tabular-nums text-sm text-charcoal-900">{data.otHours ? `+${data.otHours}h` : "-"}</span>
         </div>
       </div>
 
-      <Handle
-        type="source"
-        position={Position.Right}
-        className={`!w-2.5 !h-2.5 !border-2 ${isCrisis ? "!bg-coral !border-white" : "!bg-charcoal-900 !border-white"}`}
-      />
+      <Handle type="source" position={Position.Right} className={`${HANDLE} ${tone === "bad" ? "!bg-coral" : "!bg-charcoal-900"}`} />
     </div>
   );
 });
-WeldingLine2Node.displayName = "WeldingLine2Node";
+LineNode.displayName = "LineNode";
 
-
-// ─── Node 4: Lines 1 & 3 Buffer (Center-Bottom) ─────────────────────────────
-export const ParallelBufferNode = memo(({ data }: any) => {
+// ─── Order ───────────────────────────────────────────────────────────────────
+export const OrderNode = memo(({ data }: any) => {
   const setSelectedNodeData = useFactoryStore((s) => s.setSelectedNodeData);
-  const isProtected = data.isProtected;
-
-  return (
-    <div
-      onClick={() => setSelectedNodeData({ type: "PARALLEL_BUFFER", ...data })}
-      className={`cursor-pointer rounded-[24px] p-4 w-72 transition-all duration-300 island-card select-none ${
-        isProtected
-          ? "!border-acid/90 !bg-acid/20 !shadow-[0_18px_40px_rgba(229,244,58,0.25)] ring-2 ring-acid"
-          : "hover:border-white/70"
-      }`}
-    >
-      <Handle
-        type="target"
-        position={Position.Left}
-        className="!w-2.5 !h-2.5 !border-2 !bg-charcoal-900 !border-white"
-      />
-
-      <div className="flex items-center justify-between mb-2.5">
-        <span className="text-[10px] font-bold tracking-wider uppercase px-2.5 py-0.5 rounded-full bg-white/40 border border-white/60 text-charcoal-800">
-          PARALLEL CAPACITY
-        </span>
-        <span
-          className={`flex items-center gap-1 text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full ${
-            isProtected
-              ? "bg-acid text-charcoal-950 border border-acid shadow-pill"
-              : "bg-white/40 text-charcoal-800 border border-white/60"
-          }`}
-        >
-          <Clock className="w-3 h-3" />
-          {isProtected ? "OVERTIME ACTIVE" : "BUFFER STANDBY"}
-        </span>
-      </div>
-
-      <div className="flex items-center gap-2.5 mb-2.5">
-        <div
-          className={`p-2.5 rounded-2xl flex items-center justify-center transition-colors ${
-            isProtected
-              ? "bg-acid text-charcoal-950 shadow-pill"
-              : "bg-white/50 border border-white/70 text-charcoal-900"
-          }`}
-        >
-          <Zap className="w-5 h-5" />
-        </div>
-        <div>
-          <h3 className="text-sm font-bold text-charcoal-900 tracking-tight leading-tight">Welding Lines 1 & 3 Buffer</h3>
-          <p className="text-[11px] font-medium text-charcoal-700">LINE-1 & LINE-3 • 38 u/hr OT</p>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-2 gap-2 mt-2.5 pt-2.5 border-t border-charcoal-900/10 font-mono text-xs">
-        <div>
-          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Overtime Plan</span>
-          <span className="text-charcoal-900 font-bold tabular-nums text-sm">
-            {data.otHours ? `+${data.otHours}h Shift OT` : "Standby (Max 8h)"}
-          </span>
-        </div>
-        <div>
-          <span className="text-[10px] font-bold text-charcoal-600 block uppercase tracking-wide">Overtime Rate</span>
-          <span className="text-charcoal-800 font-bold tabular-nums text-sm">₹22,500/hr</span>
-        </div>
-      </div>
-
-      <Handle
-        type="source"
-        position={Position.Right}
-        className="!w-2.5 !h-2.5 !border-2 !bg-charcoal-900 !border-white"
-      />
-    </div>
-  );
-});
-ParallelBufferNode.displayName = "ParallelBufferNode";
-
-
-// ─── Node 5: Order #EV-402 SLA Contract (Right) ─────────────────────────────
-export const OrderSlaNode = memo(({ data }: any) => {
-  const setSelectedNodeData = useFactoryStore((s) => s.setSelectedNodeData);
-  const isProtected = data.isProtected || ["SLA_PROTECTED", "RECOVERY_IN_PROGRESS", "EXTENSION_REQUESTED"].includes(data.status);
-  const isCrisis = !isProtected && (data.isCrisis || data.status === "BREACH_RISK");
+  const tone = orderTone(data.status);
 
   return (
     <div
       onClick={() => setSelectedNodeData({ type: "ORDER_SLA", ...data })}
-      className={`cursor-pointer rounded-[24px] p-4 w-80 transition-all duration-300 island-card select-none ${
-        isProtected
-          ? "!border-acid !bg-acid/20 !shadow-[0_20px_45px_rgba(229,244,58,0.3)] ring-2 ring-acid"
-          : isCrisis
-          ? "!border-coral !bg-coral/20 !shadow-[0_22px_50px_rgba(255,71,87,0.4)] ring-2 ring-coral animate-pulse-slow"
-          : "hover:border-white/70"
+      className={`cursor-pointer rounded-[24px] p-4 w-80 transition-all duration-300 island-card select-none ${TONE_CARD[tone]} ${
+        data.isFocus ? "outline outline-2 outline-offset-2 outline-charcoal-900/40" : ""
       }`}
     >
-      <Handle
-        type="target"
-        position={Position.Left}
-        className={`!w-2.5 !h-2.5 !border-2 ${isCrisis ? "!bg-coral !border-white" : "!bg-charcoal-900 !border-white"}`}
-      />
+      <Handle type="target" position={Position.Left} className={`${HANDLE} ${tone === "bad" ? "!bg-coral" : "!bg-charcoal-900"}`} />
 
       <div className="flex items-center justify-between mb-2.5">
         <span className="text-[10px] font-bold tracking-wider uppercase px-2.5 py-0.5 rounded-full bg-white/40 border border-white/60 text-charcoal-800">
-          CLIENT SLA CONTRACT
+          {data.isFocus ? "FOCUS ORDER" : "CLIENT ORDER"}
         </span>
-        <span
-          className={`flex items-center gap-1 text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full ${
-            isProtected
-              ? "bg-acid text-charcoal-950 border border-acid shadow-pill"
-              : isCrisis
-              ? "bg-coral text-white border border-coral shadow-pill-coral"
-              : "bg-forest/15 text-forest-deep border border-forest/30"
-          }`}
-        >
-          {isProtected ? (
-            <ShieldCheck className="w-3.5 h-3.5" />
-          ) : isCrisis ? (
-            <AlertTriangle className="w-3.5 h-3.5" />
-          ) : (
-            <CheckCircle2 className="w-3.5 h-3.5 text-forest" />
-          )}
-          {isProtected ? "SLA PROTECTED" : isCrisis ? "BREACH RISK" : "ON TRACK"}
+        <span className={`flex items-center gap-1 text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full ${TONE_PILL[tone]}`}>
+          {tone === "bad" ? <AlertTriangle className="w-3.5 h-3.5" /> : tone === "good" ? <ShieldCheck className="w-3.5 h-3.5" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+          {label(data.status)}
         </span>
       </div>
 
       <div className="flex items-center gap-2.5 mb-2.5">
-        <div
-          className={`p-2.5 rounded-2xl flex items-center justify-center transition-colors ${
-            isProtected
-              ? "bg-acid text-charcoal-950 shadow-pill"
-              : isCrisis
-              ? "bg-coral text-white shadow-pill-coral"
-              : "bg-white/50 border border-white/70 text-charcoal-900"
-          }`}
-        >
+        <div className={`p-2.5 rounded-2xl flex items-center justify-center transition-colors ${TONE_ICON[tone]}`}>
           <ShieldCheck className="w-5 h-5" />
         </div>
-        <div>
-          <h3 className="text-sm font-bold text-charcoal-900 tracking-tight leading-tight">Order #EV-402 Delivery</h3>
-          <p className="text-[11px] font-medium text-charcoal-700">Ather-Grid Mobility • 500 Packs</p>
+        <div className="min-w-0">
+          <h3 className="text-sm font-bold text-charcoal-900 tracking-tight leading-tight">Order #{data.orderId}</h3>
+          <p className="text-[11px] font-medium text-charcoal-700 truncate">{data.client}</p>
         </div>
       </div>
 
       <div className="space-y-2 mt-2.5 pt-2.5 border-t border-charcoal-900/10 font-mono text-xs">
         <div className="flex justify-between items-center">
-          <span className="text-[10px] font-bold text-charcoal-600 uppercase tracking-wide">Committed SLA:</span>
-          <span className="text-charcoal-800 font-semibold text-[11px]">Friday 17:00 IST (38h)</span>
-        </div>
-
-        <div className="flex justify-between items-center">
-          <span className="text-[10px] font-bold text-charcoal-600 uppercase tracking-wide">Net Unit Shortfall:</span>
-          <span
-            className={`font-bold tabular-nums text-sm ${
-              isProtected
-                ? "text-charcoal-900 font-extrabold"
-                : isCrisis
-                ? "text-coral font-extrabold"
-                : "text-forest-deep"
-            }`}
-          >
-            {isProtected ? "Recovery plan approved" : isCrisis ? `-${data.shortfall ?? 0} Casings` : "0 Casings"}
+          <span className="text-[10px] font-bold text-charcoal-600 uppercase tracking-wide">Unit Shortfall:</span>
+          <span className={`font-bold tabular-nums text-sm ${tone === "bad" ? "text-coral font-extrabold" : "text-charcoal-900"}`}>
+            {data.shortfall}
           </span>
         </div>
-
         <div className="flex justify-between items-center pt-1.5 border-t border-charcoal-900/10">
-          <span className="text-[10px] font-bold text-charcoal-600 uppercase tracking-wide">SLA Penalty Risk:</span>
-          <span
-            className={`font-mono font-extrabold text-sm tabular-nums ${
-              isProtected
-                ? "text-forest-deep"
-                : isCrisis
-                ? "text-coral"
-                : "text-charcoal-700"
-            }`}
-          >
-            {isProtected
-              ? "Mitigation approved"
-              : isCrisis
-              ? `-₹${(data.penaltyExposure ?? 0).toLocaleString("en-IN")}`
-              : "₹0 Risk"}
+          <span className="text-[10px] font-bold text-charcoal-600 uppercase tracking-wide">SLA Penalty:</span>
+          <span className={`font-extrabold text-sm tabular-nums ${tone === "bad" ? "text-coral" : "text-charcoal-700"}`}>
+            ₹{(data.penaltyInr ?? 0).toLocaleString("en-IN")}
           </span>
         </div>
       </div>
     </div>
   );
 });
-OrderSlaNode.displayName = "OrderSlaNode";
+OrderNode.displayName = "OrderNode";
 
-// Export node types registry for React Flow
+// Node type registry for React Flow
 export const nodeTypes = {
-  chennaiSupplyNode: ChennaiSupplyNode,
-  backupVendorNode: BackupVendorNode,
-  weldingLine2Node: WeldingLine2Node,
-  parallelBufferNode: ParallelBufferNode,
-  orderSlaNode: OrderSlaNode,
+  supplier: SupplierNode,
+  line: LineNode,
+  order: OrderNode,
 };

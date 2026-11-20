@@ -24,6 +24,18 @@ def _rfq(units=150):
                units_requested=units, expected_unit_price_inr=600, needed_within_hours=34, channel="simulated")
 
 
+class RfqWordingTests(unittest.TestCase):
+    def test_flat_fee_vendor_rfq_is_not_an_air_charter(self):
+        from tests.factories import small_factory
+        model = small_factory()
+        rfq = RFQ(id="R", run_id="X", round=1, supplier_id="V3", supplier_name="Vendor V3",
+                  units_requested=120, expected_unit_price_inr=0, needed_within_hours=20, channel="simulated")
+        text = sourcing._rfq_text(model, rfq)
+        self.assertIn("flat fee", text)
+        self.assertNotIn("air charter", text)
+        self.assertIn("120 Widget", text)
+
+
 class ReplyParsingTests(unittest.TestCase):
     def test_english_and_hinglish_replies(self):
         cases = {
@@ -100,6 +112,33 @@ class SourcingFlowTests(unittest.TestCase):
         session = sourcing_store.load(sim["run_id"])
         self.assertEqual(session.model, run_store.get_run(sim["run_id"])["factory_model"])
         self.assertEqual(session.params["line_speeds"], run_store.get_run(sim["run_id"])["line_speeds"])
+
+    def test_run_missing_blast_radius_field_is_rejected(self):
+        sim = self._simulate(1)
+        run = run_store.get_run(sim["run_id"])
+        del run["blast_radius"]["sla_penalty_inr"]
+        run_store.save_run(run)
+        with self.assertRaisesRegex(sourcing.SourcingError, "sla_penalty_inr"):
+            sourcing.start_sourcing(sim["run_id"])
+
+    def test_second_factory_run_sources_with_its_own_order_terms(self):
+        from tests.factories import seed_second_factory
+        from app.agents.graph import run_cascade_pipeline
+        from app.db import reset_to_seed
+        seed_second_factory()
+        try:
+            result = run_cascade_pipeline(
+                "L-B at 40%, 80 units short on WO-77, 5h delay from Vendor V1", factory_id="test-plant")
+            run_store.save_run(result)
+            sourcing.start_sourcing(result["run_id"])
+            params = sourcing_store.load(result["run_id"]).params
+            self.assertEqual(params["order_id"], "WO-77")
+            self.assertEqual(params["sla_penalty_inr"], 400_000)
+            self.assertEqual(params["partial_penalty_inr"], 80_000)
+            self.assertEqual(params["deadline_hours"], 30.0)
+            self.assertEqual(params["client"], "Test Client")
+        finally:
+            reset_to_seed()
 
     def test_rfq_deadline_uses_the_factory_qa_time(self):
         sim = self._simulate(1)

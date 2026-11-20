@@ -2,6 +2,7 @@
 
 import React, { useRef } from "react";
 import { useFactoryStore } from "@/store/useFactoryStore";
+import { focusOrder } from "@/lib/twinGraph";
 import {
   Activity,
   AlertTriangle,
@@ -28,11 +29,14 @@ export function TopKpiBar() {
     dashboardViewMode,
     setDashboardViewMode,
     openCustomCrisisModal,
+    activeOrderId,
+    factory,
+    factoryName,
   } = useFactoryStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const ev402 = orders.find((o) => o.order_id === "EV-402");
+  const focus = focusOrder(orders, activeOrderId);
   const selectedPlan = playbooks.find((p) => p.id === selectedPlaybookId);
 
   const isCrisis = statusMode === "CRISIS";
@@ -84,7 +88,7 @@ export function TopKpiBar() {
               </span>
             </div>
             <p className="text-xs text-charcoal-700 font-medium tracking-tight hidden sm:block">
-              Apex Volt EV Battery Plant • Bengaluru Unit-2
+              {factory?.name || factoryName || "Loading factory…"}
             </p>
           </div>
 
@@ -154,7 +158,7 @@ export function TopKpiBar() {
               }`}
             >
               {isCrisis
-                ? `-₹${(ev402?.sla_penalty_inr ?? 0).toLocaleString("en-IN")}`
+                ? `-₹${(focus?.sla_penalty_inr ?? 0).toLocaleString("en-IN")}`
                 : isProtected
                 ? selectedPlan
                   ? `Plan approved (₹${(selectedPlan.total_mitigation_cost_inr / 100000).toFixed(2)}L)`

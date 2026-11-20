@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import { focusOrder, type Scenario } from "@/lib/twinGraph";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -20,6 +21,7 @@ import {
 interface FactoryStateSummary {
   statusMode: "NORMAL" | "CRISIS" | "PROTECTED";
   orderClient: string;
+  orderLabel: string;
   orderShortfall: number;
   contractRiskInr: number;
   lastAgentLog: string;
@@ -47,7 +49,8 @@ const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
 export default function MobileControllerPage() {
   const [summary, setSummary] = useState<FactoryStateSummary>({
     statusMode: "NORMAL",
-    orderClient: "Ather-Grid Mobility Corp (#EV-402)",
+    orderClient: "",
+    orderLabel: "Loading…",
     orderShortfall: 0,
     contractRiskInr: 0,
     lastAgentLog: "All systems operating within nominal tolerances.",
@@ -55,6 +58,9 @@ export default function MobileControllerPage() {
     bestPlaybook: null,
   });
   const [latestRun, setLatestRun] = useState<LatestRun>({ run_id: null });
+  const [scenarios, setScenarios] = useState<Scenario[]>([]);
+  const [scenariosError, setScenariosError] = useState<string | null>(null);
+  const activeOrderRef = React.useRef<string | null>(null);
 
   const [customPrompt, setCustomPrompt] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -66,19 +72,20 @@ export default function MobileControllerPage() {
       const res = await fetch("/api/v1/state");
       if (res.ok) {
         const data = await res.json();
-        const ev402 = data.orders?.find((o: any) => o.order_id === "EV-402");
+        const focus = focusOrder(data.orders ?? [], activeOrderRef.current);
         const logs = data.agent_logs || [];
         const lastLog = logs.length > 0 ? logs[logs.length - 1] : null;
 
-        const isProtected = RECOVERY_STATUSES.includes(ev402?.status);
+        const isProtected = RECOVERY_STATUSES.includes(focus?.status ?? "");
         const isCrisis =
-          ev402?.shortfall_units > 0 && !isProtected;
+          (focus?.shortfall_units ?? 0) > 0 && !isProtected;
 
         setSummary({
           statusMode: isProtected ? "PROTECTED" : isCrisis ? "CRISIS" : "NORMAL",
-          orderClient: ev402 ? `${ev402.client} (#${ev402.order_id})` : "Ather-Grid Mobility Corp (#EV-402)",
-          orderShortfall: ev402?.shortfall_units ?? 0,
-          contractRiskInr: isCrisis ? ev402?.sla_penalty_inr ?? 0 : 0,
+          orderClient: focus ? `${focus.client} (#${focus.order_id})` : "",
+          orderLabel: focus ? `${focus.order_id} (${focus.required_qty} units)` : "No orders",
+          orderShortfall: focus?.shortfall_units ?? 0,
+          contractRiskInr: isCrisis ? focus?.sla_penalty_inr ?? 0 : 0,
           lastAgentLog: lastLog ? lastLog.message : "All systems operating within nominal tolerances.",
           lastAgentName: lastLog ? lastLog.agent_name : "Detective",
           bestPlaybook: null,
@@ -91,7 +98,19 @@ export default function MobileControllerPage() {
     }
   };
 
+  const loadScenarios = async () => {
+    try {
+      const res = await fetch("/api/v1/scenarios");
+      if (!res.ok) throw new Error(`Scenario presets unavailable (HTTP ${res.status})`);
+      setScenarios((await res.json()) as Scenario[]);
+      setScenariosError(null);
+    } catch (err) {
+      setScenariosError(err instanceof Error ? err.message : "Scenario presets unavailable");
+    }
+  };
+
   useEffect(() => {
+    loadScenarios();
     refreshState();
     const interval = setInterval(refreshState, 2000);
     return () => clearInterval(interval);
@@ -108,10 +127,12 @@ export default function MobileControllerPage() {
       });
       if (res.ok) {
         const data = await res.json();
+        activeOrderRef.current = data.extracted_parameters?.affected_order_id ?? null;
         setFeedbackMsg(`✅ Scenario ${scenarioId} analysed → ${data.recommended_plan_id} recommended.`);
         await refreshState();
       } else {
-        setFeedbackMsg(`⚠️ Backend error (HTTP ${res.status}).`);
+        const err = await res.json().catch(() => ({}));
+        setFeedbackMsg(`⚠️ ${err.detail || `Backend error (HTTP ${res.status}).`}`);
       }
     } catch {
       setFeedbackMsg("⚠️ Could not contact FastAPI backend.");
@@ -135,10 +156,12 @@ export default function MobileControllerPage() {
         const data = await res.json();
         const via = data.extracted_parameters?.source?.startsWith("gemini") ? "Gemini" : "regex fallback (LLM offline)";
         setFeedbackMsg(`✅ Parsed via ${via} → ${data.recommended_plan_id} recommended.`);
+        activeOrderRef.current = data.extracted_parameters?.affected_order_id ?? null;
         setCustomPrompt("");
         await refreshState();
       } else {
-        setFeedbackMsg(`⚠️ Backend error (HTTP ${res.status}).`);
+        const err = await res.json().catch(() => ({}));
+        setFeedbackMsg(`⚠️ ${err.detail || `Backend error (HTTP ${res.status}).`}`);
       }
     } catch {
       setFeedbackMsg("⚠️ Error triggering custom disruption.");
@@ -306,7 +329,7 @@ export default function MobileControllerPage() {
           <div className="mt-4 pt-3 border-t border-charcoal-900/10 flex items-center justify-between text-xs font-mono">
             <div>
               <span className="text-charcoal-600 text-[10px] font-bold uppercase block">TARGET ORDER</span>
-              <span className="text-charcoal-900 font-bold">EV-402 (500 units)</span>
+              <span className="text-charcoal-900 font-bold">{summary.orderLabel}</span>
             </div>
             <div className="text-right">
               <span className="text-charcoal-600 text-[10px] font-bold uppercase block">SHORTFALL</span>
@@ -366,86 +389,33 @@ export default function MobileControllerPage() {
             <span className="text-[11px] text-charcoal-500 font-medium">Tap to Trigger</span>
           </div>
 
-          {/* Scenario 1 Button */}
-          <button
-            onClick={() => triggerScenario(1)}
-            disabled={isSubmitting}
-            className="p-4 rounded-[24px] island-card text-left active:scale-[0.98] transition-all flex items-start gap-3.5"
-          >
-            <div className="w-9 h-9 rounded-2xl bg-coral/15 border border-coral/30 flex items-center justify-center shrink-0 mt-0.5 text-coral">
-              <Flame className="w-5 h-5" />
-            </div>
-            <div className="flex-1">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-charcoal-900 font-mono">
-                  Scenario 1: Compound Disruption
-                </span>
-                <span className="text-[10px] font-mono font-extrabold px-2 py-0.5 rounded-full bg-coral/20 text-coral border border-coral/30">
-                  150u Deficit
+          {scenariosError && (
+            <div className="text-[11px] font-mono text-coral px-1">{scenariosError}</div>
+          )}
+          {scenarios.map((sc) => (
+            <button
+              key={sc.scenario_id}
+              onClick={() => triggerScenario(sc.scenario_id)}
+              disabled={isSubmitting}
+              className="p-4 rounded-[24px] island-card text-left active:scale-[0.98] transition-all flex items-start gap-3.5"
+            >
+              <div className="w-9 h-9 rounded-2xl bg-coral/15 border border-coral/30 flex items-center justify-center shrink-0 mt-0.5 text-coral">
+                <Flame className="w-5 h-5" />
+              </div>
+              <div className="flex-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-bold text-charcoal-900 font-mono">{sc.title}</span>
+                  <span className="text-[10px] font-mono font-extrabold px-2 py-0.5 rounded-full bg-coral/20 text-coral border border-coral/30 shrink-0">
+                    {sc.shortfall_units}u Deficit
+                  </span>
+                </div>
+                <p className="text-[11px] text-charcoal-700 mt-1 leading-snug font-medium">{sc.summary}</p>
+                <span className="text-[10px] text-forest font-bold font-mono mt-1.5 block">
+                  → Tap to compute ranked recovery plans
                 </span>
               </div>
-              <p className="text-[11px] text-charcoal-700 mt-1 leading-snug font-medium">
-                NH48 Highway flood (48h delay) + Welding Line 2 throttled to 50% @ 89°C.
-              </p>
-              <span className="text-[10px] text-forest font-bold font-mono mt-1.5 block">
-                → Tap to compute ranked recovery plans
-              </span>
-            </div>
-          </button>
-
-          {/* Scenario 2 Button */}
-          <button
-            onClick={() => triggerScenario(2)}
-            disabled={isSubmitting}
-            className="p-4 rounded-[24px] island-card text-left active:scale-[0.98] transition-all flex items-start gap-3.5"
-          >
-            <div className="w-9 h-9 rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center shrink-0 mt-0.5 text-amber-800">
-              <Cpu className="w-5 h-5" />
-            </div>
-            <div className="flex-1">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-charcoal-900 font-mono">
-                  Scenario 2: Minor Sensor Drift
-                </span>
-                <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 border border-amber-300">
-                  25u Deficit
-                </span>
-              </div>
-              <p className="text-[11px] text-charcoal-700 mt-1 leading-snug font-medium">
-                6h toll delay + Line 2 slightly throttled (85%). Minor casing shortfall.
-              </p>
-              <span className="text-[10px] text-forest font-bold font-mono mt-1.5 block">
-                → Tap to compute ranked recovery plans
-              </span>
-            </div>
-          </button>
-
-          {/* Scenario 3 Button */}
-          <button
-            onClick={() => triggerScenario(3)}
-            disabled={isSubmitting}
-            className="p-4 rounded-[24px] island-card text-left active:scale-[0.98] transition-all flex items-start gap-3.5"
-          >
-            <div className="w-9 h-9 rounded-2xl bg-purple-500/15 border border-purple-500/30 flex items-center justify-center shrink-0 mt-0.5 text-purple-900">
-              <Truck className="w-5 h-5" />
-            </div>
-            <div className="flex-1">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-charcoal-900 font-mono">
-                  Scenario 3: Severe Supply Cut
-                </span>
-                <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-purple-100 text-purple-900 border border-purple-300">
-                  350u Deficit
-                </span>
-              </div>
-              <p className="text-[11px] text-charcoal-700 mt-1 leading-snug font-medium">
-                Chennai supplier transformer explosion. Full 350-unit deficit.
-              </p>
-              <span className="text-[10px] text-forest font-bold font-mono mt-1.5 block">
-                → Tap to compute ranked recovery plans
-              </span>
-            </div>
-          </button>
+            </button>
+          ))}
         </div>
 
         {/* ─── Section: Custom WhatsApp / Audio Text Disruption ─────────────── */}
@@ -459,39 +429,28 @@ export default function MobileControllerPage() {
             </h3>
           </div>
           <p className="text-[11px] text-charcoal-600 font-medium leading-snug">
-            Type a disruption in plain language. Gemini extracts the numbers when available (regex fallback otherwise); the solver ranks the plans.
+            Type a disruption in plain language. AI or rule-based extraction pulls out the numbers; the solver ranks the plans.
           </p>
 
           <textarea
             value={customPrompt}
             onChange={(e) => setCustomPrompt(e.target.value)}
-            placeholder="e.g. Driver Ramesh reporting landslide near Krishnagiri on NH48. Truck stalled, 48 hours delayed."
+            placeholder={scenarios[0]?.raw_message ?? "Describe the disruption in plain language"}
             rows={3}
             className="w-full p-3 rounded-2xl bg-white/40 border border-white/60 text-xs text-charcoal-900 placeholder:text-charcoal-500 focus:outline-none focus:border-charcoal-900 font-sans resize-none shadow-inner"
           />
 
-          {/* Quick Preset Chips */}
+          {/* Quick Preset Chips (from the scenario presets) */}
           <div className="flex flex-wrap gap-1.5">
-            <button
-              onClick={() =>
-                setCustomPrompt(
-                  "Driver Ramesh reporting landslide near Krishnagiri on NH48. Truck stalled, 48 hours delayed."
-                )
-              }
-              className="text-[10px] font-mono font-semibold px-2.5 py-1 rounded-full bg-white/50 hover:bg-white/80 border border-white/70 text-charcoal-800 text-left"
-            >
-              + NH48 Landslide (48h)
-            </button>
-            <button
-              onClick={() =>
-                setCustomPrompt(
-                  "Robotic Welding Line 2 water cooling leak! Temperature spiked to 91C, speed throttled to 40%."
-                )
-              }
-              className="text-[10px] font-mono font-semibold px-2.5 py-1 rounded-full bg-white/50 hover:bg-white/80 border border-white/70 text-charcoal-800 text-left"
-            >
-              + Line 2 Water Leak (91°C)
-            </button>
+            {scenarios.map((sc) => (
+              <button
+                key={sc.scenario_id}
+                onClick={() => setCustomPrompt(sc.raw_message)}
+                className="text-[10px] font-mono font-semibold px-2.5 py-1 rounded-full bg-white/50 hover:bg-white/80 border border-white/70 text-charcoal-800 text-left"
+              >
+                + {sc.title}
+              </button>
+            ))}
           </div>
 
           <button

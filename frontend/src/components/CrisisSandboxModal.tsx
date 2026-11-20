@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useFactoryStore } from "@/store/useFactoryStore";
 import {
   AlertTriangle,
@@ -22,27 +22,42 @@ export function CrisisSandboxModal() {
     isCustomCrisisModalOpen,
     closeCustomCrisisModal,
     simulateCrisis,
+    simulateCustom,
     isSimulating,
+    factory,
+    orders,
+    scenarios,
+    scenariosError,
   } = useFactoryStore();
 
   const [activeTab, setActiveTab] = useState<"TEMPLATES" | "FREEFORM" | "SLIDERS">("TEMPLATES");
 
   // Form states
-  const [freeformPrompt, setFreeformPrompt] = useState(
-    "Driver Ramesh reporting flood on NH48. 48h delay on EV-402, Line 2 running at 50% thermal throttle."
-  );
-
-  const [targetOrder, setTargetOrder] = useState("EV-402");
+  const [freeformPrompt, setFreeformPrompt] = useState("");
+  const [targetOrderChoice, setTargetOrder] = useState<string | null>(null);
   const [shortfallUnits, setShortfallUnits] = useState(150);
   const [delayHours, setDelayHours] = useState(48);
-  const [line2Speed, setLine2Speed] = useState(50);
-  const [line2Temp, setLine2Temp] = useState(89);
+  const [lineSpeeds, setLineSpeeds] = useState<Record<string, number>>({});
+
+  const factoryId = factory?.factory_id;
+  useEffect(() => {
+    setTargetOrder(null);
+    setLineSpeeds({});
+  }, [factoryId]);
 
   if (!isCustomCrisisModalOpen) return null;
 
-  const handleInjectTemplate = async (templateText: string) => {
+  const lines = factory?.lines ?? [];
+  const targetOrder =
+    targetOrderChoice && orders.some((o) => o.order_id === targetOrderChoice)
+      ? targetOrderChoice
+      : orders[0]?.order_id ?? "";
+  const speedOf = (lineId: string) => lineSpeeds[lineId] ?? 100;
+  const placeholder = `e.g. Truck breakdown, 120 units short on ${orders[0]?.order_id ?? "an order"}, ${lines[0]?.name ?? "a line"} running at 50%...`;
+
+  const handleInjectTemplate = async (scenarioId: number) => {
     closeCustomCrisisModal();
-    await simulateCrisis(undefined, templateText);
+    await simulateCrisis(scenarioId);
   };
 
   const handleInjectFreeform = async () => {
@@ -52,9 +67,17 @@ export function CrisisSandboxModal() {
   };
 
   const handleInjectSliders = async () => {
-    const message = `Custom plant incident: ${shortfallUnits} units shortfall on order #${targetOrder}. Inbound transit delayed by ${delayHours} hours. Line 2 operating at ${line2Speed}% speed at ${line2Temp}°C.`;
+    const override_line_speeds: Record<string, number> = {};
+    for (const l of lines) {
+      if (speedOf(l.line_id) < 100) override_line_speeds[l.line_id] = speedOf(l.line_id);
+    }
     closeCustomCrisisModal();
-    await simulateCrisis(undefined, message);
+    await simulateCustom({
+      override_delay_hours: delayHours,
+      override_shortfall_units: shortfallUnits,
+      override_line_speeds,
+      order_id: targetOrder || undefined,
+    });
   };
 
   return (
@@ -79,7 +102,7 @@ export function CrisisSandboxModal() {
                 </span>
               </div>
               <p className="text-xs text-charcoal-600 font-medium">
-                Inject any real-world disruption & watch the 4-Agent PuLP solver optimize on the fly.
+                Inject any real-world disruption & watch the solver rank recovery plans on the fly.
               </p>
             </div>
           </div>
@@ -130,89 +153,39 @@ export function CrisisSandboxModal() {
           {/* TAB 1: TEMPLATES */}
           {activeTab === "TEMPLATES" && (
             <div className="grid grid-cols-1 gap-3">
-              <button
-                onClick={() =>
-                  handleInjectTemplate(
-                    "Driver Ramesh reporting flood on NH48 near Vellore. 48h delay on EV-402, Line 2 running at 50% thermal throttle."
-                  )
-                }
-                className="p-4 rounded-2xl border border-charcoal-900/10 bg-white hover:bg-acid/15 hover:border-acid text-left transition-all group flex items-start justify-between gap-4"
-              >
-                <div className="flex items-start gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-coral/15 text-coral flex items-center justify-center shrink-0 mt-0.5">
-                    <Truck className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <h4 className="text-xs font-extrabold text-charcoal-900 group-hover:text-charcoal-950">
-                      Scenario A: NH48 Highway Inundation + Machine Overheat
-                    </h4>
-                    <p className="text-[11px] text-charcoal-600 mt-0.5">
-                      150 unit deficit on Ather-Grid #EV-402 (+48h delay), Line 2 at 50%.
-                    </p>
-                    <div className="flex items-center gap-2 mt-2 text-[10px] font-mono text-charcoal-500">
-                      <span className="px-2 py-0.5 rounded bg-charcoal-900/5">SLA Risk: ₹25.0L</span>
-                      <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">Plans computed on run</span>
+              {scenariosError && (
+                <div className="p-3 rounded-xl bg-coral/10 border border-coral/30 text-[11px] font-mono text-coral">
+                  {scenariosError}
+                </div>
+              )}
+              {scenarios.map((sc) => (
+                <button
+                  key={sc.scenario_id}
+                  onClick={() => handleInjectTemplate(sc.scenario_id)}
+                  disabled={isSimulating}
+                  className="p-4 rounded-2xl border border-charcoal-900/10 bg-white hover:bg-acid/15 hover:border-acid text-left transition-all group flex items-start justify-between gap-4"
+                >
+                  <div className="flex items-start gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-coral/15 text-coral flex items-center justify-center shrink-0 mt-0.5">
+                      <Truck className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-extrabold text-charcoal-900 group-hover:text-charcoal-950">
+                        {sc.title}
+                      </h4>
+                      <p className="text-[11px] text-charcoal-600 mt-0.5">{sc.summary}</p>
+                      <div className="flex items-center gap-2 mt-2 text-[10px] font-mono text-charcoal-500">
+                        <span className="px-2 py-0.5 rounded bg-charcoal-900/5">Target: #{sc.order_id}</span>
+                        <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">Plans computed on run</span>
+                      </div>
                     </div>
                   </div>
-                </div>
-                <ArrowRight className="w-4 h-4 text-charcoal-400 group-hover:translate-x-1 transition-all shrink-0 mt-2" />
-              </button>
-
-              <button
-                onClick={() =>
-                  handleInjectTemplate(
-                    "Severe Cyclone Alert: NH48 Chennai route completely submerged for 72h. Shortfall 350 units on EV-402. Line 2 motor seized."
-                  )
-                }
-                className="p-4 rounded-2xl border border-charcoal-900/10 bg-white hover:bg-acid/15 hover:border-acid text-left transition-all group flex items-start justify-between gap-4"
-              >
-                <div className="flex items-start gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-amber-500/15 text-amber-600 flex items-center justify-center shrink-0 mt-0.5">
-                    <Flame className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <h4 className="text-xs font-extrabold text-charcoal-900 group-hover:text-charcoal-950">
-                      Scenario B: Catastrophic 350-Unit Shortfall (Triggers Agent Rebuttal)
-                    </h4>
-                    <p className="text-[11px] text-charcoal-600 mt-0.5">
-                      High volume deficit exceeding single vendor capacity. Forces Ops Hawk & CFO Watchdog into cyclic debate before solving.
-                    </p>
-                    <div className="flex items-center gap-2 mt-2 text-[10px] font-mono text-charcoal-500">
-                      <span className="px-2 py-0.5 rounded bg-charcoal-900/5">Rebuttal Cycle: ACTIVE</span>
-                      <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800">Multi-Vendor Split</span>
-                    </div>
-                  </div>
-                </div>
-                <ArrowRight className="w-4 h-4 text-charcoal-400 group-hover:translate-x-1 transition-all shrink-0 mt-2" />
-              </button>
-
-              <button
-                onClick={() =>
-                  handleInjectTemplate(
-                    "Transport strike at Attibele toll gate. 180 casings delayed 36h for Deccan E-Fleet order #EV-405. Line 1 throttled to 60%."
-                  )
-                }
-                className="p-4 rounded-2xl border border-charcoal-900/10 bg-white hover:bg-acid/15 hover:border-acid text-left transition-all group flex items-start justify-between gap-4"
-              >
-                <div className="flex items-start gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-sky-500/15 text-sky-600 flex items-center justify-center shrink-0 mt-0.5">
-                    <Wrench className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <h4 className="text-xs font-extrabold text-charcoal-900 group-hover:text-charcoal-950">
-                      Scenario C: Border Toll Bottleneck on Deccan Logistics #EV-405
-                    </h4>
-                    <p className="text-[11px] text-charcoal-600 mt-0.5">
-                      Tests dynamic order shifting — preserves secondary client SLA of ₹10.0L without disrupting Line 3 parallel buffer.
-                    </p>
-                    <div className="flex items-center gap-2 mt-2 text-[10px] font-mono text-charcoal-500">
-                      <span className="px-2 py-0.5 rounded bg-charcoal-900/5">SLA Risk: ₹10.0L</span>
-                      <span className="px-2 py-0.5 rounded bg-sky-100 text-sky-800">Target: #EV-405</span>
-                    </div>
-                  </div>
-                </div>
-                <ArrowRight className="w-4 h-4 text-charcoal-400 group-hover:translate-x-1 transition-all shrink-0 mt-2" />
-              </button>
+                  <ArrowRight className="w-4 h-4 text-charcoal-400 group-hover:translate-x-1 transition-all shrink-0 mt-2" />
+                </button>
+              ))}
+              {!scenarios.length && !scenariosError && (
+                <div className="text-[11px] font-mono text-charcoal-500">Loading scenario presets...</div>
+              )}
             </div>
           )}
 
@@ -227,12 +200,12 @@ export function CrisisSandboxModal() {
                 onChange={(e) => setFreeformPrompt(e.target.value)}
                 rows={4}
                 className="w-full p-4 rounded-2xl bg-white border border-charcoal-900/15 text-xs text-charcoal-900 font-sans focus:outline-none focus:ring-2 focus:ring-acid resize-none"
-                placeholder="e.g. Truck breakdown near Krishnagiri, 120 battery casings short on EV-402, Line 2 running at 50%..."
+                placeholder={placeholder}
               />
               <div className="p-3 rounded-xl bg-forest/5 border border-forest/15 text-[11px] text-charcoal-700 leading-relaxed flex items-start gap-2">
                 <Sparkles className="w-4 h-4 text-forest shrink-0 mt-0.5" />
                 <span>
-                  The <strong>Blast-Radius Detective</strong> uses Gemini entity extraction to dynamically parse your text, extract numbers/suppliers, and pass them directly to the PuLP solver.
+                  The <strong>Blast-Radius Detective</strong> uses AI or rule-based extraction to parse your text, extract numbers/suppliers, and pass them directly to the PuLP solver.
                 </span>
               </div>
               <button
@@ -241,7 +214,7 @@ export function CrisisSandboxModal() {
                 className="w-full py-3 rounded-xl bg-acid hover:bg-acid-hover text-charcoal-950 font-mono font-extrabold text-xs shadow-pill transition-all active:scale-95 flex items-center justify-center gap-2"
               >
                 <Zap className="w-4 h-4 fill-current" />
-                <span>Inject Prompt & Run 4-Agent Debate</span>
+                <span>Inject Prompt & Run Analysis</span>
               </button>
             </div>
           )}
@@ -259,8 +232,11 @@ export function CrisisSandboxModal() {
                     onChange={(e) => setTargetOrder(e.target.value)}
                     className="w-full p-2.5 rounded-xl border border-charcoal-900/15 text-xs font-mono bg-white"
                   >
-                    <option value="EV-402">#EV-402 (Ather-Grid: 500u / ₹25L SLA)</option>
-                    <option value="EV-405">#EV-405 (Deccan E-Fleet: 300u / ₹10L SLA)</option>
+                    {orders.map((o) => (
+                      <option key={o.order_id} value={o.order_id}>
+                        #{o.order_id} ({o.client}: {o.required_qty}u / ₹{((o.sla_penalty_inr ?? 0) / 100000).toFixed(1)}L SLA)
+                      </option>
+                    ))}
                   </select>
                 </div>
 
@@ -298,25 +274,26 @@ export function CrisisSandboxModal() {
                   />
                 </div>
 
-                <div>
-                  <div className="flex items-center justify-between text-[11px] font-mono font-bold text-charcoal-700 mb-1">
-                    <span>Line 2 Throttling</span>
-                    <span className="text-amber-600">{line2Speed}% Speed ({line2Temp}°C)</span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                {lines.map((l) => (
+                  <div key={l.line_id}>
+                    <div className="flex items-center justify-between text-[11px] font-mono font-bold text-charcoal-700 mb-1">
+                      <span>{l.name}</span>
+                      <span className="text-amber-600">{speedOf(l.line_id)}% Speed</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={speedOf(l.line_id)}
+                      onChange={(e) => setLineSpeeds((prev) => ({ ...prev, [l.line_id]: Number(e.target.value) }))}
+                      className="w-full accent-amber-600"
+                    />
                   </div>
-                  <input
-                    type="range"
-                    min="20"
-                    max="100"
-                    step="10"
-                    value={line2Speed}
-                    onChange={(e) => {
-                      const speed = Number(e.target.value);
-                      setLine2Speed(speed);
-                      setLine2Temp(Math.round(95 - (speed / 100) * 35));
-                    }}
-                    className="w-full accent-amber-600"
-                  />
-                </div>
+                ))}
               </div>
 
               <button

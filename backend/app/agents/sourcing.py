@@ -257,7 +257,7 @@ def _rfq_text(model: FactoryModel, rfq: RFQ) -> str:
     vendor = model.vendor(rfq.supplier_id)
     item = model.stock_item_name
     if _is_charter(vendor):
-        ask = f"an air charter for {rfq.units_requested} {item}"
+        ask = f"a dedicated delivery of {rfq.units_requested} {item} for a flat fee"
         price = f"(our reference: ₹{vendor.flat_cost:,} total)"
     else:
         ask = f"{rfq.units_requested} {item}"
@@ -434,12 +434,14 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
         if playbook is None:
             raise SourcingError(f"Playbook {pid} not in run {run_id}", 404)
 
-        br = run.get("blast_radius", {})
-        sr = run.get("solver_result", {})
+        br = run.get("blast_radius") or {}
+        for key in ("sla_penalty_inr", "partial_delay_penalty_inr", "hours_remaining", "client"):
+            if key not in br:
+                raise SourcingError(f"Run {run_id} has no blast_radius.{key}; run the analysis again.", 409)
         factory_id = run.get("factory_id")
         # Source against the factory data the plan was solved on, not today's database rows.
         model = run.get("factory_model") or load_factory_model(factory_id)   # FactoryDataError propagates
-        line_speeds = run.get("line_speeds") or {"LINE-2": run["line2_speed_pct"]}
+        line_speeds = run["line_speeds"]
         session = SourcingSession(
             run_id=run_id,
             playbook_id=pid,
@@ -449,11 +451,11 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
                 "shortfall_units": run["shortfall_units"],
                 "delay_hours": run["delay_hours"],
                 "line_speeds": dict(line_speeds),
-                "order_id": run.get("order_id", "EV-402"),
-                "sla_penalty_inr": int(br.get("sla_penalty_inr", sr.get("total_sla_exposure_inr", 2_500_000))),
-                "partial_penalty_inr": int(br.get("partial_delay_penalty_inr", 500_000)),
-                "deadline_hours": float(sr.get("deadline_hours", br.get("hours_remaining", 38))),
-                "client": br.get("client", "Ather-Grid Mobility Corp"),
+                "order_id": run["order_id"],
+                "sla_penalty_inr": int(br["sla_penalty_inr"]),
+                "partial_penalty_inr": int(br["partial_delay_penalty_inr"]),
+                "deadline_hours": float(br["hours_remaining"]),
+                "client": br["client"],
             },
         )
         if not playbook["vendor_allocations"]:

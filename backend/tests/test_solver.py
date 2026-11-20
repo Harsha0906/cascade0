@@ -1,11 +1,12 @@
 """Solver tests. Run from backend/: python -m unittest discover -s tests -v  (or pytest)."""
 
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 from dataclasses import replace
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
-from app.factory_model import ProductionLine, load_factory_model
+from app.factory_model import FactoryModel, ProductionLine, load_factory_model
 from app.schemas import PlaybookOption, VendorAllocation
 from app.solver import (
     SolverInputError,
@@ -15,7 +16,7 @@ from app.solver import (
     simulate_monte_carlo,
     solve_pulp_milp,
 )
-from tests.factories import small_factory
+from tests.factories import _vendor, small_factory
 
 DEMO = load_factory_model()
 S = lambda speed: {"LINE-2": speed}  # noqa: E731
@@ -302,6 +303,50 @@ class TallyXmlTests(unittest.TestCase):
         root = ET.fromstring(build_tally_xml("PO-1", self._plan(), small_factory()))
         self.assertEqual(root.findtext(".//SVCURRENTCOMPANY"), "Test Plant")
         self.assertEqual(root.findtext(".//STOCKITEMNAME"), "Widget")
+
+
+class IndexNamedVariableTests(unittest.TestCase):
+    @staticmethod
+    def _colliding_factory():
+        return FactoryModel(
+            factory_id="collide", name="Collide", stock_item_name="Widget",
+            qa_dispatch_hours=2.0, safety_stock_units=30, production_hours_in_window=10.0,
+            vendors=(
+                _vendor("V-1", "BACKUP", 30, 500, 0, 4, 90),
+                _vendor("V_1", "BACKUP", 30, 600, 0, 4, 90),
+            ),
+            lines=(
+                ProductionLine("L-B", "Line B", 10.0, 20, 5000, 6),
+                ProductionLine("L_B", "Line B2", 10.0, 10, 3000, 2),
+            ),
+        )
+
+    def test_colliding_ids_do_not_collide_in_milp(self):
+        import app.solver as solver_mod
+        created = []
+        real = solver_mod._new_var
+
+        def spy(prob, name, *args, **kw):
+            created.append((prob, name))
+            return real(prob, name, *args, **kw)
+
+        with mock.patch.object(solver_mod, "_new_var", side_effect=spy):
+            lp = solve_pulp_milp(self._colliding_factory(), 50, {"L-B": 50}, 40)
+        names = [n for _, n in created]
+        self.assertEqual(len(names), len(set(names)), names)
+        prob = created[0][0]
+        # 2 coverage + 2 window + 2*2 vendor (engage, deadline) + 1 overtime deadline
+        cons = prob.constraints() if callable(prob.constraints) else prob.constraints
+        self.assertEqual(len(cons), 9)
+        self.assertEqual(lp["overtime_line_hours"], {"L-B": 2, "L_B": 1})
+        self.assertEqual(lp["units_by_vendor"], {"V-1": 30, "V_1": 20})
+        self.assertTrue(lp["feasible"])
+
+    def test_solver_result_reports_line_speeds(self):
+        res = generate_playbooks(small_factory(), 40, 5, {"L-B": 60}, order_id="WO-1",
+                                 sla_penalty_inr=100_000, partial_penalty_inr=20_000,
+                                 deadline_hours=30, client="Client")
+        self.assertEqual(res.line_speeds, {"L-B": 60})
 
 
 if __name__ == "__main__":

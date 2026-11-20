@@ -170,7 +170,7 @@ class ApiTests(unittest.TestCase):
             headers=KEY,
         )
         p = r.json()["extracted_parameters"]
-        self.assertEqual((p["shortfall_units"], p["line2_speed_pct"], p["delay_hours"]), (120, 60, 24))
+        self.assertEqual((p["shortfall_units"], p["line_impacts"][0]["speed_pct"], p["delay_hours"]), (120, 60, 24))
 
     # ── execution uses server-side numbers, once ──
     def test_execute_uses_server_plan_and_is_idempotent(self):
@@ -293,8 +293,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(bogus.status_code, 404)
 
     def test_out_of_range_inputs_are_422(self):
-        for body in [{"override_shortfall_units": -5}, {"override_line2_speed_pct": 500},
-                     {"scenario_id": 9}, {"raw_message": "x" * 5000}]:
+        for body in [{"override_shortfall_units": -5}, {"override_line_speeds": {"LINE-1": 500}},
+                     {"scenario_id": 0}, {"raw_message": "x" * 5000}]:
             with self.subTest(body=body):
                 r = self.client.post("/api/v1/simulate-crisis", json=body, headers=KEY)
                 self.assertEqual(r.status_code, 422)
@@ -327,6 +327,101 @@ class ApiTests(unittest.TestCase):
             "Origin": "https://evil.example", "Access-Control-Request-Method": "GET"})
         self.assertNotEqual(r.headers.get("access-control-allow-origin"), "*")
         self.assertNotEqual(r.headers.get("access-control-allow-origin"), "https://evil.example")
+
+    # ── Phase 3: generic disruption API ──
+    def test_scenarios_endpoint_lists_presets_from_data(self):
+        r = self.client.get("/api/v1/scenarios")
+        self.assertEqual(r.status_code, 200)
+        rows = r.json()
+        self.assertEqual([x["scenario_id"] for x in rows], [1, 2, 3])
+        self.assertEqual(rows[0]["line_speeds"], {"LINE-2": 50})
+        self.assertEqual(rows[0]["order_id"], "EV-402")
+        self.assertEqual(rows[0]["title"], "NH48 flood + Line 2 overheat")
+
+    def test_scenario_1_reports_line_impacts(self):
+        data = self._simulate(1)
+        self.assertEqual(data["recommended_plan_id"], "PLAN_B")
+        li = data["extracted_parameters"]["line_impacts"][0]
+        self.assertEqual((li["line_id"], li["name"], li["speed_pct"]), ("LINE-2", "Robotic Welding Line 2", 50))
+        self.assertNotIn("line2_speed_pct", data["extracted_parameters"])
+        event = db.fetch_all("disruption_events")[-1]
+        self.assertEqual((event["order_id"], event["factory_id"]), ("EV-402", "apex-volt-blr2"))
+        self.assertEqual(event["line_impacts"][0]["line_id"], "LINE-2")
+
+    def test_unknown_scenario_is_404(self):
+        r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 9}, headers=KEY)
+        self.assertEqual(r.status_code, 404)
+
+    def test_no_scenario_and_no_message_is_422(self):
+        r = self.client.post("/api/v1/simulate-crisis", json={}, headers=KEY)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("scenario_id or raw_message", r.json()["detail"])
+
+    def test_twilio_hello_has_no_demo_names(self):
+        r = self.client.post("/api/v1/webhooks/whatsapp", data={"Body": "hello", "From": "x"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("connected", r.text)
+        self.assertNotIn("EV-402", r.text)
+        self.assertNotIn("Line 2", r.text)
+
+    def test_line_speed_override_validation(self):
+        r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 1,
+                             "override_line_speeds": {"LINE-1": 120}}, headers=KEY)
+        self.assertEqual(r.status_code, 422)
+        r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 1,
+                             "override_line_speeds": {"LINE-9": 50}}, headers=KEY)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("LINE-1", r.json()["detail"])
+
+    def test_custom_text_line_speed(self):
+        r = self.client.post("/api/v1/simulate-crisis", headers=KEY, json={
+            "raw_message": "Truck breakdown, 120 casings short on EV-402, Line 2 at 60%, 24h delay"})
+        self.assertEqual(r.json()["extracted_parameters"]["line_impacts"][0]["speed_pct"], 60)
+
+    def test_webhook_unresolvable_message_replies_with_reason(self):
+        self.sent.clear()
+        payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {"messages": [{
+            "from": "919800000000", "id": "wamid.GENERIC1", "type": "text",
+            "text": {"body": "flood on the highway"}}]}}]}]}
+        raw, headers = _signed(payload)
+        r = self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("shortfall", self.sent[-1][1])
+
+    def test_plc_requires_known_line(self):
+        r = self.client.post("/api/v1/ingest/plc-telemetry", json={"speed_pct": 50}, headers=KEY)
+        self.assertEqual(r.status_code, 422)
+        r = self.client.post("/api/v1/ingest/plc-telemetry", json={"line_id": "LINE-9", "speed_pct": 50,
+                             "temp_celsius": 60.0, "status": "NORMAL"}, headers=KEY)
+        self.assertEqual(r.status_code, 404)
+        r = self.client.post("/api/v1/ingest/plc-telemetry", json={"line_id": "LINE-1", "speed_pct": 70,
+                             "temp_celsius": 60.0, "status": "NORMAL"}, headers=KEY)
+        self.assertEqual(r.status_code, 200)
+
+    def test_status_text_reads_lines_and_orders_from_data(self):
+        self.assertIn("All lines normal; all orders on track.", main._status_text())
+        self._simulate(1)
+        text = main._status_text()
+        self.assertIn("Robotic Welding Line 2", text)
+        self.assertIn("EV-402", text)
+
+    def test_execute_on_second_factory_run(self):
+        from tests.factories import seed_second_factory
+        from app.agents.graph import run_cascade_pipeline
+        seed_second_factory()
+        try:
+            result = run_cascade_pipeline(
+                "L-B at 40%, 80 units short on WO-77, 5h delay from Vendor V1", factory_id="test-plant")
+            run_store.save_run(result)
+            pid = result["recommended_plan_id"]
+            r = self.client.post("/api/v1/execute-plan",
+                                 json={"run_id": result["run_id"], "playbook_id": pid}, headers=KEY)
+            self.assertEqual(r.status_code, 200, r.text)
+            expected = {"SLA_RENEGOTIATION": "EXTENSION_REQUESTED", "NO_ACTION": "RISK_ACCEPTED"}.get(
+                next(p for p in result["playbooks"] if p["id"] == pid)["strategy_type"], "RECOVERY_IN_PROGRESS")
+            self.assertEqual(db.get_order("WO-77")["status"], expected)
+        finally:
+            db.reset_to_seed()
 
 
 if __name__ == "__main__":

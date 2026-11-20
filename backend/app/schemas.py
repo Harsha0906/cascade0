@@ -11,47 +11,65 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ─── 1. Gemini Structured Extraction Schemas ─────────────────────────────────
 
+class LineImpactExtraction(BaseModel):
+    """One production line named in the message, as written (not yet resolved)."""
+    line: str = Field(description="Line reference as written, e.g. 'Line 2'")
+    speed_pct: Optional[int] = Field(
+        default=None, ge=0, le=100,
+        description="Stated speed % of this line (0-100); null if not stated"
+    )
+    temp_celsius: Optional[float] = Field(
+        default=None,
+        description="Stated operating temperature in Celsius; null if not stated"
+    )
+
+
 class DisruptionExtraction(BaseModel):
     """
-    Pydantic schema passed to Gemini 2.5 Flash `response_schema`
-    for deterministic parsing of unstructured WhatsApp/Email/SMS messages.
+    Pydantic schema passed to Gemini `response_schema` for parsing unstructured
+    WhatsApp/Email/SMS messages. Anything not stated stays null/empty: references
+    are resolved against the factory model later, and nothing is invented here.
     """
     source_channel: str = Field(
         default="WHATSAPP",
         description="Source of disruption alert, e.g. WHATSAPP, PLC, ERP, HIGHWAY_WEATHER"
     )
-    delay_hours: int = Field(
-        default=48,
-        description="Estimated inbound shipment delay in hours (e.g. 48 for NH48 flooding)"
+    delay_hours: Optional[int] = Field(
+        default=None,
+        description="Stated inbound shipment delay in hours; null if not stated"
     )
-    line2_speed_pct: int = Field(
-        default=50,
-        description="Current speed % of Welding Line 2 (e.g. 50 if throttled, 100 if normal)"
+    affected_lines: List[LineImpactExtraction] = Field(
+        default_factory=list,
+        description="Production lines named in the message"
     )
-    line2_temp_celsius: float = Field(
-        default=89.0,
-        description="Operating temperature of Welding Line 2 in degrees Celsius"
+    affected_supplier: Optional[str] = Field(
+        default=None,
+        description="Delayed supplier as written; null if not named"
     )
-    shortfall_units: int = Field(
-        default=150,
-        description="Net unit shortfall calculated for the active order"
+    affected_order: Optional[str] = Field(
+        default=None,
+        description="Order reference as written; null if not named"
     )
-    affected_order_id: str = Field(
-        default="EV-402",
-        description="Target order ID exposed to disruption, defaults to EV-402"
+    shortfall_units: Optional[int] = Field(
+        default=None,
+        description="Stated unit shortfall; null if not stated"
+    )
+    delay_mentioned: bool = Field(
+        default=False,
+        description="True if the alert says a shipment is delayed/late/blocked, even without a duration"
     )
     crisis_headline: str = Field(
-        default="Compound Disruption: NH48 Flood + Line 2 Overheat",
-        description="Concise summary headline of the compound crisis"
+        default="",
+        description="Concise summary headline of the disruption"
     )
     raw_summary: str = Field(
         default="",
-        description="Brief natural language analysis of the crisis event"
+        description="Brief natural language analysis of the event"
     )
 
 
@@ -104,7 +122,7 @@ class SolverResult(BaseModel):
     """Output from the PuLP Optimizer and Monte Carlo Risk Simulator."""
     shortfall_units: int
     delay_hours: int
-    line2_speed_pct: int
+    line_speeds: dict[str, int]
     order_id: str
     total_sla_exposure_inr: int
     playbooks: List[PlaybookOption]
@@ -139,20 +157,32 @@ class AgentLogEntry(BaseModel):
 
 class SimulateCrisisRequest(BaseModel):
     """Payload to trigger crisis simulation."""
-    scenario_id: Optional[int] = Field(default=None, ge=1, le=3, description="1, 2, or 3")
+    scenario_id: Optional[int] = Field(default=None, ge=1, description="Preset scenario id (see GET /api/v1/scenarios)")
     raw_message: Optional[str] = Field(default=None, max_length=2000, description="Custom crisis alert text")
     source_channel: str = Field(default="WEB_DASHBOARD", max_length=64, description="Channel origin")
     override_delay_hours: Optional[int] = Field(default=None, ge=0, le=720)
     override_shortfall_units: Optional[int] = Field(default=None, ge=0, le=100_000)
-    override_line2_speed_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    override_line_speeds: Optional[dict[str, int]] = Field(
+        default=None, description="Line id -> speed % (0-100) overrides"
+    )
+    order_id: Optional[str] = Field(default=None, max_length=32)
+
+    @field_validator("override_line_speeds")
+    @classmethod
+    def _speeds_in_range(cls, value):
+        if value is not None:
+            for line_id, speed in value.items():
+                if not 0 <= speed <= 100:
+                    raise ValueError(f"speed for {line_id} must be between 0 and 100")
+        return value
 
 
 class PlcTelemetryRequest(BaseModel):
     """Shop-floor machine tick from simulator_plc.py."""
-    line_id: str = Field(default="LINE-2", max_length=32)
-    speed_pct: int = Field(default=50, ge=0, le=100)
-    temp_celsius: float = Field(default=89.0, ge=-50, le=400)
-    status: str = Field(default="OVERHEATING_THROTTLED", max_length=64)
+    line_id: str = Field(max_length=32)
+    speed_pct: int = Field(ge=0, le=100)
+    temp_celsius: float = Field(ge=-50, le=400)
+    status: str = Field(max_length=64)
 
 
 class ErpCsvSyncRequest(BaseModel):
@@ -163,8 +193,8 @@ class ErpCsvSyncRequest(BaseModel):
 
 class LiveHighwayCheckRequest(BaseModel):
     """Highway corridor check."""
-    corridor: str = "NH48 Chennai-Bengaluru"
-    city: str = "Vellore"
+    corridor: str
+    city: str
 
 
 class ExecutePlanRequest(BaseModel):

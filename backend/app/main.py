@@ -101,45 +101,32 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing X-API-Key")
 
 
-# ─── Preset scenarios ────────────────────────────────────────────────────────
-SCENARIO_PROMPTS = {
-    1: (
-        "NH48 Chennai-Bengaluru highway flooding near Vellore delayed shipment of 500 aluminum battery "
-        "casings from Chennai Precision by 48 hours. Simultaneously, Robotic Welding Line 2 overheated "
-        "to 89.0°C and throttled to 50% speed. Current unit shortfall is 150 casings on Order #EV-402."
-    ),
-    2: (
-        "Minor toll transit delay on NH48 corridor causing 6 hours shipment delay for 25 units. "
-        "Welding Line 2 slightly throttled to 85% speed (74°C). Shortfall is 25 battery casings on Order #EV-402."
-    ),
-    3: (
-        "Severe supplier collapse: Chennai Precision Casings shipment blocked by 72 hours due to "
-        "bridge damage near Ranipet. Robotic Welding Line 2 overheated to 92°C and dropped "
-        "to 25% speed. Compound shortfall of 350 battery casings on Order #EV-402."
-    ),
-}
-SCENARIO_DEFAULTS = {
-    1: {"delay": 48, "shortfall": 150, "speed": 50},
-    2: {"delay": 6, "shortfall": 25, "speed": 85},
-    3: {"delay": 72, "shortfall": 350, "speed": 25},
-}
-
-
-def _run_pipeline(message: str, source_channel: str, delay=None, shortfall=None, speed=None) -> Dict[str, Any]:
+def _run_pipeline(
+    message: str,
+    source_channel: str,
+    delay=None,
+    shortfall=None,
+    line_speeds=None,
+    order_id=None,
+) -> Dict[str, Any]:
     result = run_cascade_pipeline(
         raw_message=message,
         source_channel=source_channel,
         override_delay_hours=delay,
         override_shortfall_units=shortfall,
-        override_line2_speed_pct=speed,
+        override_line_speeds=line_speeds,
+        order_id=order_id,
     )
     run_store.save_run(result)
     insert_row("disruption_events", {
         "source_channel": source_channel,
         "raw_message": message,
         "delay_hours": result["delay_hours"],
-        "line2_speed_pct": result["line2_speed_pct"],
         "shortfall_units": result["shortfall_units"],
+        "factory_id": result["factory_id"],
+        "order_id": result["order_id"],
+        "affected_supplier_id": result["affected_supplier_id"],
+        "line_impacts": result["line_impacts"],
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return result
@@ -256,28 +243,58 @@ def get_latest_run():
 
 # ─── 2. Crisis simulation ────────────────────────────────────────────────────
 
+@app.get("/api/v1/scenarios")
+def list_scenarios():
+    """Preset disruption scenarios of the default factory (read-only)."""
+    return [
+        {k: row.get(k) for k in (
+            "scenario_id", "title", "summary", "raw_message",
+            "delay_hours", "shortfall_units", "line_speeds", "order_id",
+        )}
+        for row in db.get_scenarios(settings.DEFAULT_FACTORY_ID)
+    ]
+
+
 @app.post("/api/v1/simulate-crisis", dependencies=[Depends(require_api_key)])
 def simulate_crisis(req: SimulateCrisisRequest):
+    scenarios = {r["scenario_id"]: r for r in db.get_scenarios(settings.DEFAULT_FACTORY_ID)}
+    if req.scenario_id is not None and req.scenario_id not in scenarios:
+        raise HTTPException(status_code=404, detail=f"Unknown scenario_id {req.scenario_id}")
+
+    structured = any(v is not None for v in (
+        req.override_line_speeds, req.override_shortfall_units, req.override_delay_hours)) or bool(req.order_id)
+    preset = None
     if req.raw_message:
         message = req.raw_message
+    elif req.scenario_id is not None:
+        preset = scenarios[req.scenario_id]
+        message = preset["raw_message"]
+    elif structured:
+        # Sliders: every parameter comes from the overrides; resolution still requires each one.
+        message = ""
     else:
-        message = SCENARIO_PROMPTS.get(req.scenario_id or 1, SCENARIO_PROMPTS[1])
+        raise HTTPException(
+            status_code=422, detail="Provide scenario_id or raw_message (or structured overrides)")
 
-    delay, shortfall, speed = req.override_delay_hours, req.override_shortfall_units, req.override_line2_speed_pct
-    if req.scenario_id in SCENARIO_DEFAULTS and not req.raw_message:
-        d = SCENARIO_DEFAULTS[req.scenario_id]
-        delay = d["delay"] if delay is None else delay
-        shortfall = d["shortfall"] if shortfall is None else shortfall
-        speed = d["speed"] if speed is None else speed
+    delay, shortfall = req.override_delay_hours, req.override_shortfall_units
+    line_speeds = dict(req.override_line_speeds) if req.override_line_speeds is not None else None
+    order_id = req.order_id
+    if preset is not None and req.scenario_id is not None:
+        delay = preset["delay_hours"] if delay is None else delay
+        shortfall = preset["shortfall_units"] if shortfall is None else shortfall
+        if line_speeds is None:
+            line_speeds = dict(preset.get("line_speeds") or {})
+        order_id = order_id or preset.get("order_id")
 
     logger.info("Simulating crisis via %s: %s", req.source_channel, message[:80])
     try:
-        result = _run_pipeline(message, req.source_channel, delay, shortfall, speed)
+        result = _run_pipeline(message, req.source_channel, delay, shortfall, line_speeds, order_id)
     except SolverInputError as exc:
         raise HTTPException(status_code=422, detail=f"Cannot plan for these inputs: {exc}")
     except FactoryDataError as exc:
         raise _factory_503(exc)
 
+    line_names = {l.line_id: l.name for l in result["factory_model"].lines}
     return {
         "success": True,
         "run_id": result["run_id"],
@@ -285,12 +302,20 @@ def simulate_crisis(req: SimulateCrisisRequest):
         "headline": result.get("crisis_headline", ""),
         "extracted_parameters": {
             "delay_hours": result["delay_hours"],
-            "line2_speed_pct": result["line2_speed_pct"],
-            "line2_temp_celsius": result["line2_temp_celsius"],
+            "line_impacts": [
+                {
+                    "line_id": li["line_id"],
+                    "name": line_names[li["line_id"]],
+                    "speed_pct": li["speed_pct"],
+                    "temp_celsius": li["temp_celsius"],
+                }
+                for li in result["line_impacts"]
+            ],
+            "affected_supplier_id": result["affected_supplier_id"],
             "shortfall_units": result["shortfall_units"],
             "affected_order_id": result["order_id"],
             "source": result.get("extraction_source", "unknown"),
-            "overridden_by_preset_or_slider": any(v is not None for v in (delay, shortfall, speed)),
+            "overridden_by_preset_or_slider": any(v is not None for v in (delay, shortfall, line_speeds)),
         },
         "blast_radius": result.get("blast_radius", {}),
         "ops_proposal": result.get("ops_proposal", {}),
@@ -324,16 +349,19 @@ def _is_approver(number: str) -> bool:
 
 def _status_text() -> str:
     state = get_full_state()
-    ev = next((o for o in state["orders"] if o["order_id"] == "EV-402"), None)
-    line2 = next((l for l in state["production_lines"] if l["line_id"] == "LINE-2"), {})
-    penalty = ev["sla_penalty_inr"] if ev else 0
-    return (
-        f"🏭 *PLANT STATUS*\n"
-        f"• Line 2: {line2.get('status', '?')} ({line2.get('temp_celsius', '?')}°C)\n"
-        f"• Order #EV-402: {ev['status'] if ev else 'Nominal'}\n"
-        f"• Active shortfall: {ev['shortfall_units'] if ev else 0} units\n"
-        f"• SLA penalty exposure: ₹{penalty:,}"
-    )
+    lines = [
+        f"• {l.get('name', l['line_id'])}: {l.get('status', '?')} "
+        f"({l.get('speed_pct', '?')}% speed, {l.get('temp_celsius', '?')}°C)"
+        for l in state["production_lines"] if l.get("status") != "NORMAL"
+    ]
+    orders = [
+        f"• Order #{o['order_id']} ({o.get('client', '')}): {o['status']}, "
+        f"SLA penalty exposure ₹{o.get('sla_penalty_inr', 0):,}"
+        for o in state["orders"] if o.get("status") != "ON_TRACK"
+    ]
+    if not lines and not orders:
+        return "🏭 *PLANT STATUS*\nAll lines normal; all orders on track."
+    return "🏭 *PLANT STATUS*\n" + "\n".join(lines + orders)
 
 
 def _winner_summary(result: Dict[str, Any]) -> str:
@@ -343,7 +371,7 @@ def _winner_summary(result: Dict[str, Any]) -> str:
     return (
         f"🚨 *CASCADEZERO RECOVERY PLAN* ({result['run_id']})\n"
         f"• Order #{result['order_id']} — ₹{penalty:,} SLA exposure\n"
-        f"• Shortfall: {result['shortfall_units']} casings (+{result['delay_hours']}h delay)\n\n"
+        f"• Shortfall: {result['shortfall_units']} {result['factory_model'].stock_item_name} (+{result['delay_hours']}h delay)\n\n"
         f"⚖️ *Recommended: {winner['id']}* — {winner['name']}\n"
         f"• Cost: ₹{winner['total_mitigation_cost_inr']:,}\n"
         f"• Modelled P(on-time): {winner['confidence_pct']}%\n"
@@ -511,7 +539,7 @@ async def whatsapp_webhook(request: Request):
     body_text = str(form.get("Body", "")).strip()
     sender = str(form.get("From", "")).strip()
     if not body_text or body_text.lower() in ("hi", "hello", "ping", "test") or "join" in body_text.lower():
-        reply = "✅ CascadeZero connected. Send a disruption alert, e.g. 'Flood on NH48, 48h delay, 150 casings short on EV-402'."
+        reply = "✅ CascadeZero connected. Send a disruption alert, e.g. state the delay in hours, the units short, the affected line and order."
     else:
         try:
             result = await run_in_threadpool(_run_pipeline, body_text, "TWILIO_WHATSAPP_SANDBOX")
@@ -541,6 +569,8 @@ def whatsapp_health():
 
 @app.post("/api/v1/ingest/plc-telemetry", dependencies=[Depends(require_api_key)])
 def ingest_plc_telemetry(telemetry: PlcTelemetryRequest):
+    if db.get_production_line(telemetry.line_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown line_id {telemetry.line_id}")
     update_rows("production_lines", "line_id", telemetry.line_id, {
         "speed_pct": telemetry.speed_pct,
         "temp_celsius": telemetry.temp_celsius,
@@ -604,7 +634,7 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
 # ─── 6. Highway weather ──────────────────────────────────────────────────────
 
 @app.post("/api/v1/ingest/live-highway-check")
-def live_highway_check(req: LiveHighwayCheckRequest = LiveHighwayCheckRequest()):
+def live_highway_check(req: LiveHighwayCheckRequest):
     if settings.has_weather:
         try:
             resp = httpx.get(
@@ -673,7 +703,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
 
     payload = playbook.get("tally_po_payload") or {}
     po_number = payload.get("po_number") or f"PO-CZ-{uuid.uuid4().hex[:8].upper()}"
-    order_id = run.get("order_id", "EV-402")
+    order_id = run["order_id"]
     now = datetime.now(timezone.utc).isoformat()
 
     po_row = {

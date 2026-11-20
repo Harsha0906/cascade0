@@ -2,6 +2,7 @@
 
 import React from "react";
 import { useFactoryStore } from "@/store/useFactoryStore";
+import { focusOrder, ordersSummary, throttledLinesText } from "@/lib/twinGraph";
 import { AiModeBadge } from "@/components/AiModeBadge";
 import { SourcingPanel } from "@/components/SourcingPanel";
 import {
@@ -41,16 +42,26 @@ export function ExecutiveStoryView() {
     setDashboardViewMode,
     executionReceipt,
     openReceiptModal,
+    activeOrderId,
+    factory,
+    factoryName,
   } = useFactoryStore();
 
   const isCrisis = statusMode === "CRISIS";
   const isProtected = statusMode === "PROTECTED";
-  const ev402 = orders.find((o) => o.order_id === "EV-402");
+  const focus = focusOrder(orders, activeOrderId);
   const selectedPlan =
     playbooks.find((p) => p.id === selectedPlaybookId) || playbooks.find((p) => p.recommended);
   const opsPlan = playbooks.find((p) => p.id === "PLAN_A");
   const cfoPlan = playbooks.find((p) => p.id === "PLAN_B");
-  const line2 = productionLines.find((l) => l.line_id === "LINE-2");
+  const throttled = throttledLinesText(productionLines);
+  const atRiskOrders = orders.filter((o) => o.status !== "ON_TRACK");
+  const exposureInr = atRiskOrders.reduce((sum, o) => sum + (o.sla_penalty_inr ?? 0), 0);
+  const maxTemp = productionLines.length ? Math.max(...productionLines.map((l) => l.temp_celsius)) : null;
+  const totalUnits = orders.reduce((sum, o) => sum + o.required_qty, 0);
+  const dailyCapacity = productionLines.reduce((sum, l) => sum + l.daily_capacity_units, 0);
+  const normalTemps = productionLines.map((l) => l.temp_celsius);
+  const tempRange = normalTemps.length ? `${Math.min(...normalTemps)}-${Math.max(...normalTemps)}°C` : "n/a";
   const lakh = (n: number) => `₹${(n / 100000).toFixed(2)}L`;
 
   return (
@@ -104,21 +115,21 @@ export function ExecutiveStoryView() {
                 </span>
 
                 <span className="text-xs font-mono text-charcoal-500">
-                  Apex Volt EV Battery Plant • Bengaluru Unit-2
+                  {factory?.name || factoryName || "Loading factory…"}
                 </span>
               </div>
 
               <h2 className="text-xl sm:text-2xl font-extrabold text-charcoal-900 tracking-tight mt-2">
                 {isCrisis
-                  ? `Compound Risk: ${lakh(ev402?.sla_penalty_inr ?? 0)} SLA Penalty on Order #EV-402`
+                  ? `Compound Risk: ${lakh(focus?.sla_penalty_inr ?? 0)} SLA Penalty on Order #${focus?.order_id ?? "?"}`
                   : isProtected
                   ? "Recovery Plan Approved: Draft PO & Notices Generated"
-                  : "Zero Contractual Exposure • All Production Lines Running"}
+                  : `${atRiskOrders.length ? `${lakh(exposureInr)} exposure across ${atRiskOrders.length} at-risk order(s)` : "No at-risk orders"} • ${throttled ? `Throttled: ${throttled}` : "All production lines running"}`}
               </h2>
 
               <p className="text-xs sm:text-sm text-charcoal-700 font-medium max-w-2xl mt-1 leading-relaxed">
                 {isCrisis
-                  ? `Inbound supply delay combined with Line 2 running at ${line2?.speed_pct ?? "?"}% (${line2?.temp_celsius ?? "?"}°C). ${ev402?.shortfall_units ?? 0} battery casings short.`
+                  ? `Inbound supply disruption${throttled ? ` combined with throttled lines: ${throttled}` : ""}. ${focus?.shortfall_units ?? 0} units short.`
                   : isProtected && selectedPlan
                   ? `${selectedPlan.id} approved: ${lakh(selectedPlan.total_mitigation_cost_inr)} spend, modelled on-time probability ${selectedPlan.confidence_pct}%. Delivery is not guaranteed until suppliers confirm.`
                   : "Run a scenario or paste a disruption alert to get ranked recovery plans. Telemetry in this demo is simulated."}
@@ -330,7 +341,7 @@ export function ExecutiveStoryView() {
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="w-4 h-4 rounded-full bg-emerald-100 text-emerald-800 flex items-center justify-center text-[10px] font-bold shrink-0 mt-0.5">✓</span>
-                    <span>Client notice for {ev402?.client || "the client"} stating the modelled on-time probability.</span>
+                    <span>Client notice for {focus?.client || "the client"} stating the modelled on-time probability.</span>
                   </li>
                 </ul>
                 <SourcingPanel />
@@ -372,36 +383,36 @@ export function ExecutiveStoryView() {
           <div className="island-card p-6 border border-white/60">
             <div className="flex items-center justify-between text-xs font-mono text-charcoal-600">
               <span className="font-bold uppercase">Contract Orders</span>
-              <span className="text-forest font-bold">2 ACTIVE</span>
+              <span className="text-forest font-bold">{orders.length} ACTIVE</span>
             </div>
             <div className="text-3xl font-extrabold font-mono text-charcoal-900 mt-2">
-              800 Units
+              {totalUnits} Units
             </div>
             <p className="text-xs text-charcoal-600 mt-1">
-              Ather-Grid #EV-402 (500u) & Deccan Logistics #EV-405 (300u). All on schedule.
+              {ordersSummary(orders)}. All on schedule.
             </p>
           </div>
 
           <div className="island-card p-6 border border-white/60">
             <div className="flex items-center justify-between text-xs font-mono text-charcoal-600">
               <span className="font-bold uppercase">Robotic Lines</span>
-              <span className="text-forest font-bold">550 u/day</span>
+              <span className="text-forest font-bold">{dailyCapacity} u/day</span>
             </div>
             <div className="text-3xl font-extrabold font-mono text-charcoal-900 mt-2">
-              3 Lines Active
+              {productionLines.length} Lines Active
             </div>
             <p className="text-xs text-charcoal-600 mt-1">
-              Welding Lines 1, 2, and 3 operating at nominal temperatures (60-62°C).
+              {productionLines.map((l) => l.name).join(", ")} temperatures {tempRange}{maxTemp !== null ? ` (max ${maxTemp}°C)` : ""}.
             </p>
           </div>
 
           <div className="island-card p-6 border border-white/60">
             <div className="flex items-center justify-between text-xs font-mono text-charcoal-600">
               <span className="font-bold uppercase">Multi-Agent Control</span>
-              <span className="text-forest font-bold">4-STEP PIPELINE</span>
+              <span className="text-forest font-bold">{atRiskOrders.length} AT RISK</span>
             </div>
             <div className="text-3xl font-extrabold font-mono text-charcoal-900 mt-2">
-              0 Violations
+              {atRiskOrders.length} At-Risk Orders
             </div>
             <p className="text-xs text-charcoal-600 mt-1">
               Ready to rank recovery plans when a disruption is reported.

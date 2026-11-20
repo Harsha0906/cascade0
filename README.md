@@ -72,12 +72,12 @@ When an Indian EV battery plant faces compound disruptions (e.g., an NH48 highwa
 
 ### 1. 👔 Executive Story View vs 🏭 2.5D Twin Studio
 - **Executive Mode:** Eliminates cognitive clutter. Shows the plain-English crisis narrative, the Ops vs. CFO debate summary, the PuLP mathematical proof, and a single thumb-friendly **`[⚡ APPROVE PLAN B & EXECUTE]`** action.
-- **2.5D Twin Studio:** Interactive React Flow canvas depicting real-time causal blast radii from Chennai, Peenya, and Hosur to Welding Lines 1, 2, and 3.
+- **2.5D Twin Studio:** Interactive React Flow canvas built from `/api/v1/factory` and `/api/v1/state` (one node per supplier, line and order), showing causal blast radii for whatever the factory contains.
 
 ### 2. 🎛️ Custom Crisis Scenario Studio
 - **Preset Scenarios:** NH48 Highway Flood (150 casings), Severe Cyclone Collapse (350 casings with automatic multi-agent rebuttal loop), Attibele Border Toll Strike (180 casings).
-- **Freeform Natural Language:** Type any custom message (*e.g., "Truck breakdown near Krishnagiri, 120 casings short on EV-402, Line 2 running at 50%"*).
-- **Interactive Sliders:** Adjust shortfall units (25–450u), transit delay (6–96h), and machine thermal degradation on the fly.
+- **Freeform Natural Language:** Type any custom message naming any line(s), supplier and order of the factory (*e.g., "Truck breakdown near Krishnagiri, 120 casings short, Line 2 running at 50%"*). See "Disruption format" below.
+- **Interactive Sliders:** Adjust shortfall units (25–450u), transit delay (6–96h), and one speed slider per production line (0–100%) on the fly.
 
 ### 3. 🏭 Real Shop-Floor SME Integration
 - **`cascade_sync.py`:** Watches local on-premise folders for exported Tally ERP / Excel CSV sheets.
@@ -137,13 +137,14 @@ Mobile Field Controller: `http://localhost:3000/mobile`
 Run `supabase/schema.sql`, then `supabase/migrations/001_rls_and_audit.sql` in the Supabase SQL editor.
 The migration enables Row-Level Security (browser = read-only) and adds approval audit columns.
 After it, backend writes require `SUPABASE_SERVICE_ROLE_KEY`.
-Then apply `002_sourcing_agent.sql`, `003_factory_model.sql` and `004_durable_state.sql` in order.
+Then apply `002_sourcing_agent.sql`, `003_factory_model.sql`, `004_durable_state.sql` and `005_generic_disruptions.sql` in order.
 `004_durable_state.sql` adds `analysis_runs`, `sourcing_sessions`, `execution_receipts`, `webhook_events`,
-the atomic `execute_plan_tx` function and a `schema_migrations` table (level 4 is required).
+the atomic `execute_plan_tx` function and a `schema_migrations` table.
+`005_generic_disruptions.sql` adds the `scenarios` table (preset disruptions per factory) and new `disruption_events` columns, and records `schema_migrations` level 5, which is now required.
 
 Check it with `GET /healthz`, which returns
 `{"storage", "db", "migration_level", "required_migration_level", "ready"}` and HTTP 200 when ready,
-503 otherwise. The backend logs an error at startup if the database is below level 4 (production refuses to start).
+503 otherwise. The backend logs an error at startup if the database is below level 5 (production refuses to start).
 
 ### Storage modes
 
@@ -157,6 +158,8 @@ Check it with `GET /healthz`, which returns
 ```bash
 cd ../backend
 python -m unittest discover -s tests -t .
+cd ../frontend
+npm test        # vitest: digital-twin graph builder and store
 ```
 Offline suite (no Supabase, LLM or WhatsApp calls): solver correctness, infeasibility reporting,
 ranking, Monte Carlo sensitivity, Tally XML well-formedness, API auth, webhook signatures,
@@ -172,18 +175,36 @@ WhatsApp approver allowlist, idempotent execution and CSV import.
 
 ---
 
+## 🧭 Disruption format
+
+An alert (free text via `raw_message`, a WhatsApp message, or a preset) may name **any** line(s), supplier and order of the factory.
+Extraction produces a delay, a shortfall, per-line speeds, an affected supplier and an order; `backend/app/disruption.py` maps the references to ids.
+Required: a shortfall, a speed for every named line, and a resolvable supplier when there is a delay. Nothing is invented: the old defaults
+(48h, 50%, 150 units, `EV-402`) are gone, so a message that omits these is rejected.
+Unknown or ambiguous references, a missing shortfall, a line without a speed, a delay with no resolvable supplier and negative numbers return
+**422** (or a WhatsApp reply naming what is missing); nothing is written.
+
+- `POST /api/v1/simulate-crisis` takes `{scenario_id? | raw_message?, override_delay_hours?, override_shortfall_units?, override_line_speeds?: {line_id: 0..100}, order_id?}`.
+  Neither `scenario_id` nor `raw_message` is a 422. `extracted_parameters` in the response has `delay_hours`, `line_impacts` (`line_id`, `name`, `speed_pct`, `temp_celsius`),
+  `affected_supplier_id`, `shortfall_units`, `affected_order_id`, `source` and `overridden_by_preset_or_slider`.
+- `GET /api/v1/scenarios` lists the preset scenarios from the `scenarios` table (migration `005_generic_disruptions.sql`).
+- The WhatsApp status reply lists every non-normal line and every at-risk order. Vendor enquiries to flat-fee vendors ask for "a dedicated delivery ... for a flat fee".
+- MILP variables are named by index, so ids such as `L-B` and `L_B` cannot collide.
+
 ## ✅ What Is Real vs Simulated
 
 | Component | Status |
 |---|---|
-| MILP allocation (vendors, per-line overtime, deadline feasibility, throughput gap computed from the factory's line data; LINE-2 speed is the only disruption input until Phase 3) | Real (PuLP + HiGHS/CBC). Infeasible inputs are reported, not hidden |
+| MILP allocation (vendors, per-line overtime, deadline feasibility, throughput gap computed from the factory's line data; disruption inputs are any per-line speeds, a delay and a shortfall) | Real (PuLP + HiGHS/CBC). Infeasible inputs are reported, not hidden |
 | Plan ranking | Real: argmin of `cost + (1 − P_on_time) × SLA penalty` |
 | Monte Carlo on-time probability | Real, seeded; distributions are **assumptions** for the demo plant |
 | **Sourcing Agent** | Real agent loop: sends enquiries (not orders) to the vendors in a plan, reads replies (Gemini or regex, English/Hinglish), and re-plans with confirmed capacity/price/ETA, asking the next vendor when one declines, offers less, or times out (max 3 rounds). WhatsApp or simulated channel |
 | Ops ⇄ CFO debate | Proposals are solver outputs; the rebuttal fires on computed risk (weak vendor, infeasibility, confidence gap) and the CFO re-solves |
+| Disruption extraction | Gemini (given the factory's line, supplier and order ids) or a regex fallback that only takes cue-bound numbers and never guesses; `backend/app/disruption.py` resolves references to ids. Missing or unresolvable input is rejected, never defaulted. The UI shows which path ran |
+| Digital twin | Built from the factory model (`/api/v1/factory`) and live state (`/api/v1/state`): one node per supplier, line and order. Layout is generic, not geographic |
 | LLM | Extracts parameters from free text and narrates. The UI shows when it fell back to regex/templates |
 | Vendor costs, capacities, lead times | Loaded per factory from the database (`suppliers`, `vendor_history`, `production_lines`, `factories`) |
-| PLC telemetry | Simulated, HTTP JSON |
+| PLC telemetry | Simulated, HTTP JSON; `line_id` is required (unknown line returns 404) |
 | Weather | OpenWeatherMap city weather if a key is set; otherwise shown as offline |
 | WhatsApp | Meta Cloud API with HMAC verification; approvals only from allow-listed numbers |
 | Analysis runs, sourcing sessions, execution receipts | Stored in Postgres (`analysis_runs`, `sourcing_sessions`, `execution_receipts`); in offline mode in process memory. Approving a run twice returns the original receipt with `already_executed: true`; a different plan for an executed run is a 409 |

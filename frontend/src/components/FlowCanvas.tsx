@@ -9,7 +9,7 @@ import {
 } from "@xyflow/react";
 import { useFactoryStore } from "@/store/useFactoryStore";
 import { nodeTypes } from "./CustomNodes";
-import { X, Database, History, Cpu } from "lucide-react";
+import { X, Database, History, Cpu, AlertTriangle } from "lucide-react";
 
 export function FlowCanvas() {
   const {
@@ -19,14 +19,32 @@ export function FlowCanvas() {
     isInspectionDrawerOpen,
     closeInspectionDrawer,
     vendorHistory,
+    factoryError,
+    retryFactoryLoad,
   } = useFactoryStore();
 
   // Find relevant vendor history if node is a supplier
-  const relatedHistory = vendorHistory.find((vh) => {
-    if (selectedNodeData?.id) return vh.supplier_id === selectedNodeData.id;
-    if (selectedNodeData?.type === "BACKUP_VENDORS") return vh.supplier_id === "SUP-PNY-02";
-    return false;
-  });
+  const relatedHistory = selectedNodeData?.supplierId
+    ? vendorHistory.find((vh) => vh.supplier_id === selectedNodeData.supplierId)
+    : undefined;
+
+  if (factoryError) {
+    return (
+      <div className="relative w-full h-[520px] rounded-[32px] overflow-hidden island-card-static border border-white/50 shadow-island flex items-center justify-center">
+        <div className="island-card rounded-[24px] p-6 max-w-md text-center border !border-coral !bg-coral/15">
+          <AlertTriangle className="w-6 h-6 text-coral mx-auto mb-2" />
+          <h3 className="font-bold text-sm text-charcoal-900 mb-1">Digital twin unavailable</h3>
+          <p className="text-xs text-charcoal-800 font-mono break-words">{factoryError}</p>
+          <button
+            onClick={() => void retryFactoryLoad()}
+            className="mt-3 px-4 py-1.5 rounded-full bg-charcoal-900 text-white text-xs font-bold hover:bg-charcoal-800"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="relative w-full h-[520px] rounded-[32px] overflow-hidden island-card-static border border-white/50 shadow-island">
@@ -79,7 +97,7 @@ export function FlowCanvas() {
                 Selected Entity
               </span>
               <p className="text-charcoal-950 font-bold text-sm">
-                {selectedNodeData.name || selectedNodeData.id || selectedNodeData.type}
+                {selectedNodeData.name || selectedNodeData.supplierId || selectedNodeData.lineId || selectedNodeData.orderId || selectedNodeData.type}
               </p>
             </div>
 

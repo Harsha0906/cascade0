@@ -1,7 +1,7 @@
 -- ============================================================================
 -- CASCADEZERO — Complete PostgreSQL Schema, Realtime Setup & Seed Data
 -- Target: Supabase Cloud PostgreSQL (ap-south-1)
--- Fresh install: run this file, then migrations 001, 002, 003, 004 in order.
+-- Fresh install: run this file, then migrations 001, 002, 003, 004, 005 in order.
 -- Factory: Apex Volt EV Battery Plant (Bengaluru Unit-2)
 -- ============================================================================
 
@@ -112,8 +112,31 @@ CREATE TABLE IF NOT EXISTS disruption_events (
     delay_hours         INTEGER NOT NULL DEFAULT 0,
     line2_speed_pct     INTEGER NOT NULL DEFAULT 100,
     shortfall_units     INTEGER NOT NULL DEFAULT 0,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    factory_id          TEXT,
+    order_id            TEXT,
+    affected_supplier_id TEXT,
+    line_impacts        JSONB NOT NULL DEFAULT '[]'
 );
+
+-- ============================================================================
+-- TABLE 5b: scenarios (data-driven preset disruptions per factory; seeded below)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS scenarios (
+    factory_id       TEXT NOT NULL,
+    scenario_id      INT NOT NULL,
+    title            TEXT NOT NULL,
+    summary          TEXT NOT NULL DEFAULT '',
+    raw_message      TEXT NOT NULL,
+    delay_hours      INT NOT NULL,
+    shortfall_units  INT NOT NULL,
+    line_speeds      JSONB NOT NULL DEFAULT '{}',
+    order_id         TEXT NOT NULL,
+    PRIMARY KEY (factory_id, scenario_id)
+);
+ALTER TABLE scenarios ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS scenarios_read ON scenarios;
+CREATE POLICY scenarios_read ON scenarios FOR SELECT TO anon, authenticated USING (true);
 
 -- ============================================================================
 -- TABLE 6: agent_logs (Realtime streamed to Agent Debate Terminal)
@@ -190,6 +213,20 @@ INSERT INTO orders (order_id, client, required_qty, deadline_label, hours_remain
 VALUES
     ('EV-402', 'Ather-Grid Mobility Corp', 500, 'Friday 17:00 IST (38 Hours Remaining)', 38, 2500000, 500000, 'ON_TRACK', 0, 'apex-volt-blr2'),
     ('EV-405', 'Deccan E-Fleet Logistics', 300, 'Monday 12:00 IST (110 Hours Remaining)', 110, 1000000, 200000, 'ON_TRACK', 0, 'apex-volt-blr2');
+
+-- Scenario presets
+INSERT INTO scenarios (factory_id, scenario_id, title, summary, raw_message, delay_hours, shortfall_units, line_speeds, order_id)
+VALUES
+    ('apex-volt-blr2', 1, 'NH48 flood + Line 2 overheat', '48h delay, Line 2 at 50%, 150 casings short',
+     'NH48 Chennai-Bengaluru highway flooding near Vellore delayed shipment of 500 aluminum battery casings from Chennai Precision by 48 hours. Simultaneously, Robotic Welding Line 2 overheated to 89.0°C and throttled to 50% speed. Current unit shortfall is 150 casings on Order #EV-402.',
+     48, 150, '{"LINE-2": 50}', 'EV-402'),
+    ('apex-volt-blr2', 2, 'Minor toll delay', '6h delay, Line 2 at 85%, 25 casings short',
+     'Minor toll transit delay on NH48 corridor causing 6 hours shipment delay for 25 units. Welding Line 2 slightly throttled to 85% speed (74°C). Shortfall is 25 battery casings on Order #EV-402.',
+     6, 25, '{"LINE-2": 85}', 'EV-402'),
+    ('apex-volt-blr2', 3, 'Supplier collapse', '72h delay, Line 2 at 25%, 350 casings short',
+     'Severe supplier collapse: Chennai Precision Casings shipment blocked by 72 hours due to bridge damage near Ranipet. Robotic Welding Line 2 overheated to 92°C and dropped to 25% speed. Compound shortfall of 350 battery casings on Order #EV-402.',
+     72, 350, '{"LINE-2": 25}', 'EV-402')
+ON CONFLICT (factory_id, scenario_id) DO NOTHING;
 
 -- ============================================================================
 -- SUPABASE REALTIME: Enable postgres_changes on all 7 tables

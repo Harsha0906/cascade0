@@ -1,6 +1,9 @@
 import { create } from "zustand";
 import { Edge, Node } from "@xyflow/react";
 import { subscribeToTable } from "@/lib/supabase";
+import { buildTwinGraph, type FactoryInfo, type Scenario } from "@/lib/twinGraph";
+
+export type { FactoryInfo, Scenario };
 
 export interface Supplier {
   id: string;
@@ -17,6 +20,8 @@ export interface Supplier {
   weather_risk_pct: number;
   status: string;
   delay_hours: number;
+  factory_id?: string | null;
+  sourcing_role?: string | null;
 }
 
 export interface VendorHistory {
@@ -39,6 +44,7 @@ export interface ProductionLine {
   overtime_cost_per_hour_inr: number;
   extra_units_per_ot_hour: number;
   max_ot_hours: number;
+  factory_id?: string | null;
 }
 
 export interface Order {
@@ -51,6 +57,7 @@ export interface Order {
   partial_delay_penalty_inr: number;
   status: string;
   shortfall_units: number;
+  factory_id?: string | null;
 }
 
 export interface AgentLog {
@@ -188,11 +195,25 @@ interface FactoryState {
   edges: Edge[];
   dashboardViewMode: "EXECUTIVE" | "TWIN";
   isCustomCrisisModalOpen: boolean;
+  factory: FactoryInfo | null;
+  factoryError: string | null;
+  scenariosError: string | null;
+  scenarios: Scenario[];
+  activeOrderId: string | null;
 
   // Actions
   fetchInitialState: () => Promise<void>;
+  /** Re-run the factory/scenarios load now (the Retry button); resets the backoff. */
+  retryFactoryLoad: () => Promise<void>;
   initRealtimeSubscriptions: () => () => void;
   simulateCrisis: (scenarioId?: number, customText?: string) => Promise<void>;
+  simulateCustom: (input: {
+    raw_message?: string;
+    override_delay_hours?: number;
+    override_shortfall_units?: number;
+    override_line_speeds?: Record<string, number>;
+    order_id?: string;
+  }) => Promise<void>;
   executePlaybook: (playbookId: string) => Promise<void>;
   startSourcing: () => Promise<void>;
   refreshSourcing: () => Promise<void>;
@@ -213,78 +234,6 @@ const API_BASE =
     ? ""
     : process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-// ─── Default 5 Node Coordinates (Left-to-Right Industrial Flow) ─────────────
-const INITIAL_NODES: Node[] = [
-  {
-    id: "node-chennai",
-    type: "chennaiSupplyNode",
-    position: { x: 50, y: 70 },
-    data: { id: "SUP-CHN-01", status: "ON_TIME", delayHours: 0, inboundQty: 500 },
-  },
-  {
-    id: "node-peenya-hosur",
-    type: "backupVendorNode",
-    position: { x: 50, y: 340 },
-    data: { status: "STANDBY", peenyaAllocated: 0, hosurAllocated: 0 },
-  },
-  {
-    id: "node-line2",
-    type: "weldingLine2Node",
-    position: { x: 480, y: 70 },
-    data: { id: "LINE-2", status: "NORMAL", speedPct: 100, tempC: 62.0, shortfall: 0 },
-  },
-  {
-    id: "node-lines-buffer",
-    type: "parallelBufferNode",
-    position: { x: 480, y: 340 },
-    data: { status: "NORMAL", otHours: 0, otRate: "₹22.5k/hr" },
-  },
-  {
-    id: "node-order-sla",
-    type: "orderSlaNode",
-    position: { x: 920, y: 200 },
-    data: {
-      orderId: "EV-402",
-      client: "Ather-Grid Mobility Corp",
-      status: "ON_TRACK",
-      shortfall: 0,
-      penaltyExposure: 0,
-      savedInr: 0,
-    },
-  },
-];
-
-const INITIAL_EDGES: Edge[] = [
-  {
-    id: "edge-chennai-line2",
-    source: "node-chennai",
-    target: "node-line2",
-    animated: true,
-    className: "animated-pipe-emerald",
-  },
-  {
-    id: "edge-backup-buffer",
-    source: "node-peenya-hosur",
-    target: "node-lines-buffer",
-    animated: true,
-    className: "animated-pipe-amber",
-  },
-  {
-    id: "edge-line2-order",
-    source: "node-line2",
-    target: "node-order-sla",
-    animated: true,
-    className: "animated-pipe-emerald",
-  },
-  {
-    id: "edge-buffer-order",
-    source: "node-lines-buffer",
-    target: "node-order-sla",
-    animated: true,
-    className: "animated-pipe-sky",
-  },
-];
-
 export const useFactoryStore = create<FactoryState>((set, get) => {
   /** Store sourcing state; once the agent finishes, switch the dashboard to the confirmed plan. */
   const applySourcing = (data: SourcingState) => {
@@ -299,8 +248,91 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     }
   };
 
+  /** Backoff delays (ms) between automatic retries of a failed factory/scenarios load; then stop. */
+  const RETRY_DELAYS_MS = [2000, 4000, 8000];
+  let retryAttempt = 0;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const errMsg = async (res: Response, what: string) => {
+    const detail = await res.json().catch(() => ({}));
+    return detail.detail || `${what} unavailable (HTTP ${res.status})`;
+  };
+
+  /** Load /factory and /scenarios independently; schedule bounded retries for whichever failed. */
+  const loadFactoryData = async () => {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    if (!get().factory) {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/factory`);
+        if (!res.ok) throw new Error(await errMsg(res, "Factory model"));
+        set({ factory: (await res.json()) as FactoryInfo, factoryError: null });
+      } catch (err) {
+        set({ factoryError: err instanceof Error ? err.message : "Factory model unavailable" });
+      }
+    }
+    if (get().scenarios.length === 0 || get().scenariosError) {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/scenarios`);
+        if (!res.ok) throw new Error(await errMsg(res, "Scenario presets"));
+        set({ scenarios: (await res.json()) as Scenario[], scenariosError: null });
+      } catch (err) {
+        set({ scenariosError: err instanceof Error ? err.message : "Scenario presets unavailable" });
+      }
+    }
+    get().updateNodesAndEdges();
+    if ((get().factoryError || get().scenariosError) && retryAttempt < RETRY_DELAYS_MS.length) {
+      const delay = RETRY_DELAYS_MS[retryAttempt++];
+      retryTimer = setTimeout(() => void loadFactoryData(), delay);
+    }
+  };
+
+  /** POST /simulate-crisis with the given body, then store the plans and refresh the twin. */
+  const runSimulation = async (payload: Record<string, unknown>, scenarioId: number | null) => {
+    set({ isSimulating: true, activeScenarioId: scenarioId, lastError: null, sourcing: null });
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/simulate-crisis`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, source_channel: "WEB_DASHBOARD" }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `Simulation failed (HTTP ${res.status})`);
+      }
+      const data = await res.json();
+      const sr = data.solver_result || {};
+      set({
+        statusMode: "CRISIS",
+        playbooks: data.playbooks || [],
+        selectedPlaybookId: data.recommended_plan_id || null,
+        activeRunId: data.run_id,
+        activeOrderId: data.extracted_parameters?.affected_order_id ?? null,
+        solveDurationMs: sr.solve_duration_ms ?? 0,
+        rebuttalOccurred: !!data.rebuttal_occurred,
+        rebuttalNotes: data.rebuttal_notes || [],
+        aiMode: data.ai_mode || null,
+        solverMeta: {
+          lp_status: sr.lp_status || "",
+          ranking_rule: sr.ranking_rule || "",
+          deadline_hours: sr.deadline_hours ?? 0,
+          capacity_exhausted: !!sr.capacity_exhausted,
+          throughput_gap_units: sr.throughput_gap_units ?? 0,
+        },
+      });
+      await get().fetchInitialState();
+    } catch (err) {
+      console.error("Simulation error", err);
+      set({ lastError: err instanceof Error ? err.message : "Simulation failed" });
+    } finally {
+      set({ isSimulating: false });
+    }
+  };
+
   return {
-  factoryName: "Apex Volt EV Battery Plant (Bengaluru Unit-2)",
+  factoryName: "",
   statusMode: "NORMAL",
   activeScenarioId: null,
   suppliers: [],
@@ -325,10 +357,15 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
   isReceiptModalOpen: false,
   selectedNodeData: null,
   isInspectionDrawerOpen: false,
-  nodes: INITIAL_NODES,
-  edges: INITIAL_EDGES,
+  nodes: [],
+  edges: [],
   dashboardViewMode: "EXECUTIVE",
   isCustomCrisisModalOpen: false,
+  factory: null,
+  factoryError: null,
+  scenariosError: null,
+  scenarios: [],
+  activeOrderId: null,
 
   fetchInitialState: async () => {
     try {
@@ -343,11 +380,19 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
           orders: data.orders || [],
           agentLogs: data.agent_logs || [],
         });
-        get().updateNodesAndEdges();
       }
     } catch (err) {
       console.warn("FastAPI /state unreachable — using existing state", err);
     }
+
+    await loadFactoryData();
+    get().updateNodesAndEdges();
+  },
+
+  retryFactoryLoad: async () => {
+    retryAttempt = 0;
+    set({ factoryError: null, scenariosError: null });
+    await loadFactoryData();
   },
 
   initRealtimeSubscriptions: () => {
@@ -394,50 +439,10 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     };
   },
 
-  simulateCrisis: async (scenarioId?: number, customText?: string) => {
-    set({ isSimulating: true, activeScenarioId: scenarioId ?? null, lastError: null, sourcing: null });
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/simulate-crisis`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          scenario_id: scenarioId,
-          raw_message: customText,
-          source_channel: "WEB_DASHBOARD",
-        }),
-      });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || `Simulation failed (HTTP ${res.status})`);
-      }
-      const data = await res.json();
-      const sr = data.solver_result || {};
-      set({
-        statusMode: "CRISIS",
-        playbooks: data.playbooks || [],
-        selectedPlaybookId: data.recommended_plan_id || null,
-        activeRunId: data.run_id,
-        solveDurationMs: sr.solve_duration_ms ?? 0,
-        rebuttalOccurred: !!data.rebuttal_occurred,
-        rebuttalNotes: data.rebuttal_notes || [],
-        aiMode: data.ai_mode || null,
-        solverMeta: {
-          lp_status: sr.lp_status || "",
-          ranking_rule: sr.ranking_rule || "",
-          deadline_hours: sr.deadline_hours ?? 0,
-          capacity_exhausted: !!sr.capacity_exhausted,
-          throughput_gap_units: sr.throughput_gap_units ?? 0,
-        },
-      });
-      await get().fetchInitialState();
-      get().updateNodesAndEdges();
-    } catch (err) {
-      console.error("Simulation error", err);
-      set({ lastError: err instanceof Error ? err.message : "Simulation failed" });
-    } finally {
-      set({ isSimulating: false });
-    }
-  },
+  simulateCrisis: async (scenarioId?: number, customText?: string) =>
+    runSimulation({ scenario_id: scenarioId, raw_message: customText }, scenarioId ?? null),
+
+  simulateCustom: async (input) => runSimulation(input, null),
 
   executePlaybook: async (playbookId: string) => {
     const { activeRunId, playbooks } = get();
@@ -546,6 +551,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
         playbooks: [],
         selectedPlaybookId: null,
         activeRunId: null,
+        activeOrderId: null,
         executionReceipt: null,
         agentLogs: [],
         isInspectionDrawerOpen: false,
@@ -587,121 +593,20 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
   },
 
   updateNodesAndEdges: () => {
-    const { suppliers, productionLines, orders, statusMode, playbooks, selectedPlaybookId } = get();
-
-    const chn = suppliers.find((s) => s.id === "SUP-CHN-01");
-    const l2 = productionLines.find((l) => l.line_id === "LINE-2");
-    const ev402 = orders.find((o) => o.order_id === "EV-402");
-    const selectedPlaybook = playbooks.find((p) => p.id === selectedPlaybookId);
-
-    const isCrisis = statusMode === "CRISIS" || l2?.status?.includes("OVERHEAT");
-    const isProtected = statusMode === "PROTECTED" || RECOVERY_STATUSES.includes(ev402?.status ?? "");
-
-    // 1. Update Nodes Data
-    const updatedNodes = INITIAL_NODES.map((node) => {
-      if (node.id === "node-chennai") {
-        return {
-          ...node,
-          data: {
-            id: "SUP-CHN-01",
-            name: chn?.name || "Chennai Precision Casings",
-            status: chn?.status || (isCrisis ? "DELAYED" : "ON_TIME"),
-            delayHours: chn?.delay_hours || (isCrisis ? 48 : 0),
-            inboundQty: chn?.inbound_qty || 500,
-            isCrisis,
-            isProtected,
-          },
-        };
-      }
-      if (node.id === "node-peenya-hosur") {
-        const peenyaAlloc = selectedPlaybook?.vendor_allocations.find((a) => a.supplier_id === "SUP-PNY-02")?.units_allocated || 0;
-        const hosurAlloc = selectedPlaybook?.vendor_allocations.find((a) => a.supplier_id === "SUP-HSR-03")?.units_allocated || 0;
-        return {
-          ...node,
-          data: {
-            status: isProtected ? "DISPATCHED" : isCrisis ? "RECOVERY_STANDBY" : "STANDBY",
-            peenyaAllocated: peenyaAlloc,
-            hosurAllocated: hosurAlloc,
-            isCrisis,
-            isProtected,
-          },
-        };
-      }
-      if (node.id === "node-line2") {
-        return {
-          ...node,
-          data: {
-            id: "LINE-2",
-            name: l2?.name || "Robotic Welding Line 2",
-            status: l2?.status || (isCrisis ? "OVERHEATING_THROTTLED" : "NORMAL"),
-            speedPct: l2?.speed_pct || (isCrisis ? 50 : 100),
-            tempC: l2?.temp_celsius || (isCrisis ? 89.0 : 62.0),
-            shortfall: ev402?.shortfall_units || (isCrisis ? 150 : 0),
-            isCrisis,
-            isProtected,
-          },
-        };
-      }
-      if (node.id === "node-lines-buffer") {
-        return {
-          ...node,
-          data: {
-            status: isProtected ? "OVERTIME_SCHEDULED" : isCrisis ? "BUFFER_RESERVE" : "NORMAL",
-            otHours: selectedPlaybook?.overtime_hours || (isCrisis ? 4 : 0),
-            otRate: "₹22,500/hr",
-            isCrisis,
-            isProtected,
-          },
-        };
-      }
-      if (node.id === "node-order-sla") {
-        return {
-          ...node,
-          data: {
-            orderId: "EV-402",
-            client: ev402?.client || "Ather-Grid Mobility Corp",
-            status: isProtected ? (ev402?.status || "RECOVERY_IN_PROGRESS") : isCrisis ? "BREACH_RISK" : "ON_TRACK",
-            shortfall: isProtected ? 0 : ev402?.shortfall_units || (isCrisis ? 150 : 0),
-            penaltyExposure: isProtected ? 0 : isCrisis ? ev402?.sla_penalty_inr ?? 0 : 0,
-            savedInr: isProtected ? selectedPlaybook?.net_sla_saved_inr ?? 0 : 0,
-            isCrisis,
-            isProtected,
-          },
-        };
-      }
-      return node;
+    const { factory, suppliers, productionLines, orders, playbooks, selectedPlaybookId, activeOrderId } = get();
+    if (!factory) {
+      set({ nodes: [], edges: [] });
+      return;
+    }
+    const { nodes, edges } = buildTwinGraph({
+      factory,
+      suppliers,
+      lines: productionLines,
+      orders,
+      playbook: playbooks.find((p) => p.id === selectedPlaybookId) ?? null,
+      focusOrderId: activeOrderId,
     });
-
-    // 2. Update Edges Pipe Glowing Classes
-    const updatedEdges = INITIAL_EDGES.map((edge) => {
-      if (edge.id === "edge-chennai-line2") {
-        return {
-          ...edge,
-          className: isCrisis ? "animated-pipe-crimson" : "animated-pipe-emerald",
-        };
-      }
-      if (edge.id === "edge-line2-order") {
-        return {
-          ...edge,
-          className: isCrisis ? "animated-pipe-crimson" : "animated-pipe-emerald",
-        };
-      }
-      if (edge.id === "edge-backup-buffer") {
-        return {
-          ...edge,
-          className: isProtected ? "animated-pipe-emerald" : isCrisis ? "animated-pipe-amber" : "animated-pipe-sky",
-        };
-      }
-      if (edge.id === "edge-buffer-order") {
-        return {
-          ...edge,
-          className: isProtected ? "animated-pipe-emerald" : "animated-pipe-sky",
-        };
-      }
-      return edge;
-    });
-
-    set({ nodes: updatedNodes, edges: updatedEdges });
+    set({ nodes, edges });
   },
 };
 });
