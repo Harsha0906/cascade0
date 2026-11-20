@@ -6,9 +6,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
+from app import deadlines
 from app.disruption import DisruptionResolutionError
 
-FINISHED_STATUSES = frozenset({"DELIVERED", "CANCELLED", "RISK_ACCEPTED"})
+# Orders that no longer consume stock. RISK_ACCEPTED (a NO_ACTION plan was approved) is NOT
+# finished: the order still ships and still needs its stock.
+FINISHED_STATUSES = frozenset({"DELIVERED", "CANCELLED"})
 
 
 class InventoryDataError(DisruptionResolutionError):
@@ -16,22 +19,24 @@ class InventoryDataError(DisruptionResolutionError):
 
 
 def _hours(x: float) -> str:
-    x = float(x)
+    x = round(float(x), 1)
     return str(int(x)) if x == int(x) else f"{x:.1f}"
 
 
 def _as_utc(value: Any) -> datetime:
     """Parse an ISO string / datetime. Naive values are treated as UTC."""
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise InventoryDataError(f"unparseable timestamp: {value!r}") from exc
-    if not isinstance(value, datetime):
-        raise InventoryDataError(f"unparseable timestamp: {value!r}")
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value
+    try:
+        return deadlines.parse_timestamp(value)
+    except ValueError as exc:
+        raise InventoryDataError(f"unparseable timestamp: {value!r}") from exc
+
+
+def deadline_hours(order: Mapping[str, Any], now: datetime) -> float:
+    """Hours until the order is due (from its absolute due_at); InventoryDataError when unknown."""
+    try:
+        return deadlines.deadline_hours(order, now)
+    except ValueError as exc:
+        raise InventoryDataError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,10 @@ class ShortfallBreakdown:
         )
         if self.overdue_qty > 0:
             text += f" ({self.overdue_qty} overdue on open POs not counted)"
+        if self.available < 0:
+            text += (f"; higher-priority orders take all {self.on_hand + self.inbound_before_deadline} "
+                     f"available and are {-self.available} short themselves, so this order's whole "
+                     f"demand is short")
         return text
 
 
@@ -126,7 +135,7 @@ def compute_shortfall(
     if item_code not in stock:
         raise InventoryDataError(f"no stock record for item {item_code}")
     on_hand = int(stock[item_code])
-    deadline = float(order["hours_remaining"])
+    deadline = deadline_hours(order, now)
 
     views = []
     inbound = 0
@@ -149,18 +158,25 @@ def compute_shortfall(
         views.append(ShipmentView(str(s["shipment_id"]), str(s["supplier_id"]), qty,
                                   eta_hours, delayed, counted, overdue))
 
-    def rank(o: dict):
-        return (o["priority"], o["hours_remaining"], o["order_id"])
-
-    my_rank = rank(order)
+    my_rank = order_rank(order, now)
     reserved = 0
     for o in orders:
         if o["order_id"] == order_id or o.get("status") in FINISHED_STATUSES:
             continue
-        if rank(o) < my_rank:
+        if order_rank(o, now) < my_rank:
             reserved += line_qty(o["order_id"]) or 0
 
     available = on_hand + inbound - reserved
+    # Never more than the order's own demand: a negative `available` is the higher-priority
+    # orders' deficit, not this order's.
+    shortfall = min(demand, max(0, demand - available))
     return ShortfallBreakdown(order_id, item_code, demand, on_hand, inbound, reserved,
-                              available, max(0, demand - available), deadline, tuple(views),
-                              overdue_qty)
+                              available, shortfall, deadline, tuple(views), overdue_qty)
+
+
+def order_rank(order: Mapping[str, Any], now: datetime) -> tuple:
+    """Reservation order: lower priority number first, then the earlier due time, then the id."""
+    priority = order.get("priority")
+    if priority is None or isinstance(priority, bool):
+        raise InventoryDataError(f"order {order.get('order_id', '?')} has no priority")
+    return (int(priority), deadline_hours(order, now), str(order["order_id"]))

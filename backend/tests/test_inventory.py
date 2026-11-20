@@ -98,7 +98,7 @@ class ShortfallTests(unittest.TestCase):
         self.assertEqual(run(order="EV-402", orders=orders).reserved_for_higher_priority, 0)
 
     def test_finished_does_not_reserve(self):
-        for st in ("DELIVERED", "CANCELLED", "RISK_ACCEPTED"):
+        for st in ("DELIVERED", "CANCELLED"):
             orders = _orders()
             orders[0]["status"] = st
             self.assertEqual(run(order="EV-405", orders=orders).reserved_for_higher_priority, 0)

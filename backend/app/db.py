@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from app.config import settings
+from app.deadlines import deadline_hours
 
 logger = logging.getLogger("cascadezero.db")
 
@@ -321,6 +322,13 @@ _SEED_ORDER_LINES: list[dict[str, Any]] = [
 _SEED_SHIPMENT_ETA_HOURS = 20
 
 
+def _seed_orders(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Demo orders; each is due `hours_remaining` hours after the reset/startup time."""
+    now = now or datetime.now(timezone.utc)
+    return [{**o, "due_at": (now + timedelta(hours=o["hours_remaining"])).isoformat()}
+            for o in copy.deepcopy(_SEED_ORDERS)]
+
+
 def _seed_inbound_shipments(now: datetime | None = None) -> list[dict[str, Any]]:
     """Demo inbound shipment; its eta is relative to the reset/startup time."""
     now = now or datetime.now(timezone.utc)
@@ -353,10 +361,10 @@ class InMemoryMirror:
         self.suppliers: list[dict[str, Any]] = copy.deepcopy(_SEED_SUPPLIERS)
         self.vendor_history: list[dict[str, Any]] = copy.deepcopy(_SEED_VENDOR_HISTORY)
         self.production_lines: list[dict[str, Any]] = copy.deepcopy(_SEED_PRODUCTION_LINES)
-        self.orders: list[dict[str, Any]] = copy.deepcopy(_SEED_ORDERS)
+        now = datetime.now(timezone.utc)
+        self.orders: list[dict[str, Any]] = _seed_orders(now)
         self.scenarios: list[dict[str, Any]] = copy.deepcopy(_SEED_SCENARIOS)
         self.items: list[dict[str, Any]] = copy.deepcopy(_SEED_ITEMS)
-        now = datetime.now(timezone.utc)
         self.stock_levels: list[dict[str, Any]] = [
             {**r, "as_of": now.isoformat()} for r in copy.deepcopy(_SEED_STOCK_LEVELS)
         ]
@@ -584,6 +592,28 @@ def update_rows_where(
                 row.update(updates)
                 updated.append(copy.deepcopy(row))
         return updated
+
+
+def delete_rows_where(table_name: str, match: dict[str, Any]) -> int:
+    """Delete the rows matching ALL `match` equalities; returns how many were deleted (offline)
+    or how many the database reported. Used by the snapshot imports."""
+    if not match:
+        raise ValueError("delete_rows_where needs at least one column to match")
+    client = _get_supabase()
+    if client is not None:
+        try:
+            query = client.table(table_name).delete()
+            for column, value in match.items():
+                query = query.eq(column, value)
+            return len(query.execute().data or [])
+        except Exception as exc:
+            raise _fail("delete", table_name, exc) from exc
+    with _conditional_lock:
+        table = _mirror.get_table(table_name)
+        keep = [r for r in table if not all(r.get(c) == v for c, v in match.items())]
+        deleted = len(table) - len(keep)
+        table[:] = keep
+        return deleted
 
 
 def delete_all(table_name: str) -> bool:
@@ -922,14 +952,23 @@ def get_production_line(line_id: str) -> dict[str, Any] | None:
     return fetch_by_id("production_lines", "line_id", line_id)
 
 
+def _live_hours(order: dict[str, Any] | None, now: datetime) -> dict[str, Any] | None:
+    """`hours_remaining` is display only: recompute it from the absolute due_at on every read.
+    A legacy order without due_at keeps its stored (static) value."""
+    if order is not None and order.get("due_at"):
+        order["hours_remaining"] = round(deadline_hours(order, now), 1)
+    return order
+
+
 def get_all_orders() -> list[dict[str, Any]]:
-    """Fetch all active orders."""
-    return fetch_all("orders")
+    """Fetch all active orders (hours_remaining recomputed from due_at)."""
+    now = datetime.now(timezone.utc)
+    return [_live_hours(o, now) for o in fetch_all("orders")]
 
 
 def get_order(order_id: str) -> dict[str, Any] | None:
-    """Fetch a single order."""
-    return fetch_by_id("orders", "order_id", order_id)
+    """Fetch a single order (hours_remaining recomputed from due_at)."""
+    return _live_hours(fetch_by_id("orders", "order_id", order_id), datetime.now(timezone.utc))
 
 
 def log_agent_step(
@@ -1026,7 +1065,7 @@ def reset_to_seed() -> dict[str, str]:
             ("factories", _SEED_FACTORIES),
             ("suppliers", _SEED_SUPPLIERS),
             ("production_lines", _SEED_PRODUCTION_LINES),
-            ("orders", _SEED_ORDERS),
+            ("orders", _seed_orders()),
             ("scenarios", _SEED_SCENARIOS),
             ("items", _SEED_ITEMS),
             ("stock_levels", [{**r, "as_of": now_iso} for r in _SEED_STOCK_LEVELS]),

@@ -64,6 +64,9 @@ DROP POLICY IF EXISTS order_lines_read ON order_lines;
 CREATE POLICY order_lines_read ON order_lines FOR SELECT TO anon, authenticated USING (true);
 
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 100;
+-- Absolute deadline. hours_remaining stays for display only (the API recomputes it from due_at).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ;
+UPDATE orders SET due_at = NOW() + hours_remaining * INTERVAL '1 hour' WHERE due_at IS NULL;
 ALTER TABLE factories ADD COLUMN IF NOT EXISTS stock_item_code TEXT;
 -- Scenario shortfall may now be computed from inventory instead of typed in.
 ALTER TABLE scenarios ALTER COLUMN shortfall_units DROP NOT NULL;

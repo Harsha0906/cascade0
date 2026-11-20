@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS orders (
     shortfall_units         INTEGER NOT NULL DEFAULT 0,
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     factory_id              TEXT,
-    priority                INT NOT NULL DEFAULT 100
+    priority                INT NOT NULL DEFAULT 100,
+    due_at                  TIMESTAMPTZ   -- absolute deadline; hours_remaining is display only
 );
 
 -- ============================================================================
@@ -267,6 +268,7 @@ INSERT INTO orders (order_id, client, required_qty, deadline_label, hours_remain
 VALUES
     ('EV-402', 'Ather-Grid Mobility Corp', 500, 'Friday 17:00 IST (38 Hours Remaining)', 38, 2500000, 500000, 'ON_TRACK', 0, 'apex-volt-blr2', 10),
     ('EV-405', 'Deccan E-Fleet Logistics', 300, 'Monday 12:00 IST (110 Hours Remaining)', 110, 1000000, 200000, 'ON_TRACK', 0, 'apex-volt-blr2', 20);
+UPDATE orders SET due_at = NOW() + hours_remaining * INTERVAL '1 hour' WHERE due_at IS NULL;
 
 -- Inventory (Phase 4)
 INSERT INTO items (factory_id, item_code, name, unit)
