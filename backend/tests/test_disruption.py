@@ -204,5 +204,59 @@ class ResolveDisruptionTests(unittest.TestCase):
         self.assertEqual(r.headline, "Flood")
 
 
+class ExtractionTests(unittest.TestCase):
+    def setUp(self):
+        from app.agents.tools import extract_disruption_entities
+        from app.main import SCENARIO_PROMPTS
+        self.extract = extract_disruption_entities
+        self.prompt1 = SCENARIO_PROMPTS[1]
+        self.model = load_factory_model()
+        self.orders = ["EV-402", "EV-405"]
+
+    def _resolved(self, text, model=None, orders=None):
+        model = model or self.model
+        orders = orders or self.orders
+        ext, source = self.extract(text, model, orders)
+        self.assertEqual(source, "regex-fallback")
+        return ext, resolve_disruption(ext, model, orders)
+
+    def test_scenario_1(self):
+        ext, r = self._resolved(self.prompt1)
+        self.assertEqual(len(ext.affected_lines), 1)
+        li = r.line_impacts[0]
+        self.assertEqual((li.line_id, li.speed_pct, li.temp_celsius), ("LINE-2", 50, 89.0))
+        self.assertEqual(r.supplier_id, "SUP-CHN-01")
+        self.assertEqual(r.order_id, "EV-402")
+        self.assertEqual(r.delay_hours, 48)
+        self.assertEqual(r.shortfall_units, 150)
+
+    def test_short_text(self):
+        _, r = self._resolved("Truck breakdown, 120 casings short on EV-402, Line 2 at 60%, 24h delay")
+        self.assertEqual([(l.line_id, l.speed_pct) for l in r.line_impacts], [("LINE-2", 60)])
+        self.assertEqual((r.shortfall_units, r.delay_hours, r.order_id), (120, 24, "EV-402"))
+
+    def test_two_lines(self):
+        _, r = self._resolved("Line 1 at 70% and Line 3 at 40%, 90 units short on EV-405")
+        self.assertEqual([(l.line_id, l.speed_pct) for l in r.line_impacts], [("LINE-1", 70), ("LINE-3", 40)])
+        self.assertEqual((r.shortfall_units, r.order_id), (90, "EV-405"))
+
+    def test_second_factory(self):
+        m = small_factory()
+        _, r = self._resolved("L-B at 40%, 80 units short on WO-77, 5h delay from Vendor V1", m, ["WO-77"])
+        self.assertEqual([(l.line_id, l.speed_pct) for l in r.line_impacts], [("L-B", 40)])
+        self.assertEqual((r.supplier_id, r.order_id, r.delay_hours, r.shortfall_units), ("V1", "WO-77", 5, 80))
+
+    def test_nothing_stated(self):
+        ext, _ = self.extract("flood on the highway", self.model, self.orders)
+        self.assertIsNone(ext.shortfall_units)
+        self.assertIsNone(ext.delay_hours)
+        self.assertEqual(ext.affected_lines, [])
+        self.assertIsNone(ext.affected_supplier)
+        self.assertIsNone(ext.affected_order)
+        with self.assertRaises(DisruptionResolutionError) as cm:
+            resolve_disruption(ext, self.model, self.orders)
+        self.assertIn("shortfall_units not stated", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

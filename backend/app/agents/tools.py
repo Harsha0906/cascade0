@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Sequence
 
 from app.config import settings
 from app.db import (
@@ -23,7 +23,7 @@ from app.db import (
     update_rows,
     upsert_row,
 )
-from app.schemas import DisruptionExtraction
+from app.schemas import DisruptionExtraction, LineImpactExtraction
 from app.factory_model import FactoryModel
 from app.solver import generate_playbooks
 
@@ -32,14 +32,135 @@ logger = logging.getLogger("cascadezero.tools")
 
 # ─── 1. Disruption Entity Extraction (Gemini Structured Outputs) ─────────────
 
-def extract_disruption_entities(raw_text: str) -> tuple[DisruptionExtraction, str]:
-    """
-    Extract structured disruption metrics from raw text (English/Hinglish/alerts)
-    using Gemini with Pydantic Structured Outputs (response_schema).
-    Falls back to deterministic regex extraction if the API is unavailable.
+def _mention_pattern(ident: str) -> str:
+    """Regex for an id like 'LINE-2' with flexible separators ('line 2', 'Line-2', 'line2')."""
+    chunks = re.findall(r"[A-Za-z0-9]+", ident)
+    body = r"[\s\-_]?".join(re.escape(c) for c in chunks)
+    return rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])"
 
-    Returns (extraction, source) where source is "gemini:<model>" or "regex-fallback",
-    so callers can show users which path actually produced the numbers.
+
+def _name_pattern(name: str) -> str:
+    words = name.split()
+    body = r"\s+".join(re.escape(w) for w in words)
+    return rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])"
+
+
+_TEMP_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:°\s*c\b|deg(?:rees)?\b|celsius\b|c\b)", re.I)
+_SPEED_RE = re.compile(r"(\d{1,3})\s*%")
+_WINDOW_CHARS = 80
+
+
+def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str]) -> DisruptionExtraction:
+    text = raw_text
+
+    delay_hours = None
+    m = re.search(r"(\d+)\s*(?:h|hr|hrs|hour|hours)\b", text, re.I)
+    if m:
+        delay_hours = int(m.group(1))
+
+    shortfall = None
+    item_words = re.findall(r"[A-Za-z]+", model.stock_item_name or "")
+    units = [r"battery\s+casings", r"casings", r"units", r"u\b"]
+    if item_words:
+        last = re.escape(item_words[-1])
+        units.append(rf"{last}s?\b")
+    m = re.search(
+        r"(?:shortfall\s+(?:is|of)\s*(\d+)|\b(\d+)\s*(?:" + "|".join(units) + r"))",
+        text,
+        re.I,
+    )
+    if m:
+        shortfall = int(m.group(1) or m.group(2))
+
+    # Line mentions (id or full name), overlapping spans collapsed to the earliest/longest.
+    spans = []
+    for line in model.lines:
+        for pat in (_mention_pattern(line.line_id), _name_pattern(line.name)):
+            for mm in re.finditer(pat, text, re.I):
+                spans.append((mm.start(), mm.end(), line.line_id))
+    spans.sort(key=lambda s: (s[0], -s[1]))
+    kept = []
+    for s in spans:
+        if kept and s[0] < kept[-1][1]:
+            continue
+        kept.append(s)
+
+    impacts: dict[str, LineImpactExtraction] = {}
+    for i, (_, end, lid) in enumerate(kept):
+        stop = min(end + _WINDOW_CHARS, kept[i + 1][0] if i + 1 < len(kept) else len(text))
+        window = text[end:stop]
+        sp = _SPEED_RE.search(window)
+        tm = _TEMP_RE.search(window)
+        temp = float(tm.group(1)) if tm and 0 < float(tm.group(1)) < 200 else None
+        cur = impacts.get(lid)
+        if cur is None:
+            impacts[lid] = LineImpactExtraction(
+                line=lid, speed_pct=int(sp.group(1)) if sp else None, temp_celsius=temp)
+        else:
+            if cur.speed_pct is None and sp:
+                cur.speed_pct = int(sp.group(1))
+            if cur.temp_celsius is None:
+                cur.temp_celsius = temp
+
+    # Supplier: earliest mention of an id or of a >=2-word name prefix.
+    supplier = None
+    best = None
+    candidates = list(model.primary_suppliers) + [(v.supplier_id, v.name) for v in model.vendors]
+    for sid, name in candidates:
+        pats = [_mention_pattern(sid)]
+        words = name.split(" (")[0].split()
+        for n in range(len(words), 1, -1):
+            pats.append(_name_pattern(" ".join(words[:n])))
+        for pat in pats:
+            mm = re.search(pat, text, re.I)
+            if mm and (best is None or mm.start() < best):
+                best, supplier = mm.start(), sid
+
+    order = None
+    best = None
+    for oid in order_ids:
+        mm = re.search(_mention_pattern(oid), text, re.I)
+        if mm and (best is None or mm.start() < best):
+            best, order = mm.start(), oid
+
+    return DisruptionExtraction(
+        delay_hours=delay_hours,
+        affected_lines=list(impacts.values()),
+        affected_supplier=supplier,
+        affected_order=order,
+        shortfall_units=shortfall,
+        raw_summary=raw_text[:200],
+    )
+
+
+def _gemini_prompt(raw_text: str, model: FactoryModel, order_ids: Sequence[str]) -> str:
+    lines = "\n".join(f"- {l.line_id} — {l.name}" for l in model.lines)
+    suppliers = "\n".join(
+        [f"- {sid} — {name}" for sid, name in model.primary_suppliers]
+        + [f"- {v.supplier_id} — {v.name}" for v in model.vendors]
+    )
+    orders = ", ".join(order_ids)
+    return (
+        f"You are the Crisis Detection Engine for {model.name}. "
+        f"Extract the disruption parameters stated in this alert:\n\n"
+        f'"{raw_text}"\n\n'
+        f"Production lines:\n{lines}\n\nSuppliers:\n{suppliers}\n\nOpen orders: {orders}\n\n"
+        f"Refer to every line, supplier and order using exactly one of the ids listed above. "
+        f"Leave a field null (or the list empty) when the alert does not state it; "
+        f"never invent numbers. Report each affected line with its speed_pct and temp_celsius "
+        f"only if stated, delay_hours, and shortfall_units of {model.stock_item_name}."
+    )
+
+
+def extract_disruption_entities(
+    raw_text: str, model: FactoryModel, order_ids: Sequence[str]
+) -> tuple[DisruptionExtraction, str]:
+    """
+    Extract structured disruption metrics from raw text (English/Hinglish/alerts), aware of the
+    factory model so any line, supplier or order can be named. Gemini structured output first;
+    deterministic regex fallback otherwise.
+
+    Returns (extraction, source) where source is "gemini:<model>" or "regex-fallback".
     """
     if settings.has_gemini:
         try:
@@ -49,77 +170,21 @@ def extract_disruption_entities(raw_text: str) -> tuple[DisruptionExtraction, st
                 api_key=settings.GEMINI_API_KEY,
                 http_options={"timeout": 10000},
             )
-            prompt = (
-                f"You are the Crisis Detection Engine for Apex Volt EV Battery Plant. "
-                f"Extract the exact crisis parameters from this disruption alert:\n\n"
-                f'"{raw_text}"\n\n'
-                f"If specific numbers are omitted, infer sensible manufacturing defaults: "
-                f"delay_hours (default 48), line2_speed_pct (default 50), line2_temp_celsius (default 89.0), "
-                f"shortfall_units (default 150), affected_order_id (default EV-402)."
-            )
-
             response = client.models.generate_content(
                 model=settings.GEMINI_MODEL,
-                contents=prompt,
+                contents=_gemini_prompt(raw_text, model, order_ids),
                 config={
                     "response_mime_type": "application/json",
                     "response_schema": DisruptionExtraction,
                 },
             )
-
             if response.text:
                 data = json.loads(response.text)
                 return DisruptionExtraction(**data), f"gemini:{settings.GEMINI_MODEL}"
         except Exception as exc:
             logger.warning("⚠ Gemini structured extraction failed (%s) — using deterministic fail-safe", exc)
 
-    # Deterministic Rule-Based Fallback
-    text = raw_text.lower()
-    delay_hours = 48
-    line2_speed = 50
-    temp_c = 89.0
-    shortfall = 150
-
-    # Parse delay hours
-    delay_match = re.search(r"(\d+)\s*(?:h|hr|hrs|hour|hours)", text, re.I)
-    if delay_match:
-        delay_hours = int(delay_match.group(1))
-
-    # Parse speed %
-    speed_match = re.search(r"(\d+)\s*%", text)
-    if speed_match:
-        line2_speed = int(speed_match.group(1))
-
-    # Parse temp
-    # Require a real temperature unit ("89°C", "89 deg", "89 celsius", "89c") so that
-    # "350 casings" is not misread as 350°C; ignore implausible readings.
-    temp_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:°\s*c\b|deg(?:rees)?\b|celsius\b|c\b)", text, re.I)
-    if temp_match and 0 < float(temp_match.group(1)) < 200:
-        temp_c = float(temp_match.group(1))
-
-    # Parse shortfall
-    shortfall_match = re.search(
-        r"(?:shortfall\s+(?:is|of)\s*(\d+)|\b(\d+)\s*(?:battery\s+casings|casings|units|u\b))",
-        text,
-        re.I,
-    )
-    if shortfall_match:
-        shortfall = int(shortfall_match.group(1) or shortfall_match.group(2))
-
-    order_id = "EV-402"
-    if "ev-405" in text:
-        order_id = "EV-405"
-
-    return DisruptionExtraction(
-        source_channel="WEB_DASHBOARD",
-        delay_hours=delay_hours,
-        line2_speed_pct=line2_speed,
-        line2_temp_celsius=temp_c,
-        shortfall_units=shortfall,
-        affected_order_id=order_id,
-        crisis_headline=f"Compound Crisis: NH48 Delay (+{delay_hours}h) + Line 2 Throttle ({line2_speed}%)",
-        raw_summary=raw_text[:200],
-    ), "regex-fallback"
+    return _regex_extract(raw_text, model, order_ids), "regex-fallback"
 
 
 # ─── 2. Blast-Radius SQL Query & Realtime State Updater ──────────────────────
