@@ -90,3 +90,8 @@ Real SME factories in Peenya, Hosur, or Ambattur cannot be connected via simple 
 ### Phase 4: Enterprise Compliance & Offline Failover (Month 7+)
 - ISO 27001 / SOC 2 certification.
 - Offline Edge Survival: If factory broadband drops, the Edge Box runs a local SQLite + quantized PuLP solver to continue mitigating line stoppages locally.
+
+---
+
+## 5. Delivered: Inventory-Based Shortfall (internal Phase 4, done)
+- Shortfall is now computed from stock, open purchase orders and order priority (migration 006) with Tally CSV importers; precedence is override > inventory > alert text > 422. Limited to one planning item per factory.

@@ -108,7 +108,7 @@ pip install -r requirements.txt
 
 # Configure environment variables
 cp .env.example .env
-# Edit .env: SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, GEMINI_API_KEY, CASCADE_API_KEY
+# Edit .env: SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, GEMINI_API_KEY, CASCADE_API_KEY (optional GEMINI_MODEL; the built-in default is `gemini-3.1-flash-lite`)
 
 # Start FastAPI server
 python -m app.main
@@ -137,14 +137,15 @@ Mobile Field Controller: `http://localhost:3000/mobile`
 Run `supabase/schema.sql`, then `supabase/migrations/001_rls_and_audit.sql` in the Supabase SQL editor.
 The migration enables Row-Level Security (browser = read-only) and adds approval audit columns.
 After it, backend writes require `SUPABASE_SERVICE_ROLE_KEY`.
-Then apply `002_sourcing_agent.sql`, `003_factory_model.sql`, `004_durable_state.sql` and `005_generic_disruptions.sql` in order.
+Then apply `002_sourcing_agent.sql`, `003_factory_model.sql`, `004_durable_state.sql`, `005_generic_disruptions.sql` and `006_inventory.sql` in order.
 `004_durable_state.sql` adds `analysis_runs`, `sourcing_sessions`, `execution_receipts`, `webhook_events`,
 the atomic `execute_plan_tx` function and a `schema_migrations` table.
-`005_generic_disruptions.sql` adds the `scenarios` table (preset disruptions per factory) and new `disruption_events` columns, and records `schema_migrations` level 5, which is now required.
+`005_generic_disruptions.sql` adds the `scenarios` table (preset disruptions per factory) and new `disruption_events` columns, and records `schema_migrations` level 5.
+`006_inventory.sql` adds `items`, `stock_levels`, `inbound_shipments`, `order_lines`, `orders.priority`, `factories.stock_item_code` and a nullable `scenarios.shortfall_units`, seeds the demo plant's inventory, and records level 6, which is now required. Its seed `UPDATE`s are guarded so a re-run does not overwrite edited data.
 
 Check it with `GET /healthz`, which returns
 `{"storage", "db", "migration_level", "required_migration_level", "ready"}` and HTTP 200 when ready,
-503 otherwise. The backend logs an error at startup if the database is below level 5 (production refuses to start).
+503 otherwise. The backend logs an error at startup if the database is below level 6 (production refuses to start).
 
 ### Storage modes
 
@@ -191,11 +192,42 @@ Unknown or ambiguous references, a missing shortfall, a line without a speed, a 
 - The WhatsApp status reply lists every non-normal line and every at-risk order. Vendor enquiries to flat-fee vendors ask for "a dedicated delivery ... for a flat fee".
 - MILP variables are named by index, so ids such as `L-B` and `L_B` cannot collide.
 
+## 📦 Inventory-Based Shortfall
+
+The shortfall is computed from the factory's inventory instead of being typed into the alert (migration `006_inventory.sql`; `backend/app/inventory.py`).
+
+```
+shortfall = max(0, demand − (on_hand + inbound_before_deadline − reserved_for_higher_priority))
+```
+
+- **demand**: the order's line quantity for the planning item (`order_lines`).
+- **on_hand**: `stock_levels` for that item.
+- **inbound_before_deadline**: quantity on `OPEN` inbound shipments whose ETA, shifted by the delay for the delayed supplier's shipments, falls within the order's `hours_remaining` (deadline boundary inclusive). An OPEN shipment whose original ETA has already passed is *overdue*: it has not arrived, so it is not counted (the explanation reports the overdue quantity).
+- **reserved_for_higher_priority**: line quantities of other unfinished orders that rank ahead, ranked by `(priority, hours_remaining, order_id)` (lower priority number wins; default 100).
+
+**Precedence:** explicit override (`override_shortfall_units` / slider) > inventory-computed > number stated in the alert text > **422**. The response's `extracted_parameters` carries `shortfall_source` (`override`, `inventory` or `alert_text`), the full `shortfall_breakdown` and, when inventory won over a different number in the alert, `alert_stated_shortfall`. Missing or malformed inventory data is rejected, not guessed.
+
+**Single planning item:** each factory names one `stock_item_code` (the demo plant: `CASING`); the shortfall is computed for that item only. Multi-item bills of material are not modelled.
+
+### Import endpoints
+
+All require the API key. Body `{"filename", "csv_content"}`; response `{success, filename, imported_count, errors, warnings}`. Valid rows are imported even when others fail (`errors` lists `{line, error}`; `warnings` lists skipped or caveated rows).
+
+| Endpoint | File |
+|---|---|
+| `POST /api/v1/ingest/stock-summary` | Tally stock summary (total rows skipped with a warning) |
+| `POST /api/v1/ingest/open-purchase-orders` | Open POs; overdue POs are imported with a warning, and a re-import never reopens a received PO |
+| `POST /api/v1/ingest/sales-order-lines` | Order lines per order and item |
+| `POST /api/v1/ingest/erp-csv` | Order upsert (required columns validated; updates never overwrite status or shortfall) |
+
+Tally header aliases, quantity formats (`1,20,000`, `500 Nos`, `500.00`) and IST dates (`20-Nov-2026`, date alone = 17:00 IST) are documented in [`samples/tally/README.md`](samples/tally/README.md), with sample files that reproduce the demo seed. The dashboard shows the shortfall explanation and its source, and has a CSV import picker.
+
 ## ✅ What Is Real vs Simulated
 
 | Component | Status |
 |---|---|
 | MILP allocation (vendors, per-line overtime, deadline feasibility, throughput gap computed from the factory's line data; disruption inputs are any per-line speeds, a delay and a shortfall) | Real (PuLP + HiGHS/CBC). Infeasible inputs are reported, not hidden |
+| Shortfall | Real when computed from inventory (stock, open POs, order lines, order priority) imported from Tally/Excel CSV or the seed; an override or the number in the alert text takes the other precedence paths and is labelled in the UI. Single planning item per factory; no multi-item BOM |
 | Plan ranking | Real: argmin of `cost + (1 − P_on_time) × SLA penalty` |
 | Monte Carlo on-time probability | Real, seeded; distributions are **assumptions** for the demo plant |
 | **Sourcing Agent** | Real agent loop: sends enquiries (not orders) to the vendors in a plan, reads replies (Gemini or regex, English/Hinglish), and re-plans with confirmed capacity/price/ETA, asking the next vendor when one declines, offers less, or times out (max 3 rounds). WhatsApp or simulated channel |
@@ -240,6 +272,8 @@ Sourcing sessions use optimistic concurrency (`version` column; 409 after 3 conf
 cascade0/
 ├── backend/
 │   ├── app/
+│   │   ├── inventory.py          # Inventory-based shortfall formula
+│   │   ├── importers.py          # Tally CSV parsers (stock, POs, order lines)
 │   │   ├── agents/
 │   │   │   ├── graph.py          # LangGraph 4-Agent Cyclic StateGraph
 │   │   │   └── tools.py          # SQL Blast-Radius, Vendor Memory & Gemini Extraction
@@ -270,6 +304,7 @@ cascade0/
 │   │   └── store/
 │   │       └── useFactoryStore.ts# Zustand Global Factory State & Realtime Sync
 │
+├── samples/tally/            # Sample Tally CSV exports + format guide
 ├── supabase/
 │   ├── schema.sql                # Tables & seed data
 │   └── migrations/               # Row-Level Security & audit columns
