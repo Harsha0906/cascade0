@@ -24,7 +24,7 @@ from app.db import (
     upsert_row,
 )
 from app.schemas import DisruptionExtraction, LineImpactExtraction
-from app.disruption import DisruptionResolutionError, ResolvedDisruption
+from app.disruption import DisruptionResolutionError, ResolvedDisruption, resolve_reference
 from app.factory_model import FactoryModel
 from app.solver import generate_playbooks
 
@@ -69,6 +69,11 @@ _SHORT_CUE_RES = (
     re.compile(r"\bshort(?!fall)\s*(?:by|of)?\s*(\d+)", re.I),
 )
 _SUPPLIER_DELAY_CUE_RE = re.compile(r"\b(?:delay(?:ed)?|late|blocked|stuck|held)\b", re.I)
+_LINE_MENTION_RE = re.compile(r"\bline[\s\-_]*([A-Za-z0-9]{1,6})\b", re.I)
+_ORDER_MENTION_RE = re.compile(r"(?:\border\b\s*#?|#)\s*([A-Za-z]{1,6}-?\d{1,6})\b", re.I)
+_ORDER_ON_RE = re.compile(r"\b(?:on|for)\s+([A-Za-z]{1,6}-\d{1,6})\b", re.I)
+_SUPPLIER_MENTION_RE = re.compile(
+    r"(?i:supplier|vendor)\s+([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,3})")
 _WINDOW_CHARS = 80
 _SUPPLIER_CUE_CHARS = 60
 
@@ -122,6 +127,22 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         tm = _TEMP_RE.search(window)
         if tm and temps[lid] is None and 0 < float(tm.group(1)) < 200:
             temps[lid] = float(tm.group(1))
+    # Line-shaped mentions that match no model line are emitted as-is so resolution fails loudly.
+    # A token must look like an identifier (has a digit, a single capital, or is all capitals) so
+    # that prose such as "line is down" or "line a bit slow" is not mistaken for a line.
+    mentions = [m for m in _LINE_MENTION_RE.finditer(text)]
+    for i, m in enumerate(mentions):
+        tok = m.group(1)
+        if any(m.start() < e and s0 < m.end() for s0, e, _ in kept):
+            continue
+        if not (any(c.isdigit() for c in tok) or (tok.isupper() and tok.isalpha())):
+            continue
+        stop = min(m.end() + _WINDOW_CHARS, mentions[i + 1].start() if i + 1 < len(mentions) else len(text))
+        sp = _SPEED_CUE_RE.search(text[m.end():stop])
+        speeds.setdefault(m.group(0).strip(), set())
+        temps.setdefault(m.group(0).strip(), None)
+        if sp:
+            speeds[m.group(0).strip()].add(int(sp.group(1) or sp.group(2)))
     impacts = [
         LineImpactExtraction(
             line=lid,
@@ -163,6 +184,31 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         mm = re.search(_mention_pattern(oid), text, re.I)
         if mm and (best is None or mm.start() < best):
             best, order = mm.start(), oid
+
+    # Order- or supplier-shaped mentions that match nothing known are emitted (fail loud).
+    known_orders = {re.sub(r"[^a-z0-9]", "", o.lower()) for o in order_ids}
+    other_ids = {re.sub(r"[^a-z0-9]", "", i.lower())
+                 for i in [l.line_id for l in model.lines] + [sid for sid, _ in candidates]}
+    for mm in [*_ORDER_MENTION_RE.finditer(text), *_ORDER_ON_RE.finditer(text)]:
+        norm = re.sub(r"[^a-z0-9]", "", mm.group(1).lower())
+        if norm not in known_orders and norm not in other_ids:
+            order = mm.group(1)
+            break
+
+    names = {sid: nm for sid, nm in candidates}
+    for mm in _SUPPLIER_MENTION_RE.finditer(text):
+        words = mm.group(1).split()
+        resolved = False
+        for n in range(len(words), 0, -1):
+            try:
+                resolve_reference(" ".join(words[:n]), names, "supplier")
+                resolved = True
+                break
+            except DisruptionResolutionError:
+                continue
+        if not resolved:
+            supplier = mm.group(1)
+            break
 
     return DisruptionExtraction(
         delay_hours=delay_hours,
@@ -241,7 +287,7 @@ def query_blast_radius_sql(model: FactoryModel, disruption: ResolvedDisruption) 
         raise DisruptionResolutionError(f"Unknown order '{disruption.order_id}'")
     delay = disruption.delay_hours
 
-    if disruption.supplier_id:
+    if disruption.supplier_id and delay > 0:
         update_rows("suppliers", "id", disruption.supplier_id, {
             "status": "DELAYED",
             "delay_hours": delay,

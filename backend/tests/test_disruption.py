@@ -358,16 +358,47 @@ class PipelineTests(unittest.TestCase):
     def test_unknown_reference_writes_nothing(self):
         from app.agents.graph import run_cascade_pipeline
         before = self._snapshot()
-        # The regex extractor never emits a line it cannot match, so an unknown reference reaches
-        # resolution only from an LLM extraction; simulate that.
+        with self.assertRaises(DisruptionResolutionError):
+            run_cascade_pipeline("Line 9 at 40%, 80 units short on EV-402")
+        self.assertEqual(self._snapshot(), before)
+
+    def test_unknown_reference_gemini_path_writes_nothing(self):
+        from unittest import mock
+        from app.agents.graph import run_cascade_pipeline
+        before = self._snapshot()
         bad = DisruptionExtraction(
             affected_lines=[LineImpactExtraction(line="Line 9", speed_pct=40)],
             affected_order="EV-402", shortfall_units=80)
-        from unittest import mock
         with mock.patch("app.agents.graph.extract_disruption_entities", return_value=(bad, "gemini")):
             with self.assertRaises(DisruptionResolutionError):
-                run_cascade_pipeline("Line 9 at 40%, 80 units short on EV-402")
+                run_cascade_pipeline("x")
         self.assertEqual(self._snapshot(), before)
+
+    def test_unknown_order_on_single_order_factory(self):
+        from app.agents.graph import run_cascade_pipeline
+        seed_second_factory()
+        before = self._snapshot()
+        with self.assertRaises(DisruptionResolutionError) as cm:
+            run_cascade_pipeline("L-B at 40%, 80 units short on WO-99", factory_id="test-plant")
+        self.assertIn("WO-77", str(cm.exception))
+        self.assertEqual(self._snapshot(), before)
+
+    def test_unknown_supplier_fails(self):
+        from app.agents.graph import run_cascade_pipeline
+        seed_second_factory()
+        before = self._snapshot()
+        with self.assertRaises(DisruptionResolutionError) as cm:
+            run_cascade_pipeline("L-B at 40%, 80 units short on WO-77, 5h delay from supplier Mumbai Castings",
+                                 factory_id="test-plant")
+        self.assertIn("Unknown supplier", str(cm.exception))
+        self.assertEqual(self._snapshot(), before)
+
+    def test_generic_prose_not_flagged(self):
+        from app.agents.tools import extract_disruption_entities
+        m = small_factory()
+        e = extract_disruption_entities("our vendor team says line is down, 80 units short on WO-77", m, ["WO-77"])[0]
+        self.assertEqual(e.affected_lines, [])
+        self.assertIsNone(e.affected_supplier)
 
     def test_multi_line_disruption(self):
         from app.agents.graph import run_cascade_pipeline
