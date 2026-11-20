@@ -88,7 +88,8 @@ export function TopKpiBar() {
           ok: !(data.errors?.length),
           summary: `Imported ${data.imported_count ?? 0} row(s); ${data.errors?.length ?? 0} error(s), ${data.warnings?.length ?? 0} warning(s).`,
           errors: (data.errors ?? []).map((x: { line: number; error: string }) => `Line ${x.line}: ${x.error}`),
-          warnings: (data.warnings ?? []).map((x: { line: number; warning: string }) => `Line ${x.line}: ${x.warning}`),
+          warnings: (data.warnings ?? []).map((x: { line: number | null; warning: string }) =>
+            x.line == null ? x.warning : `Line ${x.line}: ${x.warning}`),
         });
       }
     } catch {

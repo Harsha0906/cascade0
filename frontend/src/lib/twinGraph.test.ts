@@ -194,6 +194,16 @@ describe("shortfallText", () => {
       }),
     ).toBe("E (alert said 200; not used)");
   });
+  it("does not mention an alert number equal to the computed shortfall", () => {
+    expect(
+      shortfallText({
+        shortfall_units: 150,
+        shortfall_source: "inventory",
+        shortfall_breakdown: { explanation: "E" },
+        alert_stated_shortfall: 150,
+      }),
+    ).toBe("E");
+  });
   it("describes a manual override", () => {
     expect(shortfallText({ shortfall_units: 120, shortfall_source: "override" })).toBe("120 short (set manually)");
   });

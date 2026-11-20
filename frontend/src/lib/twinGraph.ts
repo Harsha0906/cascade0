@@ -211,7 +211,10 @@ export interface ShortfallParams {
 export function shortfallText(p: ShortfallParams): string {
   if (p.shortfall_source === "inventory") {
     const base = p.shortfall_breakdown?.explanation ?? `${p.shortfall_units} short (from inventory)`;
-    return p.alert_stated_shortfall != null ? `${base} (alert said ${p.alert_stated_shortfall}; not used)` : base;
+    // Mention the alert's own number only when it differs from what inventory gives.
+    return p.alert_stated_shortfall != null && p.alert_stated_shortfall !== p.shortfall_units
+      ? `${base} (alert said ${p.alert_stated_shortfall}; not used)`
+      : base;
   }
   if (p.shortfall_source === "override") return `${p.shortfall_units} short (set manually)`;
   return `${p.shortfall_units} short (from the alert; no inventory data for this order)`;
