@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from app.config import settings
 from app.db import (
@@ -32,45 +32,68 @@ logger = logging.getLogger("cascadezero.tools")
 
 # ─── 1. Disruption Entity Extraction (Gemini Structured Outputs) ─────────────
 
+def _single_char_tail(chunks: list[str]) -> str:
+    """Join chunks; a final single LETTER must match as an uppercase letter (not 'la la', 'line a bit')."""
+    esc = [re.escape(c) for c in chunks]
+    if len(chunks[-1]) == 1 and chunks[-1].isalpha():
+        esc[-1] = rf"(?-i:{re.escape(chunks[-1].upper())})"
+    return esc
+
+
 def _mention_pattern(ident: str) -> str:
     """Regex for an id like 'LINE-2' with flexible separators ('line 2', 'Line-2', 'line2')."""
     chunks = re.findall(r"[A-Za-z0-9]+", ident)
-    body = r"[\s\-_]?".join(re.escape(c) for c in chunks)
+    body = r"[\s\-_]?".join(_single_char_tail(chunks))
     return rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])"
 
 
 def _name_pattern(name: str) -> str:
-    words = name.split()
-    body = r"\s+".join(re.escape(w) for w in words)
+    words = [re.sub(r"[^A-Za-z0-9]", "", w) or w for w in name.split()]
+    body = r"\s+".join(_single_char_tail(words))
     return rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])"
 
 
 _TEMP_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:°\s*c\b|deg(?:rees)?\b|celsius\b|c\b)", re.I)
-_SPEED_RE = re.compile(r"(\d{1,3})\s*%")
+_SPEED_CUE_RE = re.compile(
+    r"\b(?:at|to)\s*(\d{1,3})\s*%(?!\s*of\b)|(\d{1,3})\s*%\s*(?:speed|capacity)\b", re.I)
+_HOURS = r"(?:h|hr|hrs|hours?)\b"
+_DELAY_CUE_RES = (
+    re.compile(rf"(\d+)\s*{_HOURS}\s*(?:of\s+)?delay", re.I),
+    re.compile(rf"delay(?:ed)?\s*(?:by|of|:)?\s*(\d+)\s*{_HOURS}", re.I),
+    re.compile(rf"\+\s*(\d+)\s*{_HOURS}", re.I),
+)
+_SHORT_CUE_RES = (
+    re.compile(r"\b(?:shortfall|deficit|missing)\s*(?:is|of|:)?\s*(\d+)", re.I),
+    re.compile(r"\b(\d+)\s*(?:[A-Za-z]+\s+){0,3}?(?:short|missing)\b", re.I),
+    re.compile(r"\bshort(?!fall)\s*(?:by|of)?\s*(\d+)", re.I),
+)
+_SUPPLIER_DELAY_CUE_RE = re.compile(r"\b(?:delay(?:ed)?|late|blocked|stuck|held)\b", re.I)
 _WINDOW_CHARS = 80
+_SUPPLIER_CUE_CHARS = 60
+
+
+def _cue_values(regexes, text: str) -> set:
+    return {int(g) for rx in regexes for m in rx.finditer(text) for g in m.groups() if g}
 
 
 def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str]) -> DisruptionExtraction:
     text = raw_text
 
-    delay_hours = None
-    m = re.search(r"(\d+)\s*(?:h|hr|hrs|hour|hours)\b", text, re.I)
-    if m:
-        delay_hours = int(m.group(1))
+    # Delay: a number bound to a delay cue; else the only hours number; else unknown.
+    vals = _cue_values(_DELAY_CUE_RES, text)
+    if not vals:
+        vals = {int(x) for x in re.findall(rf"(\d+)\s*{_HOURS}", text, re.I)}
+    delay_hours = next(iter(vals)) if len(vals) == 1 else None
 
-    shortfall = None
-    item_words = re.findall(r"[A-Za-z]+", model.stock_item_name or "")
-    units = [r"battery\s+casings", r"casings", r"units", r"u\b"]
-    if item_words:
-        last = re.escape(item_words[-1])
-        units.append(rf"{last}s?\b")
-    m = re.search(
-        r"(?:shortfall\s+(?:is|of)\s*(\d+)|\b(\d+)\s*(?:" + "|".join(units) + r"))",
-        text,
-        re.I,
-    )
-    if m:
-        shortfall = int(m.group(1) or m.group(2))
+    # Shortfall: a number bound to a shortfall cue; else the only units-count number; else unknown.
+    vals = _cue_values(_SHORT_CUE_RES, text)
+    if not vals:
+        item_words = re.findall(r"[A-Za-z]+", model.stock_item_name or "")
+        units = [r"battery\s+casings", r"casings", r"units", r"pcs", r"u\b"]
+        if item_words:
+            units.append(rf"{re.escape(item_words[-1])}s?\b")
+        vals = {int(x) for x in re.findall(r"\b(\d+)\s*(?:" + "|".join(units) + r")", text, re.I)}
+    shortfall = next(iter(vals)) if len(vals) == 1 else None
 
     # Line mentions (id or full name), overlapping spans collapsed to the earliest/longest.
     spans = []
@@ -85,36 +108,53 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
             continue
         kept.append(s)
 
-    impacts: dict[str, LineImpactExtraction] = {}
+    speeds: dict[str, set] = {}
+    temps: dict[str, Optional[float]] = {}
     for i, (_, end, lid) in enumerate(kept):
         stop = min(end + _WINDOW_CHARS, kept[i + 1][0] if i + 1 < len(kept) else len(text))
         window = text[end:stop]
-        sp = _SPEED_RE.search(window)
+        speeds.setdefault(lid, set())
+        temps.setdefault(lid, None)
+        sp = _SPEED_CUE_RE.search(window)
+        if sp:
+            speeds[lid].add(int(sp.group(1) or sp.group(2)))
         tm = _TEMP_RE.search(window)
-        temp = float(tm.group(1)) if tm and 0 < float(tm.group(1)) < 200 else None
-        cur = impacts.get(lid)
-        if cur is None:
-            impacts[lid] = LineImpactExtraction(
-                line=lid, speed_pct=int(sp.group(1)) if sp else None, temp_celsius=temp)
-        else:
-            if cur.speed_pct is None and sp:
-                cur.speed_pct = int(sp.group(1))
-            if cur.temp_celsius is None:
-                cur.temp_celsius = temp
+        if tm and temps[lid] is None and 0 < float(tm.group(1)) < 200:
+            temps[lid] = float(tm.group(1))
+    impacts = [
+        LineImpactExtraction(
+            line=lid,
+            speed_pct=next(iter(sv)) if len(sv) == 1 else None,
+            temp_celsius=temps[lid],
+        )
+        for lid, sv in speeds.items()
+    ]
 
-    # Supplier: earliest mention of an id or of a >=2-word name prefix.
-    supplier = None
-    best = None
+    # Supplier: a single mentioned supplier wins; with several, the one clearly nearest a delay cue.
+    mentioned: dict[str, tuple[int, int]] = {}
     candidates = list(model.primary_suppliers) + [(v.supplier_id, v.name) for v in model.vendors]
     for sid, name in candidates:
         pats = [_mention_pattern(sid)]
         words = name.split(" (")[0].split()
         for n in range(len(words), 1, -1):
             pats.append(_name_pattern(" ".join(words[:n])))
-        for pat in pats:
-            mm = re.search(pat, text, re.I)
-            if mm and (best is None or mm.start() < best):
-                best, supplier = mm.start(), sid
+        found = [m for pat in pats for m in re.finditer(pat, text, re.I)]
+        if found:
+            m0 = min(found, key=lambda m: m.start())
+            mentioned[sid] = (m0.start(), max(m.end() for m in found if m.start() == m0.start()))
+    supplier = None
+    if len(mentioned) == 1:
+        supplier = next(iter(mentioned))
+    elif len(mentioned) > 1:
+        cues = [(c.start(), c.end()) for c in _SUPPLIER_DELAY_CUE_RE.finditer(text)]
+        dist = {}
+        for sid, (st, en) in mentioned.items():
+            ds = [max(cs - en, st - ce, 0) for cs, ce in cues]
+            if ds and min(ds) <= _SUPPLIER_CUE_CHARS:
+                dist[sid] = min(ds)
+        ranked = sorted(dist.items(), key=lambda kv: kv[1])
+        if ranked and (len(ranked) == 1 or ranked[0][1] < ranked[1][1]):
+            supplier = ranked[0][0]
 
     order = None
     best = None
@@ -125,7 +165,7 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
 
     return DisruptionExtraction(
         delay_hours=delay_hours,
-        affected_lines=list(impacts.values()),
+        affected_lines=impacts,
         affected_supplier=supplier,
         affected_order=order,
         shortfall_units=shortfall,

@@ -258,5 +258,73 @@ class ExtractionTests(unittest.TestCase):
         self.assertIn("shortfall_units not stated", str(cm.exception))
 
 
+class ExtractionHazardTests(unittest.TestCase):
+    def setUp(self):
+        from app.agents.tools import extract_disruption_entities
+        self.extract = extract_disruption_entities
+        self.model = load_factory_model()
+        self.orders = ["EV-402", "EV-405"]
+
+    def ext(self, text, model=None, orders=None):
+        return self.extract(text, model or self.model, orders or self.orders)[0]
+
+    def speeds(self, e):
+        return [(l.line, l.speed_pct) for l in e.affected_lines]
+
+    def test_shortfall_cue_beats_leftmost(self):
+        self.assertEqual(self.ext("500 casings delayed, shortfall 150").shortfall_units, 150)
+        self.assertEqual(self.ext("3 units of scrap, 150 casings short on EV-402").shortfall_units, 150)
+
+    def test_shortfall_ambiguous_units_is_none(self):
+        self.assertIsNone(self.ext("500 casings delayed and 20 units scrapped").shortfall_units)
+
+    def test_shortfall_single_units_number_ok(self):
+        self.assertEqual(self.ext("lost 90 units on EV-402").shortfall_units, 90)
+
+    def test_delay_cue_beats_first(self):
+        e = self.ext("shipment in 3 hours ... 12 hour delay")
+        self.assertEqual(e.delay_hours, 12)
+
+    def test_delay_ambiguous_is_none(self):
+        self.assertIsNone(self.ext("truck left 3 hours ago, ETA 12 hours").delay_hours)
+
+    def test_speed_needs_cue(self):
+        e = self.ext("Line 2 is down, 50% of the shipment lost, Line 2 at 30%, 10 units short")
+        self.assertEqual(self.speeds(e), [("LINE-2", 30)])
+        e = self.ext("Line 2 down. Quality up 50%, 10 units short")
+        self.assertEqual(self.speeds(e), [("LINE-2", None)])
+
+    def test_speed_conflict_is_none(self):
+        e = self.ext("Line 2 at 50%. Line 2 at 30%. 10 units short")
+        self.assertEqual(self.speeds(e), [("LINE-2", None)])
+
+    def test_phantom_line_ids(self):
+        m = small_factory()
+        e = self.ext("la la 80 units short on WO-77", m, ["WO-77"])
+        self.assertEqual(e.affected_lines, [])
+        e = self.ext("line a bit slow, 80 units short on WO-77", m, ["WO-77"])
+        self.assertEqual(e.affected_lines, [])
+        e = self.ext("Line A at 40%, 80 units short on WO-77", m, ["WO-77"])
+        self.assertEqual(self.speeds(e), [("L-A", 40)])
+
+    def test_supplier_near_delay_cue(self):
+        e = self.ext("Hosur Precision Castings on standby; Chennai Precision Casings delayed 20 hours")
+        self.assertEqual(e.affected_supplier, "SUP-CHN-01")
+
+    def test_supplier_ambiguous_is_none(self):
+        e = self.ext("Chennai Precision Casings and Hosur Precision Castings both mentioned")
+        self.assertIsNone(e.affected_supplier)
+
+    def test_presets(self):
+        from app.main import SCENARIO_PROMPTS
+        exp = {1: (50, 48, 150), 2: (85, 6, 25), 3: (25, 72, 350)}
+        for k, (sp, d, sf) in exp.items():
+            e = self.ext(SCENARIO_PROMPTS[k])
+            self.assertEqual(self.speeds(e), [("LINE-2", sp)], k)
+            self.assertEqual((e.delay_hours, e.shortfall_units, e.affected_order), (d, sf, "EV-402"), k)
+            if k != 2:
+                self.assertEqual(e.affected_supplier, "SUP-CHN-01", k)
+
+
 if __name__ == "__main__":
     unittest.main()
