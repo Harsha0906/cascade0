@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { Edge, Node } from "@xyflow/react";
 import { subscribeToTable } from "@/lib/supabase";
-import { buildTwinGraph, type FactoryInfo, type Scenario } from "@/lib/twinGraph";
+import { buildTwinGraph, type FactoryInfo, type Scenario, type ShortfallParams } from "@/lib/twinGraph";
 
 export type { FactoryInfo, Scenario };
 
@@ -200,6 +200,8 @@ interface FactoryState {
   scenariosError: string | null;
   scenarios: Scenario[];
   activeOrderId: string | null;
+  /** Shortfall provenance fields from the last simulation run. */
+  shortfallInfo: ShortfallParams | null;
 
   // Actions
   fetchInitialState: () => Promise<void>;
@@ -310,6 +312,14 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
         selectedPlaybookId: data.recommended_plan_id || null,
         activeRunId: data.run_id,
         activeOrderId: data.extracted_parameters?.affected_order_id ?? null,
+        shortfallInfo: data.extracted_parameters?.shortfall_source
+          ? {
+              shortfall_units: data.extracted_parameters.shortfall_units ?? 0,
+              shortfall_source: data.extracted_parameters.shortfall_source,
+              shortfall_breakdown: data.extracted_parameters.shortfall_breakdown ?? null,
+              alert_stated_shortfall: data.extracted_parameters.alert_stated_shortfall ?? null,
+            }
+          : null,
         solveDurationMs: sr.solve_duration_ms ?? 0,
         rebuttalOccurred: !!data.rebuttal_occurred,
         rebuttalNotes: data.rebuttal_notes || [],
@@ -366,6 +376,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
   scenariosError: null,
   scenarios: [],
   activeOrderId: null,
+  shortfallInfo: null,
 
   fetchInitialState: async () => {
     try {
@@ -552,6 +563,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
         selectedPlaybookId: null,
         activeRunId: null,
         activeOrderId: null,
+        shortfallInfo: null,
         executionReceipt: null,
         agentLogs: [],
         isInspectionDrawerOpen: false,

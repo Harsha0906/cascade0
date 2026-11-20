@@ -2,7 +2,7 @@
 
 import React from "react";
 import { useFactoryStore } from "@/store/useFactoryStore";
-import { focusOrder, ordersSummary, throttledLinesText } from "@/lib/twinGraph";
+import { focusOrder, ordersSummary, shortfallText, throttledLinesText } from "@/lib/twinGraph";
 import { AiModeBadge } from "@/components/AiModeBadge";
 import { SourcingPanel } from "@/components/SourcingPanel";
 import {
@@ -43,6 +43,7 @@ export function ExecutiveStoryView() {
     executionReceipt,
     openReceiptModal,
     activeOrderId,
+    shortfallInfo,
     factory,
     factoryName,
   } = useFactoryStore();
@@ -134,6 +135,11 @@ export function ExecutiveStoryView() {
                   ? `${selectedPlan.id} approved: ${lakh(selectedPlan.total_mitigation_cost_inr)} spend, modelled on-time probability ${selectedPlan.confidence_pct}%. Delivery is not guaranteed until suppliers confirm.`
                   : "Run a scenario or paste a disruption alert to get ranked recovery plans. Telemetry in this demo is simulated."}
               </p>
+              {isCrisis && shortfallInfo && (
+                <p className="text-xs font-mono text-charcoal-600 mt-1.5" data-testid="shortfall-explanation">
+                  Shortfall: {shortfallText(shortfallInfo)}
+                </p>
+              )}
             </div>
           </div>
 

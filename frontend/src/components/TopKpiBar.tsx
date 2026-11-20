@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useRef } from "react";
+import React, { useRef, useState } from "react";
 import { useFactoryStore } from "@/store/useFactoryStore";
 import { focusOrder } from "@/lib/twinGraph";
 import {
@@ -14,6 +14,21 @@ import {
   Upload,
   Zap,
 } from "lucide-react";
+
+const IMPORT_KINDS = [
+  { label: "Orders (erp-csv)", path: "/api/v1/ingest/erp-csv" },
+  { label: "Stock summary", path: "/api/v1/ingest/stock-summary" },
+  { label: "Open purchase orders", path: "/api/v1/ingest/open-purchase-orders" },
+  { label: "Sales order lines", path: "/api/v1/ingest/sales-order-lines" },
+] as const;
+type ImportKind = (typeof IMPORT_KINDS)[number];
+interface ImportResult {
+  title: string;
+  ok: boolean;
+  summary: string;
+  errors: string[];
+  warnings: string[];
+}
 
 export function TopKpiBar() {
   const {
@@ -42,29 +57,44 @@ export function TopKpiBar() {
   const isCrisis = statusMode === "CRISIS";
   const isProtected = statusMode === "PROTECTED";
 
+  const [importKind, setImportKind] = useState<ImportKind>(IMPORT_KINDS[0]);
+  const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const [importResult, setImportResult] = useState<ImportResult | null>(null);
+
   const handleCsvUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
     if (!file) return;
     const text = await file.text();
     const API_BASE = typeof window !== "undefined" ? "" : (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000");
     try {
-      const res = await fetch(`${API_BASE}/api/v1/ingest/erp-csv`, {
+      const res = await fetch(`${API_BASE}${importKind.path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filename: file.name, csv_content: text }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        alert(`⚠️ Import failed: ${data.detail || `HTTP ${res.status}`}`);
-      } else if (data.errors?.length) {
-        alert(`⚠️ Imported ${data.imported_count} orders; ${data.errors.length} rows rejected (first: line ${data.errors[0].line} — ${data.errors[0].error}).`);
+        setImportResult({
+          title: `Import failed: ${file.name}`,
+          ok: false,
+          summary: String(data.detail || `HTTP ${res.status}`),
+          errors: [],
+          warnings: [],
+        });
       } else {
-        alert(`✅ Imported ${data.imported_count} orders from "${file.name}".`);
+        setImportResult({
+          title: `${importKind.label}: ${file.name}`,
+          ok: !(data.errors?.length),
+          summary: `Imported ${data.imported_count ?? 0} row(s); ${data.errors?.length ?? 0} error(s), ${data.warnings?.length ?? 0} warning(s).`,
+          errors: (data.errors ?? []).map((x: { line: number; error: string }) => `Line ${x.line}: ${x.error}`),
+          warnings: (data.warnings ?? []).map((x: { line: number; warning: string }) => `Line ${x.line}: ${x.warning}`),
+        });
       }
     } catch {
-      alert("⚠️ Could not reach the backend.");
+      setImportResult({ title: "Import failed", ok: false, summary: "Could not reach the backend.", errors: [], warnings: [] });
     } finally {
-      e.target.value = "";
+      input.value = "";
     }
   };
 
@@ -217,14 +247,36 @@ export function TopKpiBar() {
             className="hidden"
           />
 
-          {/* Action: Upload ERP CSV Circular Button */}
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            title="Upload Legacy Tally / Excel ERP CSV"
-            className="w-9 h-9 rounded-full bg-white/40 hover:bg-white/60 border border-white/50 text-charcoal-800 flex items-center justify-center transition-all active:scale-95"
-          >
-            <Upload className="w-4 h-4" />
-          </button>
+          {/* Action: import CSV (pick the file type first) */}
+          <div className="relative">
+            <button
+              onClick={() => setImportMenuOpen((o) => !o)}
+              title="Import a Tally / Excel CSV"
+              aria-haspopup="menu"
+              aria-expanded={importMenuOpen}
+              className="w-9 h-9 rounded-full bg-white/40 hover:bg-white/60 border border-white/50 text-charcoal-800 flex items-center justify-center transition-all active:scale-95"
+            >
+              <Upload className="w-4 h-4" />
+            </button>
+            {importMenuOpen && (
+              <div role="menu" className="absolute right-0 mt-2 w-56 z-40 rounded-2xl bg-white border border-charcoal-900/10 shadow-xl p-1.5">
+                {IMPORT_KINDS.map((k) => (
+                  <button
+                    key={k.path}
+                    role="menuitem"
+                    onClick={() => {
+                      setImportKind(k);
+                      setImportMenuOpen(false);
+                      fileInputRef.current?.click();
+                    }}
+                    className="w-full text-left px-3 py-2 rounded-xl text-xs font-mono font-bold text-charcoal-900 hover:bg-acid/30"
+                  >
+                    {k.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
 
           {/* Action: Reset Demo Circular Button */}
           <button
@@ -236,6 +288,44 @@ export function TopKpiBar() {
           </button>
         </div>
       </div>
+      {importResult && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-charcoal-950/50"
+          onClick={() => setImportResult(null)}
+        >
+          <div
+            role="dialog"
+            aria-label="Import result"
+            className="w-full max-w-lg max-h-[80vh] overflow-y-auto bg-white rounded-2xl p-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className={`text-sm font-extrabold ${importResult.ok ? "text-emerald-700" : "text-coral"}`}>
+              {importResult.title}
+            </h3>
+            <p className="text-xs font-mono text-charcoal-800 mt-1">{importResult.summary}</p>
+            {importResult.errors.length > 0 && (
+              <ul data-testid="import-errors" className="mt-3 space-y-1 text-[11px] font-mono text-coral">
+                {importResult.errors.map((m, i) => (
+                  <li key={i}>{m}</li>
+                ))}
+              </ul>
+            )}
+            {importResult.warnings.length > 0 && (
+              <ul data-testid="import-warnings" className="mt-3 space-y-1 text-[11px] font-mono text-amber-700">
+                {importResult.warnings.map((m, i) => (
+                  <li key={i}>{m}</li>
+                ))}
+              </ul>
+            )}
+            <button
+              onClick={() => setImportResult(null)}
+              className="mt-4 px-4 py-2 rounded-full bg-charcoal-900 text-white text-xs font-mono font-bold"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
     </header>
   );
 }
