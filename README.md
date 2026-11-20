@@ -222,11 +222,11 @@ The shortfall never exceeds the order's own demand: when higher-priority orders 
 All require the API key. Body `{"filename", "csv_content"}`; response `{success, filename, imported_count, errors, warnings}`. Valid rows are imported even when others fail (`errors` lists `{line, error}`; `warnings` lists skipped or caveated rows).
 
 **Each inventory file is a full snapshot**, so re-import the whole export each time:
-- stock summary: an item not in the file has its stock row removed;
+- stock summary: an item of the factory not in the file is set to stock 0 (Tally hides zero-balance items);
 - open purchase orders: an OPEN PO not in the file is marked `CLOSED` (received or cancelled), so a received PO is never counted both in stock and as inbound;
 - sales order lines: the file replaces all lines of each order it lists.
 
-Every removal or closure is listed in `warnings` (with `line: null`). Rows with errors are left unchanged, and a file whose header cannot be read changes nothing.
+Every zeroing, removal or closure is listed in `warnings` (with `line: null`). Rows with errors are left unchanged, and a file whose header cannot be read changes nothing.
 
 | Endpoint | File |
 |---|---|

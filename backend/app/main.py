@@ -706,23 +706,26 @@ def _snapshot_warning(text: str) -> Dict[str, Any]:
 def ingest_stock_summary(payload: ErpCsvSyncRequest):
     """Replace on-hand stock from a Tally Stock Summary export (creates items with new codes).
 
-    The file is a full snapshot of the factory's stock: an item it does not mention has its
-    stock row removed (reported in warnings). An item on a row with an error is left unchanged.
+    The file is a full snapshot of the factory's stock: an item of the factory it does not mention
+    is set to on_hand_qty 0 (Tally hides zero-balance items; reported in warnings). An item on a
+    row with an error is left unchanged.
     """
     _require_csv(payload)
     factory_id = settings.DEFAULT_FACTORY_ID
     result = importers.parse_stock_summary(payload.csv_content, factory_id, _factory_item_codes(factory_id))
-    before = set(db.get_stock_levels(factory_id)) if result.header_ok else set()
+    # Every item of the factory (with or without a stock row) is covered by the snapshot.
+    before = (_factory_item_codes(factory_id) | set(db.get_stock_levels(factory_id))
+              if result.header_ok else set())
     now = datetime.now(timezone.utc).isoformat()
     for item in result.items:
         upsert_row("items", item, key_columns=("factory_id", "item_code"))
     for row in result.rows:
         upsert_row("stock_levels", {**row, "as_of": now}, key_columns=("factory_id", "item_code"))
+    # Tally's Stock Summary hides zero-balance items, so an item missing from the snapshot ran out.
     for code in sorted(before - result.mentioned):
-        db.delete_rows_where("stock_levels", {"factory_id": factory_id, "item_code": code})
-        result.warnings.append(_snapshot_warning(
-            f"item {code} is not in this stock summary: its stock row was removed "
-            f"(each file is a full snapshot)"))
+        upsert_row("stock_levels", {"factory_id": factory_id, "item_code": code, "on_hand_qty": 0, "as_of": now},
+                   key_columns=("factory_id", "item_code"))
+        result.warnings.append(_snapshot_warning(f"{code} not in file — stock set to 0"))
     return _import_response(payload, result)
 
 

@@ -18,11 +18,11 @@ Export the whole report every time, not just the changes. An import replaces wha
 
 | File | What a missing row means |
 | --- | --- |
-| Stock summary | The item's stock row is **removed** (Tally hides zero-balance items, so a missing item usually ran out). The shortfall check then reports "no stock record" for it instead of using an old number. |
+| Stock summary | The item's stock is **set to 0** (Tally hides zero-balance items, so a missing item ran out), with the warning "ITEM not in file — stock set to 0". The shortfall check then uses 0, not an old number. |
 | Open purchase orders | An OPEN PO that is not in the file is marked **CLOSED** (received or cancelled) and no longer counted as inbound. This stops a received PO from being counted twice: once in stock and once as inbound. |
 | Sales order lines | For each order the file lists, the file replaces all of that order's lines: a line of that order not in the file is **removed**. Orders the file does not list are untouched. |
 
-Every removal or closure is listed in `warnings`. A row with an error is left as it was (it is not removed),
+Every zeroing, removal or closure is listed in `warnings`. A row with an error is left as it was (it is not changed),
 and a file whose header cannot be read changes nothing.
 
 ## Columns (case-insensitive; any alias works)

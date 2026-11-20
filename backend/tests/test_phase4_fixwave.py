@@ -60,11 +60,14 @@ class _Api(unittest.TestCase):
 # ─── I1: imports are snapshots ───────────────────────────────────────────────
 
 class SnapshotImportTests(_Api):
-    def test_stock_summary_deletes_items_absent_from_file(self):
+    def test_stock_summary_sets_items_absent_from_file_to_zero(self):
+        """Tally hides zero-balance items: an absent item ran out, so its stock becomes 0."""
         r = self.post("stock-summary", "Item Code,Item Name,Closing Quantity\nBOLT,M8 Bolt,40\n")
         self.assertEqual(r["errors"], [])
-        self.assertEqual(db.get_stock_levels(FACTORY), {"BOLT": 40})
-        self.assertTrue(any("CASING" in w["warning"] for w in r["warnings"]))
+        self.assertEqual(db.get_stock_levels(FACTORY), {"CASING": 0, "BOLT": 40})
+        self.assertIn({"line": None, "warning": "CASING not in file — stock set to 0"}, r["warnings"])
+        run = run_cascade_pipeline("Chennai shipment delayed 48h, order EV-402")
+        self.assertEqual(run["shortfall_breakdown"]["on_hand"], 0)
 
     def test_stock_row_with_error_is_kept_not_deleted(self):
         r = self.post("stock-summary", "Item Code,Item Name,Closing Quantity\nCASING,x,12a\nBOLT,M8 Bolt,40\n")
