@@ -8,6 +8,9 @@ CascadeZero — FastAPI server
   POST /api/v1/webhooks/whatsapp           Meta (HMAC-verified) / Twilio webhook
   POST /api/v1/ingest/plc-telemetry        line telemetry (HTTP JSON, simulated) [API key]
   POST /api/v1/ingest/erp-csv              Tally/Excel CSV order upsert          [API key]
+  POST /api/v1/ingest/stock-summary        Tally stock summary CSV               [API key]
+  POST /api/v1/ingest/open-purchase-orders open purchase orders CSV              [API key]
+  POST /api/v1/ingest/sales-order-lines    sales order lines CSV                 [API key]
   POST /api/v1/ingest/live-highway-check   weather check (labelled when offline)
   POST /api/v1/execute-plan                execute a server-computed playbook    [API key]
   POST /api/v1/sourcing/start              Sourcing Agent: send vendor enquiries [API key]
@@ -41,7 +44,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import run_store
+from app import importers, run_store
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
 from app import db
@@ -582,9 +585,12 @@ def ingest_plc_telemetry(telemetry: PlcTelemetryRequest):
 
 # ─── 5. ERP CSV sync ─────────────────────────────────────────────────────────
 
-def _int_field(row: Dict[str, str], key: str, default: int) -> int:
+def _int_field(row: Dict[str, str], key: str, default: Optional[int] = None) -> int:
+    """Parse a non-negative integer column. With no default the column is required."""
     raw = (row.get(key) or "").replace(",", "").strip()
     if not raw:
+        if default is None:
+            raise ValueError(f"{key} is required")
         return default
     number = float(raw)  # ValueError for non-numeric text
     if not math.isfinite(number) or number < 0 or number > 10**12:
@@ -594,7 +600,12 @@ def _int_field(row: Dict[str, str], key: str, default: int) -> int:
 
 @app.post("/api/v1/ingest/erp-csv", dependencies=[Depends(require_api_key)])
 def ingest_erp_csv(payload: ErpCsvSyncRequest):
-    """Upsert orders from a Tally/Excel CSV export. New orders are inserted, existing ones updated."""
+    """Upsert orders from a Tally/Excel CSV export. New orders are inserted, existing ones updated.
+
+    required_qty and sla_penalty_inr are always required; partial_delay_penalty_inr and
+    hours_remaining are required for a new order (an existing order keeps its value when the
+    column is blank). Updates never overwrite the order's status or shortfall_units.
+    """
     if not payload.csv_content.strip():
         raise HTTPException(status_code=400, detail="Empty CSV content")
 
@@ -606,18 +617,26 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
             errors.append({"line": line_no, "error": "missing order_id"})
             continue
         try:
-            upsert_row("orders", {
+            existing = db.get_order(order_id)
+            record = {
                 "order_id": order_id,
                 "client": (row.get("client") or "").strip(),
-                "required_qty": _int_field(row, "required_qty", 0),
-                "sla_penalty_inr": _int_field(row, "sla_penalty_inr", 0),
-                "partial_delay_penalty_inr": _int_field(row, "partial_delay_penalty_inr", 0),
-                "hours_remaining": _int_field(row, "hours_remaining", 0),
-                "deadline_label": (row.get("deadline_label") or "").strip(),
-                "status": "ON_TRACK",
-                "shortfall_units": 0,
+                "required_qty": _int_field(row, "required_qty"),
+                "sla_penalty_inr": _int_field(row, "sla_penalty_inr"),
+                "factory_id": settings.DEFAULT_FACTORY_ID,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+            for key in ("partial_delay_penalty_inr", "hours_remaining"):
+                if existing is not None and not (row.get(key) or "").strip():
+                    continue  # keep the stored value
+                record[key] = _int_field(row, key)
+            label = (row.get("deadline_label") or "").strip()
+            if label or existing is None:
+                record["deadline_label"] = label
+            if existing is None:
+                record["status"] = "ON_TRACK"
+                record["shortfall_units"] = 0
+            upsert_row("orders", record)
             imported.append(order_id)
         except ValueError as exc:
             errors.append({"line": line_no, "order_id": order_id, "error": str(exc)})
@@ -629,6 +648,68 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
         "orders": imported,
         "errors": errors,
     }
+
+
+# ─── 5b. Inventory CSV imports (Tally/Excel) ─────────────────────────────────
+
+def _require_csv(payload: ErpCsvSyncRequest) -> None:
+    if not payload.csv_content.strip():
+        raise HTTPException(status_code=400, detail="Empty CSV content")
+
+
+def _import_response(payload: ErpCsvSyncRequest, result: importers.ImportResult) -> Dict[str, Any]:
+    return {
+        "success": not result.errors,
+        "filename": payload.filename,
+        "imported_count": len(result.rows),
+        "errors": result.errors,
+    }
+
+
+def _factory_item_codes(factory_id: str) -> set[str]:
+    return {i["item_code"] for i in db.get_items(factory_id)}
+
+
+@app.post("/api/v1/ingest/stock-summary", dependencies=[Depends(require_api_key)])
+def ingest_stock_summary(payload: ErpCsvSyncRequest):
+    """Upsert on-hand stock from a Tally Stock Summary export (creates items with new codes)."""
+    _require_csv(payload)
+    factory_id = settings.DEFAULT_FACTORY_ID
+    result = importers.parse_stock_summary(payload.csv_content, factory_id, _factory_item_codes(factory_id))
+    now = datetime.now(timezone.utc).isoformat()
+    for item in result.items:
+        upsert_row("items", item, key_columns=("factory_id", "item_code"))
+    for row in result.rows:
+        upsert_row("stock_levels", {**row, "as_of": now}, key_columns=("factory_id", "item_code"))
+    return _import_response(payload, result)
+
+
+@app.post("/api/v1/ingest/open-purchase-orders", dependencies=[Depends(require_api_key)])
+def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
+    """Upsert open inbound shipments from a pending purchase orders export (dates are IST)."""
+    _require_csv(payload)
+    factory_id = settings.DEFAULT_FACTORY_ID
+    suppliers = {s["id"] for s in db.get_all_suppliers()
+                 if s.get("factory_id") == factory_id}
+    result = importers.parse_open_purchase_orders(
+        payload.csv_content, factory_id, _factory_item_codes(factory_id), suppliers,
+        datetime.now(timezone.utc),
+    )
+    for row in result.rows:
+        upsert_row("inbound_shipments", row, key_columns=("shipment_id",))
+    return _import_response(payload, result)
+
+
+@app.post("/api/v1/ingest/sales-order-lines", dependencies=[Depends(require_api_key)])
+def ingest_sales_order_lines(payload: ErpCsvSyncRequest):
+    """Upsert order lines (item quantities per sales order) from a sales order export."""
+    _require_csv(payload)
+    factory_id = settings.DEFAULT_FACTORY_ID
+    orders = {o["order_id"] for o in db.get_all_orders() if o.get("factory_id") == factory_id}
+    result = importers.parse_sales_order_lines(payload.csv_content, orders, _factory_item_codes(factory_id))
+    for row in result.rows:
+        upsert_row("order_lines", row, key_columns=("order_id", "item_code"))
+    return _import_response(payload, result)
 
 
 # ─── 6. Highway weather ──────────────────────────────────────────────────────

@@ -480,22 +480,35 @@ def fetch_ordered(
     return copy.deepcopy(rows[:limit])
 
 
-def upsert_row(table_name: str, row: dict[str, Any]) -> dict[str, Any]:
-    """Insert or update a row. Offline mode writes the in-memory mirror."""
+def upsert_row(
+    table_name: str,
+    row: dict[str, Any],
+    key_columns: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Insert or update a row. Offline mode writes the in-memory mirror.
+
+    `key_columns` names the conflict key for tables with a composite primary key (for
+    example stock_levels(factory_id, item_code)). Without it the table's single primary
+    key is assumed: PostgREST resolves it, and the offline mirror uses the row's first key.
+    """
     client = _get_supabase()
     if client is not None:
         try:
-            response = client.table(table_name).upsert(row).execute()
+            if key_columns:
+                query = client.table(table_name).upsert(row, on_conflict=",".join(key_columns))
+            else:
+                query = client.table(table_name).upsert(row)
+            response = query.execute()
         except Exception as exc:
             raise _fail("upsert", table_name, exc) from exc
         data = response.data or []
         return data[0] if data else row
     # Offline: upsert into mirror
     table = _mirror.get_table(table_name)
-    # Detect PK column from the row keys (first key is typically the PK)
-    pk_col = next(iter(row))
+    # Detect PK columns: explicit composite key, else the row's first key
+    pk_cols = list(key_columns) if key_columns else [next(iter(row))]
     for i, existing in enumerate(table):
-        if existing.get(pk_col) == row.get(pk_col):
+        if all(existing.get(c) == row.get(c) for c in pk_cols):
             table[i] = {**existing, **row}
             return table[i]
     table.append(row)

@@ -271,7 +271,8 @@ class ApiTests(unittest.TestCase):
 
     # ── ERP import ──
     def test_csv_inserts_new_orders_and_reports_bad_rows(self):
-        csv_text = "order_id,client,required_qty,sla_penalty_inr\nNEW-1,Acme,100,50000\n,Missing,1,1\nBAD-1,X,abc,1\n"
+        csv_text = ("order_id,client,required_qty,sla_penalty_inr,partial_delay_penalty_inr,hours_remaining\n"
+                    "NEW-1,Acme,100,50000,100,48\n,Missing,1,1,1,1\nBAD-1,X,abc,1,1,1\n")
         r = self.client.post("/api/v1/ingest/erp-csv", json={"filename": "o.csv", "csv_content": csv_text}, headers=KEY)
         data = r.json()
         self.assertEqual(data["orders"], ["NEW-1"])
