@@ -9,12 +9,10 @@ import {
   Radio,
   Send,
   Sparkles,
-  Truck,
-  Wrench,
 } from "lucide-react";
 
 export function WebhookBar() {
-  const { simulateCrisis, isSimulating } = useFactoryStore();
+  const { simulateCrisis, isSimulating, scenarios, scenariosError } = useFactoryStore();
   const [customInput, setCustomInput] = useState("");
   const [isPollingWeather, setIsPollingWeather] = useState(false);
   const [weatherData, setWeatherData] = useState<any>(null);
@@ -54,35 +52,21 @@ export function WebhookBar() {
             Tactical Scenarios:
           </span>
 
-          {/* Scenario 1 Pill */}
-          <button
-            onClick={() => simulateCrisis(1)}
-            disabled={isSimulating}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-white/40 hover:bg-white/70 text-charcoal-900 border border-white/50 font-medium transition-all active:scale-95"
-          >
-            <Flame className="w-3.5 h-3.5 text-coral" />
-            <span>Scenario 1: Compound Flood + Overheat</span>
-          </button>
-
-          {/* Scenario 2 Pill */}
-          <button
-            onClick={() => simulateCrisis(2)}
-            disabled={isSimulating}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-white/40 hover:bg-white/70 text-charcoal-900 border border-white/50 font-medium transition-all active:scale-95"
-          >
-            <Wrench className="w-3.5 h-3.5 text-amber-700" />
-            <span>Scenario 2: Line 3 Sensor Drift (25u)</span>
-          </button>
-
-          {/* Scenario 3 Pill */}
-          <button
-            onClick={() => simulateCrisis(3)}
-            disabled={isSimulating}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-white/40 hover:bg-white/70 text-charcoal-900 border border-white/50 font-medium transition-all active:scale-95"
-          >
-            <Truck className="w-3.5 h-3.5 text-forest" />
-            <span>Scenario 3: Chennai Collapse (350u)</span>
-          </button>
+          {scenariosError && (
+            <span className="text-[11px] font-mono text-coral">{scenariosError}</span>
+          )}
+          {scenarios.map((sc) => (
+            <button
+              key={sc.scenario_id}
+              onClick={() => simulateCrisis(sc.scenario_id)}
+              disabled={isSimulating}
+              title={sc.summary}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-white/40 hover:bg-white/70 text-charcoal-900 border border-white/50 font-medium transition-all active:scale-95"
+            >
+              <Flame className="w-3.5 h-3.5 text-coral" />
+              <span>{sc.title}</span>
+            </button>
+          ))}
 
           {/* Highway Weather Pill */}
           <button

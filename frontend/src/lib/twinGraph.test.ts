@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PROBLEM_LINE_STATUSES, buildTwinGraph, focusOrder, type FactoryInfo } from "./twinGraph";
+import { PROBLEM_LINE_STATUSES, buildTwinGraph, focusOrder, ordersSummary, throttledLinesText, type FactoryInfo } from "./twinGraph";
 import type { Order, PlaybookOption, ProductionLine, Supplier } from "../store/useFactoryStore";
 
 const vendor = (id: string, role = "BACKUP") => ({
@@ -148,4 +148,28 @@ describe("focusOrder", () => {
     expect(focusOrder([orders[0], orders[3]])?.order_id).toBe("D"));
   it("ignores an unknown preferred id", () => expect(focusOrder(orders, "ZZ")?.order_id).toBe("B"));
   it("returns null for no orders", () => expect(focusOrder([])).toBeNull());
+});
+
+describe("throttledLinesText", () => {
+  it("lists non-NORMAL lines as name at speed% (temp°C)", () => {
+    const text = throttledLinesText([
+      line("A"),
+      line("B", { status: "THROTTLED", speed_pct: 50, temp_celsius: 89 }),
+      line("C", { status: "DOWN", speed_pct: 0, temp_celsius: 95 }),
+    ]);
+    expect(text).toBe("Line B at 50% (89°C), Line C at 0% (95°C)");
+  });
+  it("is empty when every line is normal", () => {
+    expect(throttledLinesText([line("A")])).toBe("");
+  });
+});
+
+describe("ordersSummary", () => {
+  it("lists orders with client, id and quantity", () => {
+    const text = ordersSummary([order("X1", { required_qty: 500 }), order("X2", { required_qty: 300 })]);
+    expect(text).toBe("Client X1 #X1 (500u) & Client X2 #X2 (300u)");
+  });
+  it("is empty with no orders", () => {
+    expect(ordersSummary([])).toBe("");
+  });
 });

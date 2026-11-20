@@ -30,12 +30,15 @@ function ReplyBox({ rfq }: { rfq: Rfq }) {
   const { submitVendorReply, isSourcingBusy } = useFactoryStore();
   const [text, setText] = useState("");
   const lead = Math.max(1, Math.round(rfq.needed_within_hours / 4));
-  const isAir = rfq.supplier_id === "SUP-AIR-04";
+  const factory = useFactoryStore((st) => st.factory);
+  const vendor = factory?.vendors.find((v) => v.supplier_id === rfq.supplier_id);
+  const charterCost = vendor?.flat_cost ?? 0;
+  const isCharter = charterCost > 0;
   const quick = [
     {
       label: "Confirm",
-      text: isAir
-        ? `YES ${rfq.units_requested} pcs, charter Rs ${rfq.expected_unit_price_inr || 600000} in 6h`
+      text: isCharter
+        ? `YES ${rfq.units_requested} pcs, charter Rs ${rfq.expected_unit_price_inr || charterCost} in ${vendor?.lead_hours ?? lead}h`
         : `YES ${rfq.units_requested} pcs @${rfq.expected_unit_price_inr} in ${lead}h`,
     },
     { label: "Partial", text: `can do ${Math.max(1, Math.floor(rfq.units_requested / 2))} pcs only` },

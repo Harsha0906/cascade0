@@ -19,13 +19,20 @@ export function ExecutionModal({
   isOpen: boolean;
   onClose: () => void;
 }) {
-  const { executionReceipt } = useFactoryStore();
+  const { executionReceipt, playbooks, productionLines } = useFactoryStore();
   const [activeTab, setActiveTab] = useState<"tally" | "whatsapp" | "sla">("tally");
   const [copiedType, setCopiedType] = useState<string | null>(null);
 
   // Only real, server-generated receipts are shown — no canned fallback.
   if (!isOpen || !executionReceipt) return null;
   const receipt = executionReceipt;
+  const receiptPlaybook = playbooks.find((p) => p.id === receipt.playbook_id);
+  const overtimeLineNames = Object.entries(receiptPlaybook?.overtime_line_hours ?? {})
+    .filter(([, hours]) => hours > 0)
+    .map(([lineId]) => productionLines.find((l) => l.line_id === lineId)?.name ?? lineId);
+  const shiftNoticeHeading = overtimeLineNames.length
+    ? `Draft shift notice for ${overtimeLineNames.join(", ")} supervisors (copy and send)`
+    : "No overtime scheduled";
 
   const downloadXml = () => {
     const blob = new Blob([receipt.tally_xml_payload], { type: "application/xml" });
@@ -164,7 +171,7 @@ export function ExecutionModal({
             <div className="space-y-3 font-mono text-xs">
               <div className="flex items-center justify-between">
                 <span className="text-charcoal-600 text-[11px] font-medium">
-                  Draft shift notice for Lines 1 & 3 supervisors (copy and send)
+                  {shiftNoticeHeading}
                 </span>
                 <button
                   onClick={() => copyText(receipt.shift_broadcast_msg, "whatsapp")}

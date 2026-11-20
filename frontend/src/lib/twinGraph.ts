@@ -74,6 +74,19 @@ export function focusOrder(orders: OrderRow[], preferredOrderId?: string | null)
   return [...orders].sort(byPenalty)[0];
 }
 
+/** "Line B at 50% (89°C), Line C at 0% (95°C)" for every line that is not NORMAL; "" when none. */
+export function throttledLinesText(lines: ProductionLineRow[]): string {
+  return lines
+    .filter((l) => l.status !== "NORMAL")
+    .map((l) => `${l.name} at ${l.speed_pct}% (${l.temp_celsius}°C)`)
+    .join(", ");
+}
+
+/** "Client #ID (500u) & Client #ID (300u)"; "" when there are no orders. */
+export function ordersSummary(orders: OrderRow[]): string {
+  return orders.map((o) => `${o.client} #${o.order_id} (${o.required_qty}u)`).join(" & ");
+}
+
 export function buildTwinGraph(input: TwinGraphInput): { nodes: Node[]; edges: Edge[] } {
   const { factory, playbook } = input;
   const roleById = new Map(factory.vendors.map((v) => [v.supplier_id, v.sourcing_role]));
