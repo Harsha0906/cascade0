@@ -49,6 +49,7 @@ class FactoryModel:
     factory_id: str
     name: str
     stock_item_name: str
+    stock_item_code: str
     qa_dispatch_hours: float
     safety_stock_units: int
     production_hours_in_window: float
@@ -70,6 +71,8 @@ class FactoryModel:
             return Vendor(**v)
 
         d = dict(d)
+        # Run payloads saved before Phase 4 lack the code; only from_dict tolerates that.
+        d.setdefault("stock_item_code", "")
         d["vendors"] = tuple(vendor(v) for v in d["vendors"])
         d["lines"] = tuple(ProductionLine(**l) for l in d["lines"])
         d["primary_suppliers"] = tuple(tuple(x) for x in d.get("primary_suppliers", ()))
@@ -137,6 +140,7 @@ class FactoryModel:
 # ─── Loader ────────────────────────────────────────────────────────────────
 
 _MIGRATION_HINT = "apply supabase/migrations/003_factory_model.sql"
+_INVENTORY_MIGRATION_HINT = "apply supabase/migrations/006_inventory.sql"
 _VALID_ROLES = ("PRIMARY", "BACKUP", "EXPEDITE")
 
 
@@ -151,11 +155,11 @@ class _Problems:
         if msg not in self.items:
             self.items.append(msg)
 
-    def missing(self, table: str, column: str) -> None:
+    def missing(self, table: str, column: str, hint: str = _MIGRATION_HINT) -> None:
         key = f"{table}.{column}"
         if key not in self._missing:
             self._missing.add(key)
-            self.items.append(f"{key} missing — {_MIGRATION_HINT}")
+            self.items.append(f"{key} missing — {hint}")
 
 
 def _num(row: Mapping[str, Any], table: str, column: str, label: str, p: _Problems,
@@ -277,9 +281,12 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
     label = f"factory {factory_id}"
     name = frow.get("name")
     stock_item = frow.get("stock_item_name")
+    stock_code = frow.get("stock_item_code")
     for col, val in (("name", name), ("stock_item_name", stock_item)):
         if not val:
             p.missing("factories", col)
+    if not stock_code:
+        p.missing("factories", "stock_item_code", _INVENTORY_MIGRATION_HINT)
     qa = _num(frow, "factories", "qa_dispatch_hours", label, p, minimum=0)
     safety = _num(frow, "factories", "safety_stock_units", label, p, minimum=0)
     window = _num(frow, "factories", "production_hours_in_window", label, p, strictly_positive=True)
@@ -324,6 +331,7 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
         raise FactoryDataError(f"Invalid factory data for {factory_id}: " + "; ".join(p.items))
     return FactoryModel(
         factory_id=factory_id, name=name, stock_item_name=stock_item,
+        stock_item_code=stock_code,
         qa_dispatch_hours=qa, safety_stock_units=int(round(safety)),
         production_hours_in_window=window,
         # Sorted so the expedite choice and MILP tie-breaks never depend on database row order.

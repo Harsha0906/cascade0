@@ -14,8 +14,8 @@ import json
 import logging
 import re
 import threading
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Sequence
 
 from app.config import settings
 
@@ -226,6 +226,7 @@ _SEED_ORDERS: list[dict[str, Any]] = [
         "partial_delay_penalty_inr": 500000,
         "status": "ON_TRACK",
         "shortfall_units": 0,
+        "priority": 10,
         "factory_id": "apex-volt-blr2",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
@@ -239,6 +240,7 @@ _SEED_ORDERS: list[dict[str, Any]] = [
         "partial_delay_penalty_inr": 200000,
         "status": "ON_TRACK",
         "shortfall_units": 0,
+        "priority": 20,
         "factory_id": "apex-volt-blr2",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     },
@@ -249,6 +251,7 @@ _SEED_FACTORIES: list[dict[str, Any]] = [
         "id": "apex-volt-blr2",
         "name": "Apex Volt EV Battery Plant (Bengaluru Unit-2)",
         "stock_item_name": "Aluminium Battery Casing",
+        "stock_item_code": "CASING",
         "qa_dispatch_hours": 2.5,
         "safety_stock_units": 50,
         "production_hours_in_window": 16,
@@ -267,7 +270,7 @@ _SEED_SCENARIOS: list[dict[str, Any]] = [
             "to 89.0°C and throttled to 50% speed. Current unit shortfall is 150 casings on Order #EV-402."
         ),
         "delay_hours": 48,
-        "shortfall_units": 150,
+        "shortfall_units": None,  # computed from inventory (Phase 4)
         "line_speeds": {"LINE-2": 50},
         "order_id": "EV-402",
     },
@@ -302,8 +305,33 @@ _SEED_SCENARIOS: list[dict[str, Any]] = [
     },
 ]
 
+_SEED_ITEMS: list[dict[str, Any]] = [
+    {"factory_id": "apex-volt-blr2", "item_code": "CASING", "name": "Aluminium Battery Casing", "unit": "pcs"},
+]
 
-REQUIRED_MIGRATION_LEVEL = 5
+_SEED_STOCK_LEVELS: list[dict[str, Any]] = [
+    {"factory_id": "apex-volt-blr2", "item_code": "CASING", "on_hand_qty": 350},
+]
+
+_SEED_ORDER_LINES: list[dict[str, Any]] = [
+    {"order_id": "EV-402", "item_code": "CASING", "qty": 500},
+    {"order_id": "EV-405", "item_code": "CASING", "qty": 300},
+]
+
+_SEED_SHIPMENT_ETA_HOURS = 20
+
+
+def _seed_inbound_shipments(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Demo inbound shipment; its eta is relative to the reset/startup time."""
+    now = now or datetime.now(timezone.utc)
+    return [{
+        "shipment_id": "SHP-CHN-0001", "factory_id": "apex-volt-blr2", "item_code": "CASING",
+        "supplier_id": "SUP-CHN-01", "qty": 500,
+        "eta": (now + timedelta(hours=_SEED_SHIPMENT_ETA_HOURS)).isoformat(), "status": "OPEN",
+    }]
+
+
+REQUIRED_MIGRATION_LEVEL = 6
 
 # Durable-state tables cleared on reset, with their primary-key column.
 _DURABLE_TABLES: tuple[tuple[str, str], ...] = (
@@ -327,6 +355,13 @@ class InMemoryMirror:
         self.production_lines: list[dict[str, Any]] = copy.deepcopy(_SEED_PRODUCTION_LINES)
         self.orders: list[dict[str, Any]] = copy.deepcopy(_SEED_ORDERS)
         self.scenarios: list[dict[str, Any]] = copy.deepcopy(_SEED_SCENARIOS)
+        self.items: list[dict[str, Any]] = copy.deepcopy(_SEED_ITEMS)
+        now = datetime.now(timezone.utc)
+        self.stock_levels: list[dict[str, Any]] = [
+            {**r, "as_of": now.isoformat()} for r in copy.deepcopy(_SEED_STOCK_LEVELS)
+        ]
+        self.inbound_shipments: list[dict[str, Any]] = _seed_inbound_shipments(now)
+        self.order_lines: list[dict[str, Any]] = copy.deepcopy(_SEED_ORDER_LINES)
         self.disruption_events: list[dict[str, Any]] = []
         self.agent_logs: list[dict[str, Any]] = []
         self.purchase_orders: list[dict[str, Any]] = []
@@ -766,6 +801,72 @@ def get_scenarios(factory_id: str) -> list[dict[str, Any]]:
     return copy.deepcopy(sorted(rows, key=lambda r: r["scenario_id"]))
 
 
+def get_items(factory_id: str) -> list[dict[str, Any]]:
+    """Stock items of one factory, ordered by item_code."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            response = (
+                client.table("items").select("*").eq("factory_id", factory_id)
+                .order("item_code").execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            raise _fail("get_items", "items", exc) from exc
+    rows = [r for r in _mirror.items if r.get("factory_id") == factory_id]
+    return copy.deepcopy(sorted(rows, key=lambda r: r["item_code"]))
+
+
+def get_stock_levels(factory_id: str) -> dict[str, int]:
+    """On-hand quantity per item_code for one factory."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            response = client.table("stock_levels").select("*").eq("factory_id", factory_id).execute()
+            rows = response.data or []
+        except Exception as exc:
+            raise _fail("get_stock_levels", "stock_levels", exc) from exc
+    else:
+        rows = [r for r in _mirror.stock_levels if r.get("factory_id") == factory_id]
+    return {r["item_code"]: int(r["on_hand_qty"]) for r in rows}
+
+
+def get_inbound_shipments(factory_id: str, status: str = "OPEN") -> list[dict[str, Any]]:
+    """Inbound shipments of one factory with the given status, ordered by eta then id."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            response = (
+                client.table("inbound_shipments").select("*").eq("factory_id", factory_id)
+                .eq("status", status).order("eta").order("shipment_id").execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            raise _fail("get_inbound_shipments", "inbound_shipments", exc) from exc
+    rows = [r for r in _mirror.inbound_shipments
+            if r.get("factory_id") == factory_id and r.get("status") == status]
+    return copy.deepcopy(sorted(rows, key=lambda r: (str(r["eta"]), r["shipment_id"])))
+
+
+def get_order_lines(order_ids: Sequence[str]) -> list[dict[str, Any]]:
+    """Order lines (order_id, item_code, qty) of the given orders."""
+    ids = list(order_ids)
+    if not ids:
+        return []
+    client = _get_supabase()
+    if client is not None:
+        try:
+            response = (
+                client.table("order_lines").select("*").in_("order_id", ids)
+                .order("order_id").order("item_code").execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            raise _fail("get_order_lines", "order_lines", exc) from exc
+    rows = [r for r in _mirror.order_lines if r.get("order_id") in ids]
+    return copy.deepcopy(sorted(rows, key=lambda r: (r["order_id"], r["item_code"])))
+
+
 def get_all_suppliers() -> list[dict[str, Any]]:
     """Fetch all suppliers."""
     return fetch_all("suppliers")
@@ -896,6 +997,7 @@ def reset_to_seed() -> dict[str, str]:
         return {"success": True, "status": "reset_complete", "factory": default_factory_name()}
 
     try:
+        now_iso = datetime.now(timezone.utc).isoformat()
         # Clear dynamic tables
         client.table("purchase_orders").delete().neq("po_number", "___none___").execute()
         for tbl in ("agent_logs", "disruption_events"):  # SERIAL integer id
@@ -913,6 +1015,10 @@ def reset_to_seed() -> dict[str, str]:
             ("production_lines", _SEED_PRODUCTION_LINES),
             ("orders", _SEED_ORDERS),
             ("scenarios", _SEED_SCENARIOS),
+            ("items", _SEED_ITEMS),
+            ("stock_levels", [{**r, "as_of": now_iso} for r in _SEED_STOCK_LEVELS]),
+            ("order_lines", _SEED_ORDER_LINES),
+            ("inbound_shipments", _seed_inbound_shipments()),
         ):
             for row in seed:
                 client.table(tbl).upsert(row).execute()

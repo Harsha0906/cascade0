@@ -2,6 +2,8 @@
 
 from tests import _offline_env  # noqa: F401  (must precede any app import)
 
+from datetime import datetime, timezone
+
 from app.factory_model import FactoryModel, ProductionLine, Vendor
 
 
@@ -18,6 +20,7 @@ def small_factory() -> FactoryModel:
         factory_id="test-plant",
         name="Test Plant",
         stock_item_name="Widget",
+        stock_item_code="ITEM-W",
         qa_dispatch_hours=2.0,
         safety_stock_units=30,
         production_hours_in_window=10.0,
@@ -41,7 +44,7 @@ def seed_second_factory() -> None:
 
     db.insert_row("factories", {
         "id": "test-plant", "name": "Test Plant", "stock_item_name": "Widget",
-        "qa_dispatch_hours": 2.0, "safety_stock_units": 30, "production_hours_in_window": 10.0,
+        "stock_item_code": "ITEM-W", "qa_dispatch_hours": 2.0, "safety_stock_units": 30, "production_hours_in_window": 10.0,
     })
     for sid, role, max_units, unit_cost, flat, lead, rel in (
         ("V1", "BACKUP", 100, 500, 0, 4, 90),
@@ -76,5 +79,11 @@ def seed_second_factory() -> None:
         "order_id": "WO-77", "client": "Test Client", "required_qty": 100,
         "deadline_label": "30 hours", "hours_remaining": 30, "sla_penalty_inr": 400_000,
         "partial_delay_penalty_inr": 80_000, "status": "ON_TRACK", "shortfall_units": 0,
-        "factory_id": "test-plant",
+        "factory_id": "test-plant", "priority": 100,
     })
+    db.insert_row("items", {"factory_id": "test-plant", "item_code": "ITEM-W", "name": "Widget", "unit": "pcs"})
+    db.insert_row("stock_levels", {
+        "factory_id": "test-plant", "item_code": "ITEM-W", "on_hand_qty": 40,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    })
+    db.insert_row("order_lines", {"order_id": "WO-77", "item_code": "ITEM-W", "qty": 80})

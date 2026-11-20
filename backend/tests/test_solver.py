@@ -309,7 +309,7 @@ class IndexNamedVariableTests(unittest.TestCase):
     @staticmethod
     def _colliding_factory():
         return FactoryModel(
-            factory_id="collide", name="Collide", stock_item_name="Widget",
+            factory_id="collide", name="Collide", stock_item_name="Widget", stock_item_code="ITEM-W",
             qa_dispatch_hours=2.0, safety_stock_units=30, production_hours_in_window=10.0,
             vendors=(
                 _vendor("V-1", "BACKUP", 30, 500, 0, 4, 90),
