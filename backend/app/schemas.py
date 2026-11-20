@@ -59,6 +59,10 @@ class DisruptionExtraction(BaseModel):
         default=None,
         description="Stated unit shortfall; null if not stated"
     )
+    delay_mentioned: bool = Field(
+        default=False,
+        description="True if the alert says a shipment is delayed/late/blocked, even without a duration"
+    )
     crisis_headline: str = Field(
         default="",
         description="Concise summary headline of the disruption"
@@ -176,9 +180,9 @@ class SimulateCrisisRequest(BaseModel):
 class PlcTelemetryRequest(BaseModel):
     """Shop-floor machine tick from simulator_plc.py."""
     line_id: str = Field(max_length=32)
-    speed_pct: int = Field(default=50, ge=0, le=100)
-    temp_celsius: float = Field(default=89.0, ge=-50, le=400)
-    status: str = Field(default="OVERHEATING_THROTTLED", max_length=64)
+    speed_pct: int = Field(ge=0, le=100)
+    temp_celsius: float = Field(ge=-50, le=400)
+    status: str = Field(max_length=64)
 
 
 class ErpCsvSyncRequest(BaseModel):

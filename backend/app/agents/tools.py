@@ -57,18 +57,33 @@ def _name_pattern(name: str) -> str:
 _TEMP_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:°\s*c\b|deg(?:rees)?\b|celsius\b|c\b)", re.I)
 _SPEED_CUE_RE = re.compile(
     r"\b(?:at|to)\s*(\d{1,3})\s*%(?!\s*of\b)|(\d{1,3})\s*%\s*(?:speed|capacity)\b", re.I)
+# A whole number, with optional thousands separators: 1,200 and Indian 1,20,000 grouping.
+_NUM = r"(\d{1,3}(?:,\d{2,3})+(?![\d,])|\d+)"
 _HOURS = r"(?:h|hr|hrs|hours?)\b"
-_DELAY_CUE_RES = (
-    re.compile(rf"(\d+)\s*{_HOURS}\s*(?:of\s+)?delay", re.I),
-    re.compile(rf"delay(?:ed)?\s*(?:by|of|:)?\s*(\d+)\s*{_HOURS}", re.I),
-    re.compile(rf"\+\s*(\d+)\s*{_HOURS}", re.I),
-)
+_DAYS = r"days?\b"
+
+
+def _delay_cues(unit: str) -> tuple:
+    return (
+        re.compile(rf"{_NUM}\s*{unit}\s*(?:of\s+)?delay", re.I),
+        re.compile(rf"(?:delay(?:ed)?|late)\s*(?:by|of|:)?\s*{_NUM}\s*{unit}", re.I),
+        re.compile(rf"\+\s*{_NUM}\s*{unit}", re.I),
+    )
+
+
+_DELAY_CUE_RES = _delay_cues(_HOURS)
+_DELAY_DAY_CUE_RES = _delay_cues(_DAYS)
 _SHORT_CUE_RES = (
-    re.compile(r"\b(?:shortfall|deficit|missing)\s*(?:is|of|:)?\s*(\d+)", re.I),
-    re.compile(r"\b(\d+)\s*(?:[A-Za-z]+\s+){0,3}?(?:short|missing)\b", re.I),
-    re.compile(r"\bshort(?!fall)\s*(?:by|of)?\s*(\d+)", re.I),
+    re.compile(rf"\b(?:shortfall|deficit|missing)\s*(?:is|of|:)?\s*{_NUM}", re.I),
+    re.compile(rf"\b{_NUM}\s*(?:[A-Za-z]+\s+){{0,3}}?(?:short|missing)\b", re.I),
+    re.compile(rf"\bshort(?!fall)\s*(?:by|of)?\s*{_NUM}", re.I),
 )
 _SUPPLIER_DELAY_CUE_RE = re.compile(r"\b(?:delay(?:ed)?|late|blocked|stuck|held)\b", re.I)
+# The alert says something is delayed, even when it gives no duration.
+_DELAY_MENTION_RE = re.compile(r"\b(?:delay(?:s|ed)?|late|blocked|stuck|held\s+up)\b", re.I)
+# A speed cue right after a line mention ("line a at 40%", "line a running at 40%").
+_IMMEDIATE_SPEED_CUE_RE = re.compile(
+    r"\s*(?:(?:is|was|now|running|down|dropped|slowed)\s+){0,2}(?:at|to)\s*\d{1,3}\s*%", re.I)
 _LINE_MENTION_RE = re.compile(r"\bline[\s\-_]*([A-Za-z0-9]{1,6})\b", re.I)
 _ORDER_MENTION_RE = re.compile(r"(?:\border\b\s*#?|#)\s*([A-Za-z]{1,6}-?\d{1,6})\b", re.I)
 _ORDER_ON_RE = re.compile(r"\b(?:on|for)\s+([A-Za-z]{1,6}-\d{1,6})\b", re.I)
@@ -78,18 +93,25 @@ _WINDOW_CHARS = 80
 _SUPPLIER_CUE_CHARS = 60
 
 
-def _cue_values(regexes, text: str) -> set:
-    return {int(g) for rx in regexes for m in rx.finditer(text) for g in m.groups() if g}
+def _to_int(s: str) -> int:
+    return int(s.replace(",", ""))
+
+
+def _cue_values(regexes, text: str, scale: int = 1) -> set:
+    return {_to_int(g) * scale for rx in regexes for m in rx.finditer(text) for g in m.groups() if g}
 
 
 def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str]) -> DisruptionExtraction:
     text = raw_text
 
-    # Delay: a number bound to a delay cue; else the only hours number; else unknown.
-    vals = _cue_values(_DELAY_CUE_RES, text)
+    # Delay: a number of hours/days bound to a delay cue; else the only hours/days number;
+    # else unknown. A delay that is mentioned without a duration is reported as such.
+    vals = _cue_values(_DELAY_CUE_RES, text) | _cue_values(_DELAY_DAY_CUE_RES, text, 24)
     if not vals:
-        vals = {int(x) for x in re.findall(rf"(\d+)\s*{_HOURS}", text, re.I)}
+        vals = ({_to_int(x) for x in re.findall(rf"{_NUM}\s*{_HOURS}", text, re.I)}
+                | {_to_int(x) * 24 for x in re.findall(rf"{_NUM}\s*{_DAYS}", text, re.I)})
     delay_hours = next(iter(vals)) if len(vals) == 1 else None
+    delay_mentioned = bool(_DELAY_MENTION_RE.search(text))
 
     # Shortfall: a number bound to a shortfall cue; else the only units-count number; else unknown.
     vals = _cue_values(_SHORT_CUE_RES, text)
@@ -98,7 +120,7 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         units = [r"battery\s+casings", r"casings", r"units", r"pcs", r"u\b"]
         if item_words:
             units.append(rf"{re.escape(item_words[-1])}s?\b")
-        vals = {int(x) for x in re.findall(r"\b(\d+)\s*(?:" + "|".join(units) + r")", text, re.I)}
+        vals = {_to_int(x) for x in re.findall(rf"\b{_NUM}\s*(?:" + "|".join(units) + r")", text, re.I)}
     shortfall = next(iter(vals)) if len(vals) == 1 else None
 
     # Line mentions (id or full name), overlapping spans collapsed to the earliest/longest.
@@ -107,6 +129,12 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         for pat in (_mention_pattern(line.line_id), _name_pattern(line.name)):
             for mm in re.finditer(pat, text, re.I):
                 spans.append((mm.start(), mm.end(), line.line_id))
+            # A lowercase single-letter tail ("line a") counts only when a speed cue follows.
+            loose = pat.replace("(?-i:", "(?:")
+            if loose != pat:
+                for mm in re.finditer(loose, text, re.I):
+                    if _IMMEDIATE_SPEED_CUE_RE.match(text, mm.end()):
+                        spans.append((mm.start(), mm.end(), line.line_id))
     spans.sort(key=lambda s: (s[0], -s[1]))
     kept = []
     for s in spans:
@@ -216,6 +244,7 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         affected_supplier=supplier,
         affected_order=order,
         shortfall_units=shortfall,
+        delay_mentioned=delay_mentioned,
         raw_summary=raw_text[:200],
     )
 
@@ -239,6 +268,31 @@ def _gemini_prompt(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
     )
 
 
+def _ground_numbers(extraction: DisruptionExtraction, raw_text: str) -> DisruptionExtraction:
+    """Null every LLM number that does not appear in the alert text (no invented numbers).
+    Thousands separators are ignored; a delay may also be a stated number of days x 24."""
+    text = re.sub(r"(?<=\d),(?=\d)", "", raw_text or "")
+    stated = {float(x) for x in re.findall(r"\d+(?:\.\d+)?", text)}
+
+    def grounded(value, days_ok: bool = False):
+        if value is None:
+            return None
+        if float(value) in stated or (days_ok and value % 24 == 0 and value / 24 in stated):
+            return value
+        logger.warning("Gemini returned %r, which the alert does not state; ignored", value)
+        return None
+
+    return extraction.model_copy(update={
+        "delay_hours": grounded(extraction.delay_hours, days_ok=True),
+        "shortfall_units": grounded(extraction.shortfall_units),
+        "affected_lines": [
+            li.model_copy(update={"speed_pct": grounded(li.speed_pct),
+                                  "temp_celsius": grounded(li.temp_celsius)})
+            for li in extraction.affected_lines
+        ],
+    })
+
+
 def extract_disruption_entities(
     raw_text: str, model: FactoryModel, order_ids: Sequence[str]
 ) -> tuple[DisruptionExtraction, str]:
@@ -247,8 +301,12 @@ def extract_disruption_entities(
     factory model so any line, supplier or order can be named. Gemini structured output first;
     deterministic regex fallback otherwise.
 
-    Returns (extraction, source) where source is "gemini:<model>" or "regex-fallback".
+    Returns (extraction, source) where source is "gemini:<model>", "regex-fallback", or
+    "structured-overrides" for an empty message (a slider/override-only run: nothing to extract).
     """
+    if not (raw_text or "").strip():
+        return DisruptionExtraction(), "structured-overrides"
+
     if settings.has_gemini:
         try:
             from google import genai
@@ -267,7 +325,8 @@ def extract_disruption_entities(
             )
             if response.text:
                 data = json.loads(response.text)
-                return DisruptionExtraction(**data), f"gemini:{settings.GEMINI_MODEL}"
+                extraction = _ground_numbers(DisruptionExtraction(**data), raw_text)
+                return extraction, f"gemini:{settings.GEMINI_MODEL}"
         except Exception as exc:
             logger.warning("⚠ Gemini structured extraction failed (%s) — using deterministic fail-safe", exc)
 

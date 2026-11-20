@@ -391,9 +391,11 @@ class ApiTests(unittest.TestCase):
     def test_plc_requires_known_line(self):
         r = self.client.post("/api/v1/ingest/plc-telemetry", json={"speed_pct": 50}, headers=KEY)
         self.assertEqual(r.status_code, 422)
-        r = self.client.post("/api/v1/ingest/plc-telemetry", json={"line_id": "LINE-9", "speed_pct": 50}, headers=KEY)
+        r = self.client.post("/api/v1/ingest/plc-telemetry", json={"line_id": "LINE-9", "speed_pct": 50,
+                             "temp_celsius": 60.0, "status": "NORMAL"}, headers=KEY)
         self.assertEqual(r.status_code, 404)
-        r = self.client.post("/api/v1/ingest/plc-telemetry", json={"line_id": "LINE-1", "speed_pct": 70}, headers=KEY)
+        r = self.client.post("/api/v1/ingest/plc-telemetry", json={"line_id": "LINE-1", "speed_pct": 70,
+                             "temp_celsius": 60.0, "status": "NORMAL"}, headers=KEY)
         self.assertEqual(r.status_code, 200)
 
     def test_status_text_reads_lines_and_orders_from_data(self):

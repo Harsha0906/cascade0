@@ -261,14 +261,20 @@ def simulate_crisis(req: SimulateCrisisRequest):
     if req.scenario_id is not None and req.scenario_id not in scenarios:
         raise HTTPException(status_code=404, detail=f"Unknown scenario_id {req.scenario_id}")
 
+    structured = any(v is not None for v in (
+        req.override_line_speeds, req.override_shortfall_units, req.override_delay_hours)) or bool(req.order_id)
     preset = None
     if req.raw_message:
         message = req.raw_message
-    else:
-        if req.scenario_id is None:
-            raise HTTPException(status_code=422, detail="Provide scenario_id or raw_message")
+    elif req.scenario_id is not None:
         preset = scenarios[req.scenario_id]
         message = preset["raw_message"]
+    elif structured:
+        # Sliders: every parameter comes from the overrides; resolution still requires each one.
+        message = ""
+    else:
+        raise HTTPException(
+            status_code=422, detail="Provide scenario_id or raw_message (or structured overrides)")
 
     delay, shortfall = req.override_delay_hours, req.override_shortfall_units
     line_speeds = dict(req.override_line_speeds) if req.override_line_speeds is not None else None

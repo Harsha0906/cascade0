@@ -167,7 +167,7 @@ class CascadeGraphState(TypedDict, total=False):
 
 def _ctx(state: CascadeGraphState) -> Tuple[float, int, int]:
     br = state["blast_radius"]
-    return float(br["hours_remaining"]), int(state.get("delay_hours", 0)), int(br["sla_penalty_inr"])
+    return float(br["hours_remaining"]), int(state["delay_hours"]), int(br["sla_penalty_inr"])
 
 
 def _supplier_name(model: FactoryModel, supplier_id: str) -> str:

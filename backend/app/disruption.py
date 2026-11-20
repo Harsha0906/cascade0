@@ -34,9 +34,20 @@ def _name_forms(name: str) -> set:
     return {f for f in (_norm(name), _norm(name.split(" (")[0])) if f}
 
 
+def _digit_runs(s: str) -> set:
+    """Digit runs of a normalised form as integers ('ev402' -> {402}, 'wo07' -> {7})."""
+    return {int(d) for d in re.findall(r"\d+", s)}
+
+
 def resolve_reference(text: str, candidates: Mapping[str, str], kind: str) -> str:
     t = _norm(text)
     forms = {cid: _forms(cid, name) for cid, name in candidates.items()}
+    # An id-shaped reference ("Line 10", "EV-4021") may only match, beyond an exact form, a form
+    # carrying exactly the same numbers: near-miss ids are a different entity, never a typo.
+    t_digits = _digit_runs(t)
+
+    def same_digits(x: str) -> bool:
+        return not t_digits or _digit_runs(x) == t_digits
 
     def ambiguous(ids) -> DisruptionResolutionError:
         return DisruptionResolutionError(
@@ -48,10 +59,11 @@ def resolve_reference(text: str, candidates: Mapping[str, str], kind: str) -> st
             return exact[0]
         if len(exact) > 1:
             raise ambiguous(exact)
-
+    # Orders are bare ids: only an exact (normalised) match is the same order.
+    if t and kind != "order":
         sub = []
         if len(t) >= 3 and re.search(r"[a-z]", t):
-            sub = [cid for cid, f in forms.items() if any(t in x for x in f)]
+            sub = [cid for cid, f in forms.items() if any(t in x and same_digits(x) for x in f)]
         if len(sub) == 1:
             return sub[0]
         if len(sub) > 1:
@@ -60,6 +72,8 @@ def resolve_reference(text: str, candidates: Mapping[str, str], kind: str) -> st
         by_norm: dict = {}
         for cid, name in candidates.items():
             for x in _name_forms(name):  # fuzzy matching on names only, never ids
+                if not same_digits(x):
+                    continue
                 by_norm.setdefault(x, set()).add(cid)
                 # a typo'd partial name ("chenai precision") is compared with same-length
                 # windows of the name, so it need not be spelled out in full
@@ -141,6 +155,9 @@ def resolve_disruption(
 
     delay = ov.delay_hours if ov.delay_hours is not None else extraction.delay_hours
     if delay is None:
+        if extraction.delay_mentioned:
+            raise DisruptionResolutionError(
+                "delay_hours not stated (the alert mentions a delay; give the hours)")
         delay = 0
     if delay < 0:
         raise DisruptionResolutionError(f"delay_hours must be >= 0, got {delay}")
@@ -153,11 +170,18 @@ def resolve_disruption(
 
     impacts = []
     if ov.line_speeds is not None:
+        # Overridden speeds keep any temperature the alert states for the same line (best effort).
+        stated_temps: dict = {}
+        for item in extraction.affected_lines:
+            try:
+                stated_temps.setdefault(resolve_reference(item.line, line_names, "line"), item.temp_celsius)
+            except DisruptionResolutionError:
+                continue
         for lid, speed in ov.line_speeds.items():
             if lid not in line_names:
                 known = ", ".join(f"{i} ({n})" for i, n in line_names.items())
                 raise DisruptionResolutionError(f"Unknown line '{lid}'. Known: {known}")
-            impacts.append(LineImpact(lid, _check_speed(lid, speed), None))
+            impacts.append(LineImpact(lid, _check_speed(lid, speed), stated_temps.get(lid)))
     else:
         seen = set()
         for item in extraction.affected_lines:
