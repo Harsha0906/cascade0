@@ -170,7 +170,8 @@ class ApiTests(unittest.TestCase):
             headers=KEY,
         )
         p = r.json()["extracted_parameters"]
-        self.assertEqual((p["shortfall_units"], p["line_impacts"][0]["speed_pct"], p["delay_hours"]), (120, 60, 24))
+        self.assertEqual((p["shortfall_units"], p["line_impacts"][0]["speed_pct"], p["delay_hours"]), (150, 60, 24))
+        self.assertEqual((p["shortfall_source"], p["alert_stated_shortfall"]), ("inventory", 120))
 
     # ── execution uses server-side numbers, once ──
     def test_execute_uses_server_plan_and_is_idempotent(self):
@@ -377,7 +378,10 @@ class ApiTests(unittest.TestCase):
     def test_custom_text_line_speed(self):
         r = self.client.post("/api/v1/simulate-crisis", headers=KEY, json={
             "raw_message": "Truck breakdown, 120 casings short on EV-402, Line 2 at 60%, 24h delay"})
-        self.assertEqual(r.json()["extracted_parameters"]["line_impacts"][0]["speed_pct"], 60)
+        p = r.json()["extracted_parameters"]
+        self.assertEqual(p["line_impacts"][0]["speed_pct"], 60)
+        # EV-402 has inventory data: the computed shortfall wins; the alert's 120 is reported, not used.
+        self.assertEqual((p["shortfall_source"], p["alert_stated_shortfall"]), ("inventory", 120))
 
     def test_webhook_unresolvable_message_replies_with_reason(self):
         self.sent.clear()
@@ -387,7 +391,7 @@ class ApiTests(unittest.TestCase):
         raw, headers = _signed(payload)
         r = self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers)
         self.assertEqual(r.status_code, 200)
-        self.assertIn("shortfall", self.sent[-1][1])
+        self.assertIn("not stated", self.sent[-1][1])
 
     def test_plc_requires_known_line(self):
         r = self.client.post("/api/v1/ingest/plc-telemetry", json={"speed_pct": 50}, headers=KEY)

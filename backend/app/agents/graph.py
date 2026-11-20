@@ -26,7 +26,8 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -36,9 +37,12 @@ from app.agents.tools import (
     query_blast_radius_sql,
     run_pulp_milp_and_monte_carlo,
 )
-from app.db import get_all_orders, log_agent_step
+from app.db import (
+    get_all_orders, get_inbound_shipments, get_order_lines, get_stock_levels, log_agent_step,
+)
 from app.disruption import DisruptionOverrides, resolve_disruption
-from app.factory_model import FactoryModel, load_factory_model
+from app.factory_model import FactoryDataError, FactoryModel, load_factory_model
+from app.inventory import compute_shortfall
 from app.solver import (
     simulate_monte_carlo,
     solve_pulp_milp,
@@ -144,6 +148,10 @@ class CascadeGraphState(TypedDict, total=False):
     line_impacts: List[Dict[str, Any]]
     affected_supplier_id: Optional[str]
     shortfall_units: int
+    shortfall_source: str
+    shortfall_breakdown: Optional[Dict[str, Any]]
+    alert_stated_shortfall: Optional[int]
+    now: datetime
     order_id: str
     crisis_headline: str
     extraction_source: str
@@ -177,6 +185,28 @@ def _supplier_name(model: FactoryModel, supplier_id: str) -> str:
 
 # ─── Node 1: Detective ───────────────────────────────────────────────────────
 
+def _make_shortfall_resolver(model: FactoryModel, now: datetime) -> Callable[..., Any]:
+    """Inventory-based shortfall for one factory; reads data only when called (not on override).
+
+    Returns None when the order has no line for the planning item (no inventory data)."""
+    def resolve(order_id: str, supplier_id: Optional[str], delay_hours: int):
+        item_code = (model.stock_item_code or "").strip()
+        if not item_code:
+            raise FactoryDataError(
+                f"factory {model.factory_id} has no stock_item_code; cannot compute a shortfall")
+        # Only this factory's orders: another factory's orders must never reserve stock here.
+        orders = [o for o in get_all_orders() if o.get("factory_id") == model.factory_id]
+        lines = get_order_lines([o["order_id"] for o in orders])
+        if not any(l["order_id"] == order_id and l["item_code"] == item_code for l in lines):
+            return None
+        return compute_shortfall(
+            order_id, item_code, orders, lines, get_stock_levels(model.factory_id),
+            get_inbound_shipments(model.factory_id), now,
+            delayed_supplier_id=supplier_id, delay_hours=delay_hours,
+        )
+    return resolve
+
+
 def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
     model = load_factory_model(state.get("factory_id"))   # FactoryDataError propagates (-> 503 in main)
@@ -194,7 +224,19 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     overridden = any(
         v is not None for v in (overrides.delay_hours, overrides.shortfall_units, overrides.line_speeds))
     # Resolve before any write: an unknown reference raises with nothing touched.
-    disruption = resolve_disruption(extraction, model, order_ids, overrides)
+    now = state.get("now") or datetime.now(timezone.utc)
+    disruption = resolve_disruption(
+        extraction, model, order_ids, overrides, shortfall_resolver=_make_shortfall_resolver(model, now))
+    breakdown = disruption.shortfall_breakdown
+    if disruption.shortfall_source == "inventory":
+        shortfall_txt = f"inventory: {breakdown.explanation()}"
+        if disruption.alert_stated_shortfall is not None:
+            shortfall_txt = (f"alert said {disruption.alert_stated_shortfall}; "
+                             f"using inventory: {breakdown.explanation()}")
+    elif disruption.shortfall_source == "override":
+        shortfall_txt = f"{disruption.shortfall_units} short (set manually)"
+    else:
+        shortfall_txt = f"{disruption.shortfall_units} short (from the alert; no inventory data for this order)"
 
     line_names = {l.line_id: l.name for l in model.lines}
     lines_txt = ", ".join(
@@ -210,6 +252,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         tool_called=f"extract_disruption_entities({source})",
         tool_output_summary=(
             f"{supplier_txt} | {lines_txt} | Shortfall {disruption.shortfall_units} units on #{disruption.order_id}"
+            f" ({shortfall_txt})"
             + (" | parameters set by scenario/slider override" if overridden else "")
         ),
         message=(
@@ -248,6 +291,9 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         "affected_supplier_id": disruption.supplier_id,
         "delay_hours": disruption.delay_hours,
         "shortfall_units": disruption.shortfall_units,
+        "shortfall_source": disruption.shortfall_source,
+        "shortfall_breakdown": breakdown.to_dict() if breakdown is not None else None,
+        "alert_stated_shortfall": disruption.alert_stated_shortfall,
         "order_id": disruption.order_id,
         "crisis_headline": disruption.headline,
         "extraction_source": source,
@@ -532,6 +578,7 @@ def run_cascade_pipeline(
     override_line_speeds: Optional[Dict[str, int]] = None,
     order_id: Optional[str] = None,
     factory_id: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     run_id = f"RUN-{uuid.uuid4().hex[:8].upper()}"
     initial: CascadeGraphState = {
@@ -543,9 +590,11 @@ def run_cascade_pipeline(
         "line_speeds": override_line_speeds,
         "shortfall_units": override_shortfall_units,
         "order_id": order_id,
+        "now": now or datetime.now(timezone.utc),
         "rebuttal_notes": [],
         "llm_trace": [],
     }
     final_state = cascade_graph.invoke(initial)
+    final_state.pop("now", None)   # run-internal clock; the persisted run must stay JSON-serialisable
     final_state["ai_mode"] = summarize_ai_mode(final_state.get("llm_trace", []))
     return final_state

@@ -9,7 +9,7 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from app.factory_model import FactoryModel
 from app.schemas import DisruptionExtraction
@@ -115,6 +115,9 @@ class ResolvedDisruption:
     order_id: str
     shortfall_units: int
     headline: str
+    shortfall_source: str = "alert_text"
+    shortfall_breakdown: Optional[Any] = None
+    alert_stated_shortfall: Optional[int] = None
 
     @property
     def line_speeds(self) -> dict:
@@ -132,6 +135,10 @@ class ResolvedDisruption:
             "order_id": self.order_id,
             "shortfall_units": self.shortfall_units,
             "headline": self.headline,
+            "shortfall_source": self.shortfall_source,
+            "shortfall_breakdown": (self.shortfall_breakdown.to_dict()
+                                    if self.shortfall_breakdown is not None else None),
+            "alert_stated_shortfall": self.alert_stated_shortfall,
         }
 
 
@@ -147,6 +154,7 @@ def resolve_disruption(
     model: FactoryModel,
     order_ids: Sequence[str],
     overrides: Optional[DisruptionOverrides] = None,
+    shortfall_resolver: Optional[Callable[[str, Optional[str], int], Optional[Any]]] = None,
 ) -> ResolvedDisruption:
     ov = overrides or DisruptionOverrides()
     line_names = {l.line_id: l.name for l in model.lines}
@@ -161,12 +169,6 @@ def resolve_disruption(
         delay = 0
     if delay < 0:
         raise DisruptionResolutionError(f"delay_hours must be >= 0, got {delay}")
-
-    shortfall = ov.shortfall_units if ov.shortfall_units is not None else extraction.shortfall_units
-    if shortfall is None:
-        raise DisruptionResolutionError("shortfall_units not stated")
-    if shortfall < 0:
-        raise DisruptionResolutionError(f"shortfall_units must be >= 0, got {shortfall}")
 
     impacts = []
     if ov.line_speeds is not None:
@@ -215,6 +217,26 @@ def resolve_disruption(
     else:
         supplier_id = None
 
+    # Shortfall precedence: explicit override > inventory-computed > number stated in the alert.
+    alert_shortfall = extraction.shortfall_units
+    breakdown = None
+    alert_stated = None
+    if ov.shortfall_units is not None:
+        shortfall, source = ov.shortfall_units, "override"
+    else:
+        if shortfall_resolver is not None:
+            breakdown = shortfall_resolver(order_id, supplier_id, delay)
+        if breakdown is not None:
+            shortfall, source = breakdown.shortfall, "inventory"
+            alert_stated = alert_shortfall
+        elif alert_shortfall is not None:
+            shortfall, source = alert_shortfall, "alert_text"
+        else:
+            raise DisruptionResolutionError(
+                f"shortfall_units not stated and order {order_id} has no inventory data")
+    if shortfall < 0:
+        raise DisruptionResolutionError(f"shortfall_units must be >= 0, got {shortfall}")
+
     headline = (extraction.crisis_headline or "").strip()
     if not headline:
         parts = []
@@ -225,4 +247,5 @@ def resolve_disruption(
         parts.append(f"{shortfall} short on #{order_id}")
         headline = "; ".join(parts)
 
-    return ResolvedDisruption(delay, tuple(impacts), supplier_id, order_id, shortfall, headline)
+    return ResolvedDisruption(delay, tuple(impacts), supplier_id, order_id, shortfall, headline,
+                              source, breakdown, alert_stated)
