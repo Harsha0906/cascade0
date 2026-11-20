@@ -141,7 +141,7 @@ Then apply `002_sourcing_agent.sql`, `003_factory_model.sql`, `004_durable_state
 `004_durable_state.sql` adds `analysis_runs`, `sourcing_sessions`, `execution_receipts`, `webhook_events`,
 the atomic `execute_plan_tx` function and a `schema_migrations` table.
 `005_generic_disruptions.sql` adds the `scenarios` table (preset disruptions per factory) and new `disruption_events` columns, and records `schema_migrations` level 5.
-`006_inventory.sql` adds `items`, `stock_levels`, `inbound_shipments`, `order_lines`, `orders.priority`, `factories.stock_item_code` and a nullable `scenarios.shortfall_units`, seeds the demo plant's inventory, and records level 6, which is now required. Its seed `UPDATE`s are guarded so a re-run does not overwrite edited data.
+`006_inventory.sql` adds `items`, `stock_levels`, `inbound_shipments`, `order_lines`, `orders.priority`, `orders.due_at` (absolute deadline, backfilled as now + `hours_remaining` for orders that have none), `factories.stock_item_code` and a nullable `scenarios.shortfall_units`, seeds the demo plant's inventory, and records level 6, which is now required. Its seed `UPDATE`s are guarded so a re-run does not overwrite edited data; re-run it after upgrading to add `due_at`.
 
 Check it with `GET /healthz`, which returns
 `{"storage", "db", "migration_level", "required_migration_level", "ready"}` and HTTP 200 when ready,
@@ -187,7 +187,7 @@ Unknown or ambiguous references, a missing shortfall, a line without a speed, a 
 
 - `POST /api/v1/simulate-crisis` takes `{scenario_id? | raw_message?, override_delay_hours?, override_shortfall_units?, override_line_speeds?: {line_id: 0..100}, order_id?}`.
   Neither `scenario_id` nor `raw_message` is a 422. `extracted_parameters` in the response has `delay_hours`, `line_impacts` (`line_id`, `name`, `speed_pct`, `temp_celsius`),
-  `affected_supplier_id`, `shortfall_units`, `affected_order_id`, `source` and `overridden_by_preset_or_slider`.
+  `affected_supplier_id`, `shortfall_units`, `affected_order_id`, `order_selection`, `other_order_shortfalls`, `source` and `overridden_by_preset_or_slider`.
 - `GET /api/v1/scenarios` lists the preset scenarios from the `scenarios` table (migration `005_generic_disruptions.sql`).
 - The WhatsApp status reply lists every non-normal line and every at-risk order. Vendor enquiries to flat-fee vendors ask for "a dedicated delivery ... for a flat fee".
 - MILP variables are named by index, so ids such as `L-B` and `L_B` cannot collide.
@@ -197,15 +197,23 @@ Unknown or ambiguous references, a missing shortfall, a line without a speed, a 
 The shortfall is computed from the factory's inventory instead of being typed into the alert (migration `006_inventory.sql`; `backend/app/inventory.py`).
 
 ```
-shortfall = max(0, demand − (on_hand + inbound_before_deadline − reserved_for_higher_priority))
+available = on_hand + inbound_before_deadline − reserved_for_higher_priority
+shortfall = min(demand, max(0, demand − available))
 ```
+
+The shortfall never exceeds the order's own demand: when higher-priority orders take all the supply
+(`available` < 0), the explanation says so instead of charging their deficit to this order.
 
 - **demand**: the order's line quantity for the planning item (`order_lines`).
 - **on_hand**: `stock_levels` for that item.
-- **inbound_before_deadline**: quantity on `OPEN` inbound shipments whose ETA, shifted by the delay for the delayed supplier's shipments, falls within the order's `hours_remaining` (deadline boundary inclusive). An OPEN shipment whose original ETA has already passed is *overdue*: it has not arrived, so it is not counted (the explanation reports the overdue quantity).
-- **reserved_for_higher_priority**: line quantities of other unfinished orders that rank ahead, ranked by `(priority, hours_remaining, order_id)` (lower priority number wins; default 100).
+- **inbound_before_deadline**: quantity on `OPEN` inbound shipments whose ETA, shifted by the delay for the delayed supplier's shipments, falls before the order's deadline (boundary inclusive). An OPEN shipment whose original ETA has already passed is *overdue*: it has not arrived, so it is not counted (the explanation reports the overdue quantity).
+- **reserved_for_higher_priority**: line quantities of other unfinished orders that rank ahead, ranked by `(priority, hours to deadline, order_id)` (lower priority number wins; default 100). *Unfinished* means any status except `DELIVERED` and `CANCELLED`: an order whose risk was accepted (`RISK_ACCEPTED`, after approving a no-action plan) still ships, so it still reserves stock. An order without a priority is rejected (422), never ranked by a guess.
+- **Deadline:** each order has an absolute `due_at`. Every deadline (the inventory check, the blast radius `hours_remaining` and the MILP / Monte Carlo deadline) is `due_at − now`, so it counts down. `hours_remaining` is kept for display and recomputed from `due_at` on every read. An order created before `due_at` existed falls back to its stored `hours_remaining` (static, does not count down); re-import it with a due date. An order already past its due time is rejected (422).
+- **Delay scope:** the alert's delay shifts every OPEN shipment from the delayed supplier, not only the one the message refers to.
 
-**Precedence:** explicit override (`override_shortfall_units` / slider) > inventory-computed > number stated in the alert text > **422**. The response's `extracted_parameters` carries `shortfall_source` (`override`, `inventory` or `alert_text`), the full `shortfall_breakdown` and, when inventory won over a different number in the alert, `alert_stated_shortfall`. Missing or malformed inventory data is rejected, not guessed.
+**Precedence:** explicit override (`override_shortfall_units` / slider) > inventory-computed > number stated in the alert text > **422**. The response's `extracted_parameters` carries `shortfall_source` (`override`, `inventory` or `alert_text`), the full `shortfall_breakdown` and `alert_stated_shortfall` (the number the alert itself stated, if any, when inventory was used; the dashboard mentions it, as "alert said N; not used", only when it differs from the computed value). Missing or malformed inventory data is rejected, not guessed.
+
+**Order selection:** `order_selection` says how the order was chosen: `override` (request `order_id` or preset), `stated` (named in the alert), `only_order` (the factory has one order) or `inventory`. When an alert describes a disruption (a supplier delay or a line impact) but names no order, the shortfall is computed for every open order of the factory with a line for the planning item, and the most urgent order that is short is chosen (the most urgent order when none is short). The narration says so, and `other_order_shortfalls` lists the other orders' computed shortfalls (`[{order_id, shortfall}]`). So "Chennai shipment delayed 48h" on the demo plant resolves to EV-402, 150 short. With no inventory data the alert must still name the order (422).
 
 **Single planning item:** each factory names one `stock_item_code` (the demo plant: `CASING`); the shortfall is computed for that item only. Multi-item bills of material are not modelled.
 
@@ -213,12 +221,19 @@ shortfall = max(0, demand − (on_hand + inbound_before_deadline − reserved_fo
 
 All require the API key. Body `{"filename", "csv_content"}`; response `{success, filename, imported_count, errors, warnings}`. Valid rows are imported even when others fail (`errors` lists `{line, error}`; `warnings` lists skipped or caveated rows).
 
+**Each inventory file is a full snapshot**, so re-import the whole export each time:
+- stock summary: an item not in the file has its stock row removed;
+- open purchase orders: an OPEN PO not in the file is marked `CLOSED` (received or cancelled), so a received PO is never counted both in stock and as inbound;
+- sales order lines: the file replaces all lines of each order it lists.
+
+Every removal or closure is listed in `warnings` (with `line: null`). Rows with errors are left unchanged, and a file whose header cannot be read changes nothing.
+
 | Endpoint | File |
 |---|---|
-| `POST /api/v1/ingest/stock-summary` | Tally stock summary (total rows skipped with a warning) |
-| `POST /api/v1/ingest/open-purchase-orders` | Open POs; overdue POs are imported with a warning, and a re-import never reopens a received PO |
+| `POST /api/v1/ingest/stock-summary` | Tally stock summary (total rows skipped with a warning; optional `Unit`/`UOM` column sets a new item's unit, else `pcs`) |
+| `POST /api/v1/ingest/open-purchase-orders` | Open POs; overdue POs are imported with a warning, and a re-import never reopens a received PO. `Pending Quantity` wins over `Quantity` |
 | `POST /api/v1/ingest/sales-order-lines` | Order lines per order and item |
-| `POST /api/v1/ingest/erp-csv` | Order upsert (required columns validated; updates never overwrite status or shortfall) |
+| `POST /api/v1/ingest/erp-csv` | Order upsert (required columns validated; updates never overwrite status or shortfall). Deadline from `due_date` (IST) or `hours_remaining` (from import time), stored as `due_at`; optional `priority` (a new order without it gets 100, the lowest) |
 
 Tally header aliases, quantity formats (`1,20,000`, `500 Nos`, `500.00`) and IST dates (`20-Nov-2026`, date alone = 17:00 IST) are documented in [`samples/tally/README.md`](samples/tally/README.md), with sample files that reproduce the demo seed. The dashboard shows the shortfall explanation and its source, and has a CSV import picker.
 
