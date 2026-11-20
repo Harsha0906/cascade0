@@ -24,6 +24,7 @@ from app.db import (
     upsert_row,
 )
 from app.schemas import DisruptionExtraction, LineImpactExtraction
+from app.disruption import DisruptionResolutionError, ResolvedDisruption
 from app.factory_model import FactoryModel
 from app.solver import generate_playbooks
 
@@ -229,57 +230,62 @@ def extract_disruption_entities(
 
 # ─── 2. Blast-Radius SQL Query & Realtime State Updater ──────────────────────
 
-def query_blast_radius_sql(
-    shortfall_units: int,
-    delay_hours: int,
-    line2_speed_pct: int,
-    order_id: str = "EV-402",
-    line2_temp_celsius: float | None = None,
-) -> Dict[str, Any]:
+def query_blast_radius_sql(model: FactoryModel, disruption: ResolvedDisruption) -> Dict[str, Any]:
     """
-    Computes blast radius across suppliers, lines, and client SLA contracts.
-    Updates Supabase tables to CRITICAL/BREACH_RISK states so the 2.5D
-    React Flow canvas glows crimson red via Supabase Realtime.
+    Computes the blast radius of a resolved disruption and writes it to the database: the delayed
+    supplier, every impacted line and the order at risk. Realtime subscribers see the change.
+    Everything returned about the order comes from the order row; nothing is defaulted.
     """
-    # 1. Update Chennai supplier status
-    update_rows("suppliers", "id", "SUP-CHN-01", {
-        "status": "DELAYED",
-        "delay_hours": delay_hours,
-    })
+    order = get_order(disruption.order_id)
+    if order is None:
+        raise DisruptionResolutionError(f"Unknown order '{disruption.order_id}'")
+    delay = disruption.delay_hours
 
-    # 2. Update Welding Line 2 status
-    temp_val = line2_temp_celsius if line2_temp_celsius else (89.0 if line2_speed_pct <= 50 else 74.0)
-    update_rows("production_lines", "line_id", "LINE-2", {
-        "status": "OVERHEATING_THROTTLED",
-        "speed_pct": line2_speed_pct,
-        "temp_celsius": temp_val,
-    })
+    if disruption.supplier_id:
+        update_rows("suppliers", "id", disruption.supplier_id, {
+            "status": "DELAYED",
+            "delay_hours": delay,
+        })
 
-    # 3. Update Order SLA status
-    order = get_order(order_id) or {
-        "order_id": order_id,
-        "client": "Ather-Grid Mobility Corp",
-        "sla_penalty_inr": 2500000,
-    }
-    sla_penalty = order.get("sla_penalty_inr", 2500000)
+    for li in disruption.line_impacts:
+        updates: Dict[str, Any] = {
+            "status": "THROTTLED" if li.speed_pct < 100 else "NORMAL",
+            "speed_pct": li.speed_pct,
+        }
+        if li.temp_celsius is not None:
+            updates["temp_celsius"] = li.temp_celsius
+        update_rows("production_lines", "line_id", li.line_id, updates)
 
-    update_rows("orders", "order_id", order_id, {
+    update_rows("orders", "order_id", disruption.order_id, {
         "status": "BREACH_RISK",
-        "shortfall_units": shortfall_units,
+        "shortfall_units": disruption.shortfall_units,
     })
+
+    has_supply = bool(disruption.supplier_id) and delay > 0
+    has_line = bool(disruption.line_impacts)
+    if has_supply and has_line:
+        severity = "COMPOUND"
+    elif has_supply:
+        severity = "SUPPLY"
+    elif has_line:
+        severity = "CAPACITY"
+    else:
+        severity = "LOW"
 
     return {
-        "order_id": order_id,
-        "client": order.get("client", "Ather-Grid Mobility Corp"),
-        "shortfall_units": shortfall_units,
-        "sla_penalty_inr": sla_penalty,
-        "partial_delay_penalty_inr": order.get("partial_delay_penalty_inr", 500000),
-        "hours_remaining": order.get("hours_remaining", 38),
-        "inbound_delay_hours": delay_hours,
-        "affected_supplier": "SUP-CHN-01 (Chennai Precision Casings)",
-        "line2_speed_pct": line2_speed_pct,
-        "line2_temp_celsius": temp_val,
-        "blast_radius_severity": "HIGH_COMPOUND_RISK",
+        "order_id": disruption.order_id,
+        "client": order["client"],
+        "shortfall_units": disruption.shortfall_units,
+        "sla_penalty_inr": order["sla_penalty_inr"],
+        "partial_delay_penalty_inr": order["partial_delay_penalty_inr"],
+        "hours_remaining": order["hours_remaining"],
+        "inbound_delay_hours": delay,
+        "affected_supplier_id": disruption.supplier_id,
+        "line_impacts": [
+            {"line_id": li.line_id, "speed_pct": li.speed_pct, "temp_celsius": li.temp_celsius}
+            for li in disruption.line_impacts
+        ],
+        "blast_radius_severity": severity,
     }
 
 

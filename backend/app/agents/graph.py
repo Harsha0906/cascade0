@@ -36,7 +36,8 @@ from app.agents.tools import (
     query_blast_radius_sql,
     run_pulp_milp_and_monte_carlo,
 )
-from app.db import log_agent_step
+from app.db import get_all_orders, log_agent_step
+from app.disruption import DisruptionOverrides, resolve_disruption
 from app.factory_model import FactoryModel, load_factory_model
 from app.solver import (
     simulate_monte_carlo,
@@ -140,8 +141,8 @@ class CascadeGraphState(TypedDict, total=False):
     source_channel: str
 
     delay_hours: int
-    line2_speed_pct: int
-    line2_temp_celsius: float
+    line_impacts: List[Dict[str, Any]]
+    affected_supplier_id: Optional[str]
     shortfall_units: int
     order_id: str
     crisis_headline: str
@@ -163,18 +164,15 @@ class CascadeGraphState(TypedDict, total=False):
     llm_trace: List[Dict[str, str]]
 
 
-def _default(value: Any, fallback: Any) -> Any:
-    """Use `fallback` only when `value` is missing (None) — never for a legitimate 0."""
-    return fallback if value is None else value
-
 
 def _ctx(state: CascadeGraphState) -> Tuple[float, int, int]:
-    br = state.get("blast_radius", {})
-    return (
-        float(_default(br.get("hours_remaining"), 38)),
-        int(state.get("delay_hours", 0)),
-        int(_default(br.get("sla_penalty_inr"), 2_500_000)),
-    )
+    br = state["blast_radius"]
+    return float(br["hours_remaining"]), int(state.get("delay_hours", 0)), int(br["sla_penalty_inr"])
+
+
+def _supplier_name(model: FactoryModel, supplier_id: str) -> str:
+    names = {**dict(model.primary_suppliers), **{v.supplier_id: v.name for v in model.vendors}}
+    return names.get(supplier_id, supplier_id)
 
 
 # ─── Node 1: Detective ───────────────────────────────────────────────────────
@@ -182,23 +180,36 @@ def _ctx(state: CascadeGraphState) -> Tuple[float, int, int]:
 def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
     model = load_factory_model(state.get("factory_id"))   # FactoryDataError propagates (-> 503 in main)
-    extraction, source = extract_disruption_entities(state["raw_message"])
+    order_ids = [o["order_id"] for o in get_all_orders() if o.get("factory_id") == model.factory_id]
+    extraction, source = extract_disruption_entities(state["raw_message"], model, order_ids)
 
     # Explicit overrides (scenario presets / sliders) win over extraction, and we say so.
     # None means "not overridden"; an explicit 0 is a real value and must win.
-    delay_hours = _default(state.get("delay_hours"), extraction.delay_hours)
-    line2_speed = _default(state.get("line2_speed_pct"), extraction.line2_speed_pct)
-    line2_temp = _default(state.get("line2_temp_celsius"), extraction.line2_temp_celsius)
-    shortfall = _default(state.get("shortfall_units"), extraction.shortfall_units)
-    order_id = state.get("order_id") or extraction.affected_order_id or "EV-402"
-    overridden = any(state.get(k) is not None for k in ("delay_hours", "line2_speed_pct", "shortfall_units"))
+    overrides = DisruptionOverrides(
+        delay_hours=state.get("delay_hours"),
+        shortfall_units=state.get("shortfall_units"),
+        line_speeds=state.get("line_speeds"),
+        order_id=state.get("order_id"),
+    )
+    overridden = any(
+        v is not None for v in (overrides.delay_hours, overrides.shortfall_units, overrides.line_speeds))
+    # Resolve before any write: an unknown reference raises with nothing touched.
+    disruption = resolve_disruption(extraction, model, order_ids, overrides)
+
+    line_names = {l.line_id: l.name for l in model.lines}
+    lines_txt = ", ".join(
+        f"{line_names[li.line_id]} {li.speed_pct}%"
+        + (f" ({li.temp_celsius:g}°C)" if li.temp_celsius is not None else "")
+        for li in disruption.line_impacts) or "no line impact"
+    supplier_txt = (f"{_supplier_name(model, disruption.supplier_id)} +{disruption.delay_hours}h"
+                    if disruption.supplier_id else "no supplier delay")
 
     log_agent_step(
         run_id=run_id, step_order=1,
         agent_name="Blast-Radius Detective", agent_role="Disruption Entity Extractor", badge_color="amber",
         tool_called=f"extract_disruption_entities({source})",
         tool_output_summary=(
-            f"Delay +{delay_hours}h | Line 2 {line2_speed}% ({line2_temp}°C) | Shortfall {shortfall} units on #{order_id}"
+            f"{supplier_txt} | {lines_txt} | Shortfall {disruption.shortfall_units} units on #{disruption.order_id}"
             + (" | parameters set by scenario/slider override" if overridden else "")
         ),
         message=(
@@ -208,21 +219,18 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         ),
     )
 
-    blast = query_blast_radius_sql(
-        shortfall_units=shortfall, delay_hours=delay_hours, line2_speed_pct=line2_speed,
-        order_id=order_id, line2_temp_celsius=line2_temp,
-    )
+    blast = query_blast_radius_sql(model, disruption)
     summary = (
-        f"Order #{order_id} exposed to ₹{blast['sla_penalty_inr']:,} penalty, "
-        f"{blast.get('hours_remaining', 38)}h to deadline. Inbound delay +{delay_hours}h; "
-        f"Line 2 at {line2_speed}% ({line2_temp}°C)."
+        f"Order #{disruption.order_id} exposed to ₹{blast['sla_penalty_inr']:,} penalty, "
+        f"{blast['hours_remaining']}h to deadline. {supplier_txt}; {lines_txt}."
     )
     msg, mode = _llm_agent_reason(
         "Blast-Radius Detective", "Causal Dependency Mapper",
         "Summarise the compound disruption and what is at stake.",
-        {"delay_hours": delay_hours, "line2_speed_pct": line2_speed, "line2_temp_celsius": line2_temp,
-         "shortfall_units": shortfall, "order_id": order_id, "sla_penalty_inr": blast["sla_penalty_inr"]},
-        f"⚠️ {summary} Shortfall: {shortfall} units.",
+        {"delay_hours": disruption.delay_hours, "supplier": supplier_txt, "line_impacts": lines_txt,
+         "shortfall_units": disruption.shortfall_units, "order_id": disruption.order_id,
+         "sla_penalty_inr": blast["sla_penalty_inr"]},
+        f"⚠️ {summary} Shortfall: {disruption.shortfall_units} units.",
     )
     log_agent_step(
         run_id=run_id, step_order=2,
@@ -235,13 +243,13 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     return {
         "factory_id": model.factory_id,
         "factory_model": model,
-        "line_speeds": {"LINE-2": line2_speed},
-        "delay_hours": delay_hours,
-        "line2_speed_pct": line2_speed,
-        "line2_temp_celsius": line2_temp,
-        "shortfall_units": shortfall,
-        "order_id": order_id,
-        "crisis_headline": extraction.crisis_headline,
+        "line_speeds": disruption.line_speeds,
+        "line_impacts": disruption.to_dict()["line_impacts"],
+        "affected_supplier_id": disruption.supplier_id,
+        "delay_hours": disruption.delay_hours,
+        "shortfall_units": disruption.shortfall_units,
+        "order_id": disruption.order_id,
+        "crisis_headline": disruption.headline,
         "extraction_source": source,
         "blast_radius": blast,
         "rebuttal_count": 0,
@@ -429,17 +437,17 @@ def should_rebuttal_continue(state: CascadeGraphState) -> Literal["rebuttal", "a
 def arbitrator_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
     deadline, delay, penalty = _ctx(state)
-    br = state.get("blast_radius", {})
+    br = state["blast_radius"]
     solver_dict = run_pulp_milp_and_monte_carlo(
         state["factory_model"],
         shortfall_units=state["shortfall_units"],
         delay_hours=delay,
         line_speeds=state["line_speeds"],
-        order_id=state.get("order_id", "EV-402"),
+        order_id=state["order_id"],
         sla_penalty_inr=penalty,
-        partial_penalty_inr=int(_default(br.get("partial_delay_penalty_inr"), 500_000)),
+        partial_penalty_inr=int(br["partial_delay_penalty_inr"]),
         deadline_hours=deadline,
-        client=br.get("client", "Ather-Grid Mobility Corp"),
+        client=br["client"],
         cfo_min_vendor_reliability_pct=state.get("cfo_reliability_floor_pct", 0.0),
     )
     playbooks = solver_dict["playbooks"]
@@ -521,8 +529,8 @@ def run_cascade_pipeline(
     source_channel: str = "WEB_DASHBOARD",
     override_delay_hours: Optional[int] = None,
     override_shortfall_units: Optional[int] = None,
-    override_line2_speed_pct: Optional[int] = None,
-    order_id: str = "EV-402",
+    override_line_speeds: Optional[Dict[str, int]] = None,
+    order_id: Optional[str] = None,
     factory_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     run_id = f"RUN-{uuid.uuid4().hex[:8].upper()}"
@@ -532,8 +540,7 @@ def run_cascade_pipeline(
         "raw_message": raw_message,
         "source_channel": source_channel,
         "delay_hours": override_delay_hours,
-        "line2_speed_pct": override_line2_speed_pct,
-        "line2_temp_celsius": None,
+        "line_speeds": override_line_speeds,
         "shortfall_units": override_shortfall_units,
         "order_id": order_id,
         "rebuttal_notes": [],

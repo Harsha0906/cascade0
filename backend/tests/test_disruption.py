@@ -2,7 +2,7 @@ import json
 import unittest
 
 from tests import _offline_env  # noqa: F401
-from tests.factories import small_factory
+from tests.factories import seed_second_factory, small_factory
 
 from app.disruption import (
     DisruptionOverrides,
@@ -324,6 +324,60 @@ class ExtractionHazardTests(unittest.TestCase):
             self.assertEqual((e.delay_hours, e.shortfall_units, e.affected_order), (d, sf, "EV-402"), k)
             if k != 2:
                 self.assertEqual(e.affected_supplier, "SUP-CHN-01", k)
+
+
+class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        from app import db
+        self.db = db
+        db.reset_to_seed()
+
+    def tearDown(self):
+        self.db.reset_to_seed()
+
+    def _snapshot(self):
+        import copy
+        return copy.deepcopy([
+            self.db.get_all_suppliers(), self.db.get_all_production_lines(), self.db.get_all_orders()])
+
+    def test_pipeline_on_second_factory(self):
+        from app.agents.graph import run_cascade_pipeline
+        seed_second_factory()
+        r = run_cascade_pipeline(
+            "L-B at 40%, 80 units short on WO-77, 5h delay from Vendor V1", factory_id="test-plant")
+        self.assertEqual(r["line_speeds"], {"L-B": 40})
+        self.assertEqual(r["order_id"], "WO-77")
+        self.assertEqual(r["affected_supplier_id"], "V1")
+        self.assertGreaterEqual(len(r["playbooks"]), 1)
+        line = self.db.get_production_line("L-B")
+        self.assertEqual(line["speed_pct"], 40)
+        self.assertEqual(line["status"], "THROTTLED")
+        self.assertEqual(self.db.get_order("WO-77")["status"], "BREACH_RISK")
+        self.assertEqual(self.db.get_supplier("V1")["status"], "DELAYED")
+
+    def test_unknown_reference_writes_nothing(self):
+        from app.agents.graph import run_cascade_pipeline
+        before = self._snapshot()
+        # The regex extractor never emits a line it cannot match, so an unknown reference reaches
+        # resolution only from an LLM extraction; simulate that.
+        bad = DisruptionExtraction(
+            affected_lines=[LineImpactExtraction(line="Line 9", speed_pct=40)],
+            affected_order="EV-402", shortfall_units=80)
+        from unittest import mock
+        with mock.patch("app.agents.graph.extract_disruption_entities", return_value=(bad, "gemini")):
+            with self.assertRaises(DisruptionResolutionError):
+                run_cascade_pipeline("Line 9 at 40%, 80 units short on EV-402")
+        self.assertEqual(self._snapshot(), before)
+
+    def test_multi_line_disruption(self):
+        from app.agents.graph import run_cascade_pipeline
+        speeds = {"LINE-1": 70, "LINE-3": 40}
+        r = run_cascade_pipeline(
+            "two lines degraded", override_delay_hours=12, override_shortfall_units=100,
+            override_line_speeds=speeds, order_id="EV-402")
+        self.assertEqual({li["line_id"] for li in r["line_impacts"]}, {"LINE-1", "LINE-3"})
+        gap = load_factory_model().throughput_gap(speeds)
+        self.assertEqual(r["solver_result"]["throughput_gap_units"], gap)
 
 
 if __name__ == "__main__":
