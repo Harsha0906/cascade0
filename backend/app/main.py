@@ -8,6 +8,9 @@ CascadeZero — FastAPI server
   POST /api/v1/webhooks/whatsapp           Meta (HMAC-verified) / Twilio webhook
   POST /api/v1/ingest/plc-telemetry        line telemetry (HTTP JSON, simulated) [API key]
   POST /api/v1/ingest/erp-csv              Tally/Excel CSV order upsert          [API key]
+  POST /api/v1/ingest/stock-summary        Tally stock summary CSV               [API key]
+  POST /api/v1/ingest/open-purchase-orders open purchase orders CSV              [API key]
+  POST /api/v1/ingest/sales-order-lines    sales order lines CSV                 [API key]
   POST /api/v1/ingest/live-highway-check   weather check (labelled when offline)
   POST /api/v1/execute-plan                execute a server-computed playbook    [API key]
   POST /api/v1/sourcing/start              Sourcing Agent: send vendor enquiries [API key]
@@ -32,7 +35,7 @@ import logging
 import math
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import httpx
@@ -41,7 +44,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import run_store
+from app import importers, run_store
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
 from app import db
@@ -313,7 +316,12 @@ def simulate_crisis(req: SimulateCrisisRequest):
             ],
             "affected_supplier_id": result["affected_supplier_id"],
             "shortfall_units": result["shortfall_units"],
+            "shortfall_source": result["shortfall_source"],
+            "shortfall_breakdown": result["shortfall_breakdown"],
+            "alert_stated_shortfall": result["alert_stated_shortfall"],
             "affected_order_id": result["order_id"],
+            "order_selection": result["order_selection"],
+            "other_order_shortfalls": result["other_order_shortfalls"],
             "source": result.get("extraction_source", "unknown"),
             "overridden_by_preset_or_slider": any(v is not None for v in (delay, shortfall, line_speeds)),
         },
@@ -582,9 +590,12 @@ def ingest_plc_telemetry(telemetry: PlcTelemetryRequest):
 
 # ─── 5. ERP CSV sync ─────────────────────────────────────────────────────────
 
-def _int_field(row: Dict[str, str], key: str, default: int) -> int:
+def _int_field(row: Dict[str, str], key: str, default: Optional[int] = None) -> int:
+    """Parse a non-negative integer column. With no default the column is required."""
     raw = (row.get(key) or "").replace(",", "").strip()
     if not raw:
+        if default is None:
+            raise ValueError(f"{key} is required")
         return default
     number = float(raw)  # ValueError for non-numeric text
     if not math.isfinite(number) or number < 0 or number > 10**12:
@@ -592,32 +603,67 @@ def _int_field(row: Dict[str, str], key: str, default: int) -> int:
     return int(number)
 
 
+# Priority of a new order imported without a `priority` column: the lowest (same as the
+# database DEFAULT), so an unranked order never reserves stock ahead of a ranked one.
+DEFAULT_ORDER_PRIORITY = 100
+
+
 @app.post("/api/v1/ingest/erp-csv", dependencies=[Depends(require_api_key)])
 def ingest_erp_csv(payload: ErpCsvSyncRequest):
-    """Upsert orders from a Tally/Excel CSV export. New orders are inserted, existing ones updated."""
+    """Upsert orders from a Tally/Excel CSV export. New orders are inserted, existing ones updated.
+
+    required_qty and sla_penalty_inr are always required; partial_delay_penalty_inr and a deadline
+    (`due_date`, IST, or `hours_remaining` from now) are required for a new order (an existing order
+    keeps its value when the column is blank). The deadline is stored as the absolute `due_at`.
+    `priority` is optional (lower ranks first); a new order without it gets DEFAULT_ORDER_PRIORITY.
+    Updates never overwrite the order's status or shortfall_units.
+    """
     if not payload.csv_content.strip():
         raise HTTPException(status_code=400, detail="Empty CSV content")
 
     imported, errors = [], []
-    reader = csv.DictReader(io.StringIO(payload.csv_content))
+    reader = csv.DictReader(io.StringIO(payload.csv_content.lstrip("\ufeff")))
+    reader.fieldnames = [importers.normalize_header(h) for h in (reader.fieldnames or [])]
     for line_no, row in enumerate(reader, start=2):
         order_id = (row.get("order_id") or "").strip()
         if not order_id:
             errors.append({"line": line_no, "error": "missing order_id"})
             continue
         try:
-            upsert_row("orders", {
+            existing = db.get_order(order_id)
+            record = {
                 "order_id": order_id,
-                "client": (row.get("client") or "").strip(),
-                "required_qty": _int_field(row, "required_qty", 0),
-                "sla_penalty_inr": _int_field(row, "sla_penalty_inr", 0),
-                "partial_delay_penalty_inr": _int_field(row, "partial_delay_penalty_inr", 0),
-                "hours_remaining": _int_field(row, "hours_remaining", 0),
-                "deadline_label": (row.get("deadline_label") or "").strip(),
-                "status": "ON_TRACK",
-                "shortfall_units": 0,
+                "required_qty": _int_field(row, "required_qty"),
+                "sla_penalty_inr": _int_field(row, "sla_penalty_inr"),
+                "factory_id": settings.DEFAULT_FACTORY_ID,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+            if existing is None or (row.get("partial_delay_penalty_inr") or "").strip():
+                record["partial_delay_penalty_inr"] = _int_field(row, "partial_delay_penalty_inr")
+            due_text = (row.get("due_date") or row.get("due_at") or "").strip()
+            if due_text:
+                due_at = importers.parse_eta(due_text)
+                record["due_at"] = due_at.isoformat()
+                hours = (due_at - datetime.now(timezone.utc)).total_seconds() / 3600.0
+                record["hours_remaining"] = max(0, int(round(hours)))  # display only; recomputed on read
+            elif (row.get("hours_remaining") or "").strip():
+                record["hours_remaining"] = _int_field(row, "hours_remaining")
+                record["due_at"] = (datetime.now(timezone.utc)
+                                    + timedelta(hours=record["hours_remaining"])).isoformat()
+            elif existing is None:
+                raise ValueError("due_date or hours_remaining is required")
+            if (row.get("priority") or "").strip():
+                record["priority"] = _int_field(row, "priority")
+            elif existing is None:
+                record["priority"] = DEFAULT_ORDER_PRIORITY
+            for key in ("client", "deadline_label"):
+                value = (row.get(key) or "").strip()
+                if value or existing is None:  # blank on update keeps the stored value
+                    record[key] = value
+            if existing is None:
+                record["status"] = "ON_TRACK"
+                record["shortfall_units"] = 0
+            upsert_row("orders", record)
             imported.append(order_id)
         except ValueError as exc:
             errors.append({"line": line_no, "order_id": order_id, "error": str(exc)})
@@ -629,6 +675,112 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
         "orders": imported,
         "errors": errors,
     }
+
+
+# ─── 5b. Inventory CSV imports (Tally/Excel) ─────────────────────────────────
+
+def _require_csv(payload: ErpCsvSyncRequest) -> None:
+    if not payload.csv_content.strip():
+        raise HTTPException(status_code=400, detail="Empty CSV content")
+
+
+def _import_response(payload: ErpCsvSyncRequest, result: importers.ImportResult) -> Dict[str, Any]:
+    return {
+        "success": not result.errors,
+        "filename": payload.filename,
+        "imported_count": len(result.rows),
+        "errors": result.errors,
+        "warnings": result.warnings,
+    }
+
+
+def _factory_item_codes(factory_id: str) -> set[str]:
+    return {i["item_code"] for i in db.get_items(factory_id)}
+
+
+def _snapshot_warning(text: str) -> Dict[str, Any]:
+    return {"line": None, "warning": text}
+
+
+@app.post("/api/v1/ingest/stock-summary", dependencies=[Depends(require_api_key)])
+def ingest_stock_summary(payload: ErpCsvSyncRequest):
+    """Replace on-hand stock from a Tally Stock Summary export (creates items with new codes).
+
+    The file is a full snapshot of the factory's stock: an item of the factory it does not mention
+    is set to on_hand_qty 0 (Tally hides zero-balance items; reported in warnings). An item on a
+    row with an error is left unchanged.
+    """
+    _require_csv(payload)
+    factory_id = settings.DEFAULT_FACTORY_ID
+    result = importers.parse_stock_summary(payload.csv_content, factory_id, _factory_item_codes(factory_id))
+    # Every item of the factory (with or without a stock row) is covered by the snapshot.
+    before = (_factory_item_codes(factory_id) | set(db.get_stock_levels(factory_id))
+              if result.header_ok else set())
+    now = datetime.now(timezone.utc).isoformat()
+    for item in result.items:
+        upsert_row("items", item, key_columns=("factory_id", "item_code"))
+    for row in result.rows:
+        upsert_row("stock_levels", {**row, "as_of": now}, key_columns=("factory_id", "item_code"))
+    # Tally's Stock Summary hides zero-balance items, so an item missing from the snapshot ran out.
+    for code in sorted(before - result.mentioned):
+        upsert_row("stock_levels", {"factory_id": factory_id, "item_code": code, "on_hand_qty": 0, "as_of": now},
+                   key_columns=("factory_id", "item_code"))
+        result.warnings.append(_snapshot_warning(f"{code} not in file — stock set to 0"))
+    return _import_response(payload, result)
+
+
+@app.post("/api/v1/ingest/open-purchase-orders", dependencies=[Depends(require_api_key)])
+def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
+    """Import open inbound shipments from a pending purchase orders export (dates are IST).
+
+    The file is a full snapshot of the factory's pending POs: an OPEN shipment it does not
+    mention is marked CLOSED (received or cancelled) and listed in warnings.
+    """
+    _require_csv(payload)
+    factory_id = settings.DEFAULT_FACTORY_ID
+    suppliers = {s["id"] for s in db.get_all_suppliers()
+                 if s.get("factory_id") == factory_id}
+    result = importers.parse_open_purchase_orders(
+        payload.csv_content, factory_id, _factory_item_codes(factory_id), suppliers,
+        datetime.now(timezone.utc),
+        existing_shipments={r["shipment_id"]: r for r in db.fetch_all("inbound_shipments")},
+    )
+    before = ({s["shipment_id"] for s in db.get_inbound_shipments(factory_id)}
+              if result.header_ok else set())
+    for row in result.rows:
+        upsert_row("inbound_shipments", row, key_columns=("shipment_id",))
+    closed = sorted(before - result.mentioned)
+    for sid in closed:
+        db.update_rows_where("inbound_shipments", {"shipment_id": sid, "factory_id": factory_id},
+                             {"status": "CLOSED"})
+    if closed:
+        result.warnings.append(_snapshot_warning(
+            f"{len(closed)} open PO(s) not in this file marked CLOSED (received or cancelled; "
+            f"each file is a full snapshot of pending POs): {', '.join(closed)}"))
+    return _import_response(payload, result)
+
+
+@app.post("/api/v1/ingest/sales-order-lines", dependencies=[Depends(require_api_key)])
+def ingest_sales_order_lines(payload: ErpCsvSyncRequest):
+    """Import order lines (item quantities per sales order) from a sales order export.
+
+    For every order the file lists, the file replaces that order's lines: a line of that order
+    the file does not mention is removed (reported in warnings). Other orders are untouched.
+    """
+    _require_csv(payload)
+    factory_id = settings.DEFAULT_FACTORY_ID
+    orders = {o["order_id"] for o in db.get_all_orders() if o.get("factory_id") == factory_id}
+    result = importers.parse_sales_order_lines(payload.csv_content, orders, _factory_item_codes(factory_id))
+    in_file = sorted({oid for oid, _ in result.mentioned}) if result.header_ok else []
+    stale = [l for l in db.get_order_lines(in_file) if (l["order_id"], l["item_code"]) not in result.mentioned]
+    for row in result.rows:
+        upsert_row("order_lines", row, key_columns=("order_id", "item_code"))
+    for line in stale:
+        db.delete_rows_where("order_lines", {"order_id": line["order_id"], "item_code": line["item_code"]})
+        result.warnings.append(_snapshot_warning(
+            f"order {line['order_id']} line for item {line['item_code']} is not in this file: removed "
+            f"(the file replaces all lines of each order it lists)"))
+    return _import_response(payload, result)
 
 
 # ─── 6. Highway weather ──────────────────────────────────────────────────────

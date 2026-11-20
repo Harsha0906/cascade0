@@ -199,3 +199,23 @@ export function buildTwinGraph(input: TwinGraphInput): { nodes: Node[]; edges: E
 
   return { nodes, edges };
 }
+
+export interface ShortfallParams {
+  shortfall_units: number;
+  shortfall_source: "override" | "inventory" | "alert_text";
+  shortfall_breakdown?: { explanation?: string } | null;
+  alert_stated_shortfall?: number | null;
+}
+
+/** One-line description of where the shortfall number came from. */
+export function shortfallText(p: ShortfallParams): string {
+  if (p.shortfall_source === "inventory") {
+    const base = p.shortfall_breakdown?.explanation ?? `${p.shortfall_units} short (from inventory)`;
+    // Mention the alert's own number only when it differs from what inventory gives.
+    return p.alert_stated_shortfall != null && p.alert_stated_shortfall !== p.shortfall_units
+      ? `${base} (alert said ${p.alert_stated_shortfall}; not used)`
+      : base;
+  }
+  if (p.shortfall_source === "override") return `${p.shortfall_units} short (set manually)`;
+  return `${p.shortfall_units} short (from the alert; no inventory data for this order)`;
+}

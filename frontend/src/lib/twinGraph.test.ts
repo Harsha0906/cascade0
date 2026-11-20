@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PROBLEM_LINE_STATUSES, buildTwinGraph, focusOrder, ordersSummary, throttledLinesText, type FactoryInfo } from "./twinGraph";
+import { PROBLEM_LINE_STATUSES, buildTwinGraph, focusOrder, ordersSummary, shortfallText, throttledLinesText, type FactoryInfo } from "./twinGraph";
 import type { Order, PlaybookOption, ProductionLine, Supplier } from "../store/useFactoryStore";
 
 const vendor = (id: string, role = "BACKUP") => ({
@@ -171,5 +171,45 @@ describe("ordersSummary", () => {
   });
   it("is empty with no orders", () => {
     expect(ordersSummary([])).toBe("");
+  });
+});
+
+describe("shortfallText", () => {
+  it("uses the backend explanation for inventory", () => {
+    expect(
+      shortfallText({
+        shortfall_units: 150,
+        shortfall_source: "inventory",
+        shortfall_breakdown: { explanation: "500 needed - (350 on hand + 0 inbound) = 150 short" },
+      }),
+    ).toBe("500 needed - (350 on hand + 0 inbound) = 150 short");
+  });
+  it("notes an ignored alert number for inventory", () => {
+    expect(
+      shortfallText({
+        shortfall_units: 150,
+        shortfall_source: "inventory",
+        shortfall_breakdown: { explanation: "E" },
+        alert_stated_shortfall: 200,
+      }),
+    ).toBe("E (alert said 200; not used)");
+  });
+  it("does not mention an alert number equal to the computed shortfall", () => {
+    expect(
+      shortfallText({
+        shortfall_units: 150,
+        shortfall_source: "inventory",
+        shortfall_breakdown: { explanation: "E" },
+        alert_stated_shortfall: 150,
+      }),
+    ).toBe("E");
+  });
+  it("describes a manual override", () => {
+    expect(shortfallText({ shortfall_units: 120, shortfall_source: "override" })).toBe("120 short (set manually)");
+  });
+  it("describes alert text", () => {
+    expect(shortfallText({ shortfall_units: 90, shortfall_source: "alert_text" })).toBe(
+      "90 short (from the alert; no inventory data for this order)",
+    );
   });
 });

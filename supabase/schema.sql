@@ -1,7 +1,7 @@
 -- ============================================================================
 -- CASCADEZERO — Complete PostgreSQL Schema, Realtime Setup & Seed Data
 -- Target: Supabase Cloud PostgreSQL (ap-south-1)
--- Fresh install: run this file, then migrations 001, 002, 003, 004, 005 in order.
+-- Fresh install: run this file, then migrations 001, 002, 003, 004, 005, 006 in order.
 -- Factory: Apex Volt EV Battery Plant (Bengaluru Unit-2)
 -- ============================================================================
 
@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS factories (
     id                          TEXT PRIMARY KEY,
     name                        TEXT NOT NULL,
     stock_item_name             TEXT NOT NULL,
+    stock_item_code             TEXT,
     qa_dispatch_hours           FLOAT NOT NULL,
     safety_stock_units          INTEGER NOT NULL,
     production_hours_in_window  FLOAT NOT NULL
@@ -98,7 +99,9 @@ CREATE TABLE IF NOT EXISTS orders (
     status                  TEXT NOT NULL DEFAULT 'ON_TRACK',
     shortfall_units         INTEGER NOT NULL DEFAULT 0,
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    factory_id              TEXT
+    factory_id              TEXT,
+    priority                INT NOT NULL DEFAULT 100,
+    due_at                  TIMESTAMPTZ   -- absolute deadline; hours_remaining is display only
 );
 
 -- ============================================================================
@@ -129,7 +132,7 @@ CREATE TABLE IF NOT EXISTS scenarios (
     summary          TEXT NOT NULL DEFAULT '',
     raw_message      TEXT NOT NULL,
     delay_hours      INT NOT NULL,
-    shortfall_units  INT NOT NULL,
+    shortfall_units  INT,
     line_speeds      JSONB NOT NULL DEFAULT '{}',
     order_id         TEXT NOT NULL,
     PRIMARY KEY (factory_id, scenario_id)
@@ -137,6 +140,58 @@ CREATE TABLE IF NOT EXISTS scenarios (
 ALTER TABLE scenarios ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS scenarios_read ON scenarios;
 CREATE POLICY scenarios_read ON scenarios FOR SELECT TO anon, authenticated USING (true);
+
+-- ============================================================================
+-- TABLE 5c: inventory (Phase 4) - items, stock levels, inbound shipments, order lines
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS items (
+    factory_id  TEXT NOT NULL,
+    item_code   TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    unit        TEXT NOT NULL DEFAULT 'pcs',
+    PRIMARY KEY (factory_id, item_code)
+);
+
+CREATE TABLE IF NOT EXISTS stock_levels (
+    factory_id   TEXT NOT NULL,
+    item_code    TEXT NOT NULL,
+    on_hand_qty  INT NOT NULL CHECK (on_hand_qty >= 0),
+    as_of        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (factory_id, item_code)
+);
+
+CREATE TABLE IF NOT EXISTS inbound_shipments (
+    shipment_id  TEXT PRIMARY KEY,
+    factory_id   TEXT NOT NULL,
+    item_code    TEXT NOT NULL,
+    supplier_id  TEXT NOT NULL,
+    qty          INT NOT NULL CHECK (qty > 0),
+    eta          TIMESTAMPTZ NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'OPEN'
+);
+
+CREATE TABLE IF NOT EXISTS order_lines (
+    order_id   TEXT NOT NULL,
+    item_code  TEXT NOT NULL,
+    qty        INT NOT NULL CHECK (qty > 0),
+    PRIMARY KEY (order_id, item_code)
+);
+
+ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS items_read ON items;
+CREATE POLICY items_read ON items FOR SELECT TO anon, authenticated USING (true);
+
+ALTER TABLE stock_levels ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS stock_levels_read ON stock_levels;
+CREATE POLICY stock_levels_read ON stock_levels FOR SELECT TO anon, authenticated USING (true);
+
+ALTER TABLE inbound_shipments ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS inbound_shipments_read ON inbound_shipments;
+CREATE POLICY inbound_shipments_read ON inbound_shipments FOR SELECT TO anon, authenticated USING (true);
+
+ALTER TABLE order_lines ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS order_lines_read ON order_lines;
+CREATE POLICY order_lines_read ON order_lines FOR SELECT TO anon, authenticated USING (true);
 
 -- ============================================================================
 -- TABLE 6: agent_logs (Realtime streamed to Agent Debate Terminal)
@@ -182,8 +237,8 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
 -- ============================================================================
 
 -- Factory
-INSERT INTO factories (id, name, stock_item_name, qa_dispatch_hours, safety_stock_units, production_hours_in_window)
-VALUES ('apex-volt-blr2', 'Apex Volt EV Battery Plant (Bengaluru Unit-2)', 'Aluminium Battery Casing', 2.5, 50, 16);
+INSERT INTO factories (id, name, stock_item_name, stock_item_code, qa_dispatch_hours, safety_stock_units, production_hours_in_window)
+VALUES ('apex-volt-blr2', 'Apex Volt EV Battery Plant (Bengaluru Unit-2)', 'Aluminium Battery Casing', 'CASING', 2.5, 50, 16);
 
 -- Suppliers
 INSERT INTO suppliers (id, name, tier, route, part_name, inbound_qty, max_available_qty, extra_cost_per_unit_inr, flat_charter_cost_inr, lead_time_hours, traffic_risk_pct, weather_risk_pct, status, delay_hours, factory_id, sourcing_role, lead_time_sigma_hours, delay_shock_min_hours, delay_shock_max_hours, unreliable_delay_min_hours, unreliable_delay_max_hours, min_lead_hours)
@@ -209,17 +264,28 @@ VALUES
     ('LINE-3', 'Robotic Welding Line 3', 'NORMAL', 100, 60.0, 150, 11250, 19, 8, 'apex-volt-blr2', 14);
 
 -- Orders
-INSERT INTO orders (order_id, client, required_qty, deadline_label, hours_remaining, sla_penalty_inr, partial_delay_penalty_inr, status, shortfall_units, factory_id)
+INSERT INTO orders (order_id, client, required_qty, deadline_label, hours_remaining, sla_penalty_inr, partial_delay_penalty_inr, status, shortfall_units, factory_id, priority)
 VALUES
-    ('EV-402', 'Ather-Grid Mobility Corp', 500, 'Friday 17:00 IST (38 Hours Remaining)', 38, 2500000, 500000, 'ON_TRACK', 0, 'apex-volt-blr2'),
-    ('EV-405', 'Deccan E-Fleet Logistics', 300, 'Monday 12:00 IST (110 Hours Remaining)', 110, 1000000, 200000, 'ON_TRACK', 0, 'apex-volt-blr2');
+    ('EV-402', 'Ather-Grid Mobility Corp', 500, 'Friday 17:00 IST (38 Hours Remaining)', 38, 2500000, 500000, 'ON_TRACK', 0, 'apex-volt-blr2', 10),
+    ('EV-405', 'Deccan E-Fleet Logistics', 300, 'Monday 12:00 IST (110 Hours Remaining)', 110, 1000000, 200000, 'ON_TRACK', 0, 'apex-volt-blr2', 20);
+UPDATE orders SET due_at = NOW() + hours_remaining * INTERVAL '1 hour' WHERE due_at IS NULL;
+
+-- Inventory (Phase 4)
+INSERT INTO items (factory_id, item_code, name, unit)
+VALUES ('apex-volt-blr2', 'CASING', 'Aluminium Battery Casing', 'pcs');
+INSERT INTO stock_levels (factory_id, item_code, on_hand_qty)
+VALUES ('apex-volt-blr2', 'CASING', 350);
+INSERT INTO inbound_shipments (shipment_id, factory_id, item_code, supplier_id, qty, eta, status)
+VALUES ('SHP-CHN-0001', 'apex-volt-blr2', 'CASING', 'SUP-CHN-01', 500, NOW() + INTERVAL '20 hours', 'OPEN');
+INSERT INTO order_lines (order_id, item_code, qty)
+VALUES ('EV-402', 'CASING', 500), ('EV-405', 'CASING', 300);
 
 -- Scenario presets
 INSERT INTO scenarios (factory_id, scenario_id, title, summary, raw_message, delay_hours, shortfall_units, line_speeds, order_id)
 VALUES
     ('apex-volt-blr2', 1, 'NH48 flood + Line 2 overheat', '48h delay, Line 2 at 50%, 150 casings short',
      'NH48 Chennai-Bengaluru highway flooding near Vellore delayed shipment of 500 aluminum battery casings from Chennai Precision by 48 hours. Simultaneously, Robotic Welding Line 2 overheated to 89.0°C and throttled to 50% speed. Current unit shortfall is 150 casings on Order #EV-402.',
-     48, 150, '{"LINE-2": 50}', 'EV-402'),
+     48, NULL, '{"LINE-2": 50}', 'EV-402'),
     ('apex-volt-blr2', 2, 'Minor toll delay', '6h delay, Line 2 at 85%, 25 casings short',
      'Minor toll transit delay on NH48 corridor causing 6 hours shipment delay for 25 units. Welding Line 2 slightly throttled to 85% speed (74°C). Shortfall is 25 battery casings on Order #EV-402.',
      6, 25, '{"LINE-2": 85}', 'EV-402'),

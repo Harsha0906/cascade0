@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -36,9 +38,12 @@ from app.agents.tools import (
     query_blast_radius_sql,
     run_pulp_milp_and_monte_carlo,
 )
-from app.db import get_all_orders, log_agent_step
-from app.disruption import DisruptionOverrides, resolve_disruption
-from app.factory_model import FactoryModel, load_factory_model
+from app.db import (
+    get_all_orders, get_inbound_shipments, get_order, get_order_lines, get_stock_levels, log_agent_step,
+)
+from app.disruption import DisruptionOverrides, DisruptionResolutionError, resolve_disruption
+from app.factory_model import FactoryDataError, FactoryModel, load_factory_model
+from app.inventory import FINISHED_STATUSES, compute_shortfall, deadline_hours, order_rank
 from app.solver import (
     simulate_monte_carlo,
     solve_pulp_milp,
@@ -52,6 +57,9 @@ MAX_REBUTTAL_ROUNDS = 1
 
 _genai_client = None
 _gemini_failure_logged = False
+NARRATION_TIMEOUT_MS = 6000           # one narration call; the model usually answers in ~2 s
+NARRATION_COOLDOWN_S = 60.0           # after a failure, use templates for this long (no repeated timeouts)
+_narration_down_until = 0.0
 
 
 # ─── LLM narration (optional) ────────────────────────────────────────────────
@@ -60,7 +68,8 @@ def _get_genai_client():
     global _genai_client
     if _genai_client is None:
         from google import genai
-        _genai_client = genai.Client(api_key=settings.GEMINI_API_KEY, http_options={"timeout": 12000})
+        _genai_client = genai.Client(api_key=settings.GEMINI_API_KEY,
+                                     http_options={"timeout": NARRATION_TIMEOUT_MS})
     return _genai_client
 
 
@@ -75,8 +84,8 @@ def _llm_agent_reason(
     Ask Gemini to narrate a decision that has already been computed.
     Returns (text, mode) where mode is "gemini" or "template".
     """
-    global _gemini_failure_logged
-    if not settings.has_gemini:
+    global _gemini_failure_logged, _narration_down_until
+    if not settings.has_gemini or time.monotonic() < _narration_down_until:
         return fallback_message, "template"
     try:
         prompt = (
@@ -91,6 +100,8 @@ def _llm_agent_reason(
         if resp.text and len(resp.text.strip()) > 15:
             return resp.text.strip(), "gemini"
     except Exception as exc:
+        # One slow or failed call should not make every remaining step wait for its own timeout.
+        _narration_down_until = time.monotonic() + NARRATION_COOLDOWN_S
         if not _gemini_failure_logged:
             logger.warning("Gemini narration unavailable (%s) — using templated narration", exc)
             _gemini_failure_logged = True
@@ -144,6 +155,12 @@ class CascadeGraphState(TypedDict, total=False):
     line_impacts: List[Dict[str, Any]]
     affected_supplier_id: Optional[str]
     shortfall_units: int
+    shortfall_source: str
+    shortfall_breakdown: Optional[Dict[str, Any]]
+    alert_stated_shortfall: Optional[int]
+    order_selection: str
+    other_order_shortfalls: List[Dict[str, Any]]
+    now: datetime
     order_id: str
     crisis_headline: str
     extraction_source: str
@@ -177,6 +194,58 @@ def _supplier_name(model: FactoryModel, supplier_id: str) -> str:
 
 # ─── Node 1: Detective ───────────────────────────────────────────────────────
 
+def _planning_item(model: FactoryModel) -> str:
+    item_code = (model.stock_item_code or "").strip()
+    if not item_code:
+        raise FactoryDataError(
+            f"factory {model.factory_id} has no stock_item_code; cannot compute a shortfall")
+    return item_code
+
+
+def _factory_orders(model: FactoryModel) -> List[Dict[str, Any]]:
+    # Only this factory's orders: another factory's orders must never reserve stock here.
+    return [o for o in get_all_orders() if o.get("factory_id") == model.factory_id]
+
+
+def _make_shortfall_resolver(model: FactoryModel, now: datetime) -> Callable[..., Any]:
+    """Inventory-based shortfall for one factory; reads data only when called (not on override).
+
+    Returns None when the order has no line for the planning item (no inventory data)."""
+    def resolve(order_id: str, supplier_id: Optional[str], delay_hours: int):
+        item_code = _planning_item(model)
+        orders = _factory_orders(model)
+        lines = get_order_lines([o["order_id"] for o in orders])
+        if not any(l["order_id"] == order_id and l["item_code"] == item_code for l in lines):
+            return None
+        return compute_shortfall(
+            order_id, item_code, orders, lines, get_stock_levels(model.factory_id),
+            get_inbound_shipments(model.factory_id), now,
+            delayed_supplier_id=supplier_id, delay_hours=delay_hours,
+        )
+    return resolve
+
+
+def _make_order_ranker(model: FactoryModel, now: datetime) -> Callable[..., List[Any]]:
+    """Shortfall breakdowns of every open order of the factory with a line for the planning item,
+    most urgent first (the reservation order). Used when the alert names no order."""
+    def rank(supplier_id: Optional[str], delay_hours: int) -> List[Any]:
+        item_code = _planning_item(model)
+        orders = _factory_orders(model)
+        lines = get_order_lines([o["order_id"] for o in orders])
+        with_line = {l["order_id"] for l in lines if l["item_code"] == item_code}
+        candidates = [o for o in orders
+                      if o["order_id"] in with_line and o.get("status") not in FINISHED_STATUSES]
+        if not candidates:
+            return []
+        candidates.sort(key=lambda o: order_rank(o, now))
+        stock = get_stock_levels(model.factory_id)
+        shipments = get_inbound_shipments(model.factory_id)
+        return [compute_shortfall(o["order_id"], item_code, orders, lines, stock, shipments, now,
+                                  delayed_supplier_id=supplier_id, delay_hours=delay_hours)
+                for o in candidates]
+    return rank
+
+
 def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
     model = load_factory_model(state.get("factory_id"))   # FactoryDataError propagates (-> 503 in main)
@@ -194,7 +263,28 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     overridden = any(
         v is not None for v in (overrides.delay_hours, overrides.shortfall_units, overrides.line_speeds))
     # Resolve before any write: an unknown reference raises with nothing touched.
-    disruption = resolve_disruption(extraction, model, order_ids, overrides)
+    now = state.get("now") or datetime.now(timezone.utc)
+    disruption = resolve_disruption(
+        extraction, model, order_ids, overrides, shortfall_resolver=_make_shortfall_resolver(model, now),
+        order_ranker=_make_order_ranker(model, now))
+    order_row = get_order(disruption.order_id)
+    if order_row is None:
+        raise DisruptionResolutionError(f"Unknown order '{disruption.order_id}'")
+    hours_left = deadline_hours(order_row, now)
+    if hours_left <= 0:
+        raise DisruptionResolutionError(
+            f"order {disruption.order_id} was due {-hours_left:.1f}h ago; update its due date before planning")
+    breakdown = disruption.shortfall_breakdown
+    if disruption.shortfall_source == "inventory":
+        shortfall_txt = f"inventory: {breakdown.explanation()}"
+        if (disruption.alert_stated_shortfall is not None
+                and disruption.alert_stated_shortfall != disruption.shortfall_units):
+            shortfall_txt = (f"alert said {disruption.alert_stated_shortfall}; "
+                             f"using inventory: {breakdown.explanation()}")
+    elif disruption.shortfall_source == "override":
+        shortfall_txt = f"{disruption.shortfall_units} short (set manually)"
+    else:
+        shortfall_txt = f"{disruption.shortfall_units} short (from the alert; no inventory data for this order)"
 
     line_names = {l.line_id: l.name for l in model.lines}
     lines_txt = ", ".join(
@@ -203,6 +293,12 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         for li in disruption.line_impacts) or "no line impact"
     supplier_txt = (f"{_supplier_name(model, disruption.supplier_id)} +{disruption.delay_hours}h"
                     if disruption.supplier_id else "no supplier delay")
+    selection_txt = ""
+    if disruption.order_selection == "inventory":
+        others = ", ".join(f"{x['order_id']} {x['shortfall']} short" for x in disruption.other_order_shortfalls)
+        selection_txt = (f" | order not named in the alert: chose #{disruption.order_id}, the most urgent "
+                         f"order that is short (checked from inventory"
+                         + (f"; also {others}" if others else "") + ")")
 
     log_agent_step(
         run_id=run_id, step_order=1,
@@ -210,6 +306,8 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         tool_called=f"extract_disruption_entities({source})",
         tool_output_summary=(
             f"{supplier_txt} | {lines_txt} | Shortfall {disruption.shortfall_units} units on #{disruption.order_id}"
+            f" ({shortfall_txt})"
+            + selection_txt
             + (" | parameters set by scenario/slider override" if overridden else "")
         ),
         message=(
@@ -219,10 +317,10 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         ),
     )
 
-    blast = query_blast_radius_sql(model, disruption)
+    blast = query_blast_radius_sql(model, disruption, now=now)
     summary = (
         f"Order #{disruption.order_id} exposed to ₹{blast['sla_penalty_inr']:,} penalty, "
-        f"{blast['hours_remaining']}h to deadline. {supplier_txt}; {lines_txt}."
+        f"{blast['hours_remaining']:g}h to deadline. {supplier_txt}; {lines_txt}."
     )
     msg, mode = _llm_agent_reason(
         "Blast-Radius Detective", "Causal Dependency Mapper",
@@ -248,6 +346,11 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         "affected_supplier_id": disruption.supplier_id,
         "delay_hours": disruption.delay_hours,
         "shortfall_units": disruption.shortfall_units,
+        "shortfall_source": disruption.shortfall_source,
+        "shortfall_breakdown": breakdown.to_dict() if breakdown is not None else None,
+        "alert_stated_shortfall": disruption.alert_stated_shortfall,
+        "order_selection": disruption.order_selection,
+        "other_order_shortfalls": [dict(x) for x in disruption.other_order_shortfalls],
         "order_id": disruption.order_id,
         "crisis_headline": disruption.headline,
         "extraction_source": source,
@@ -532,6 +635,7 @@ def run_cascade_pipeline(
     override_line_speeds: Optional[Dict[str, int]] = None,
     order_id: Optional[str] = None,
     factory_id: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     run_id = f"RUN-{uuid.uuid4().hex[:8].upper()}"
     initial: CascadeGraphState = {
@@ -543,9 +647,11 @@ def run_cascade_pipeline(
         "line_speeds": override_line_speeds,
         "shortfall_units": override_shortfall_units,
         "order_id": order_id,
+        "now": now or datetime.now(timezone.utc),
         "rebuttal_notes": [],
         "llm_trace": [],
     }
     final_state = cascade_graph.invoke(initial)
+    final_state.pop("now", None)   # run-internal clock; the persisted run must stay JSON-serialisable
     final_state["ai_mode"] = summarize_ai_mode(final_state.get("llm_trace", []))
     return final_state

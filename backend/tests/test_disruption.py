@@ -254,8 +254,8 @@ class ExtractionTests(unittest.TestCase):
         self.assertIsNone(ext.affected_supplier)
         self.assertIsNone(ext.affected_order)
         with self.assertRaises(DisruptionResolutionError) as cm:
-            resolve_disruption(ext, self.model, self.orders)
-        self.assertIn("shortfall_units not stated", str(cm.exception))
+            resolve_disruption(ext, self.model, ["EV-402"])
+        self.assertIn("shortfall_units not stated and order EV-402 has no inventory data", str(cm.exception))
 
 
 class ExtractionHazardTests(unittest.TestCase):

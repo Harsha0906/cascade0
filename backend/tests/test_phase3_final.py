@@ -218,6 +218,7 @@ class ApiFinalTests(unittest.TestCase):
         self.assertEqual((p["shortfall_units"], p["delay_hours"], p["affected_order_id"]), (120, 10, "EV-402"))
 
     def test_overrides_only_still_need_shortfall(self):
+        db.delete_all("order_lines")   # no inventory data: nothing can supply the shortfall
         r = self.client.post("/api/v1/simulate-crisis", headers=KEY,
                              json={"override_line_speeds": {"LINE-2": 40}, "order_id": "EV-402"})
         self.assertEqual(r.status_code, 422)

@@ -9,7 +9,7 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from app.factory_model import FactoryModel
 from app.schemas import DisruptionExtraction
@@ -115,6 +115,14 @@ class ResolvedDisruption:
     order_id: str
     shortfall_units: int
     headline: str
+    shortfall_source: str = "alert_text"
+    shortfall_breakdown: Optional[Any] = None
+    alert_stated_shortfall: Optional[int] = None
+    # How the order was chosen: "stated" (named in the alert), "override" (request/preset),
+    # "only_order" (the factory has one order) or "inventory" (most urgent order that is short).
+    order_selection: str = "stated"
+    # With order_selection "inventory": the other candidate orders' computed shortfalls.
+    other_order_shortfalls: tuple = ()
 
     @property
     def line_speeds(self) -> dict:
@@ -132,6 +140,12 @@ class ResolvedDisruption:
             "order_id": self.order_id,
             "shortfall_units": self.shortfall_units,
             "headline": self.headline,
+            "shortfall_source": self.shortfall_source,
+            "shortfall_breakdown": (self.shortfall_breakdown.to_dict()
+                                    if self.shortfall_breakdown is not None else None),
+            "alert_stated_shortfall": self.alert_stated_shortfall,
+            "order_selection": self.order_selection,
+            "other_order_shortfalls": [dict(x) for x in self.other_order_shortfalls],
         }
 
 
@@ -147,7 +161,12 @@ def resolve_disruption(
     model: FactoryModel,
     order_ids: Sequence[str],
     overrides: Optional[DisruptionOverrides] = None,
+    shortfall_resolver: Optional[Callable[[str, Optional[str], int], Optional[Any]]] = None,
+    order_ranker: Optional[Callable[[Optional[str], int], Sequence[Any]]] = None,
 ) -> ResolvedDisruption:
+    """`order_ranker(supplier_id, delay_hours)` returns inventory shortfall breakdowns (each with
+    .order_id and .shortfall) for the factory's open orders that have a line for the planning item,
+    most urgent first. It is used only when the alert names no order and the factory has several."""
     ov = overrides or DisruptionOverrides()
     line_names = {l.line_id: l.name for l in model.lines}
     primaries = dict(model.primary_suppliers)
@@ -161,12 +180,6 @@ def resolve_disruption(
         delay = 0
     if delay < 0:
         raise DisruptionResolutionError(f"delay_hours must be >= 0, got {delay}")
-
-    shortfall = ov.shortfall_units if ov.shortfall_units is not None else extraction.shortfall_units
-    if shortfall is None:
-        raise DisruptionResolutionError("shortfall_units not stated")
-    if shortfall < 0:
-        raise DisruptionResolutionError(f"shortfall_units must be >= 0, got {shortfall}")
 
     impacts = []
     if ov.line_speeds is not None:
@@ -193,17 +206,6 @@ def resolve_disruption(
                 raise DisruptionResolutionError(f"speed for line {lid} not stated")
             impacts.append(LineImpact(lid, _check_speed(lid, item.speed_pct), item.temp_celsius))
 
-    order_map = {o: o for o in order_ids}
-    if ov.order_id:
-        order_id = resolve_reference(ov.order_id, order_map, "order")
-    elif extraction.affected_order:
-        order_id = resolve_reference(extraction.affected_order, order_map, "order")
-    elif len(order_ids) == 1:
-        order_id = order_ids[0]
-    else:
-        raise DisruptionResolutionError(
-            "order not stated; known orders: " + ", ".join(order_ids))
-
     if extraction.affected_supplier:
         supplier_id = resolve_reference(extraction.affected_supplier, vendor_names, "supplier")
     elif delay > 0:
@@ -215,6 +217,51 @@ def resolve_disruption(
     else:
         supplier_id = None
 
+    order_map = {o: o for o in order_ids}
+    picked = None
+    others: tuple = ()
+    if ov.order_id:
+        order_id, selection = resolve_reference(ov.order_id, order_map, "order"), "override"
+    elif extraction.affected_order:
+        order_id, selection = resolve_reference(extraction.affected_order, order_map, "order"), "stated"
+    elif len(order_ids) == 1:
+        order_id, selection = order_ids[0], "only_order"
+    else:
+        # Only an alert that describes a disruption (a supplier delay or a line impact) is mapped
+        # to an order from inventory; an alert with neither has nothing to plan for.
+        disrupted = delay > 0 or bool(impacts)
+        ranked = list(order_ranker(supplier_id, delay)) if (order_ranker is not None and disrupted) else []
+        if not ranked:
+            raise DisruptionResolutionError(
+                "order not stated; known orders: " + ", ".join(order_ids))
+        # The most urgent order that is short; when none is short, the most urgent order.
+        picked = next((b for b in ranked if b.shortfall > 0), ranked[0])
+        order_id, selection = picked.order_id, "inventory"
+        others = tuple({"order_id": b.order_id, "shortfall": b.shortfall}
+                       for b in ranked if b is not picked)
+
+    # Shortfall precedence: explicit override > inventory-computed > number stated in the alert.
+    alert_shortfall = extraction.shortfall_units
+    breakdown = None
+    alert_stated = None
+    if ov.shortfall_units is not None:
+        shortfall, source = ov.shortfall_units, "override"
+    else:
+        if picked is not None:
+            breakdown = picked
+        elif shortfall_resolver is not None:
+            breakdown = shortfall_resolver(order_id, supplier_id, delay)
+        if breakdown is not None:
+            shortfall, source = breakdown.shortfall, "inventory"
+            alert_stated = alert_shortfall
+        elif alert_shortfall is not None:
+            shortfall, source = alert_shortfall, "alert_text"
+        else:
+            raise DisruptionResolutionError(
+                f"shortfall_units not stated and order {order_id} has no inventory data")
+    if shortfall < 0:
+        raise DisruptionResolutionError(f"shortfall_units must be >= 0, got {shortfall}")
+
     headline = (extraction.crisis_headline or "").strip()
     if not headline:
         parts = []
@@ -225,4 +272,5 @@ def resolve_disruption(
         parts.append(f"{shortfall} short on #{order_id}")
         headline = "; ".join(parts)
 
-    return ResolvedDisruption(delay, tuple(impacts), supplier_id, order_id, shortfall, headline)
+    return ResolvedDisruption(delay, tuple(impacts), supplier_id, order_id, shortfall, headline,
+                              source, breakdown, alert_stated, selection, others)

@@ -237,9 +237,9 @@ class DurableStateTests(unittest.TestCase):
             db.call_function("execute_plan_tx", {})
 
     def test_migration_level_live_max_version(self):
-        stub = StubClient(data=[{"version": 5}])
+        stub = StubClient(data=[{"version": 6}])
         with mock.patch("app.db._get_supabase", return_value=stub):
-            self.assertEqual(db.migration_level(), 5)
+            self.assertEqual(db.migration_level(), 6)
 
     def test_migration_level_missing_table_is_zero(self):
         with mock.patch("app.db._get_supabase", return_value=StubClient(error=MissingTableError())):
@@ -448,7 +448,7 @@ class WebhookDedupeHealthTests(unittest.TestCase):
     def test_healthz_offline_ready(self):
         r = self.client.get("/healthz")
         self.assertEqual((r.status_code, r.json()["storage"], r.json()["ready"]), (200, "offline", True))
-        self.assertEqual(r.json()["required_migration_level"], 5)
+        self.assertEqual(r.json()["required_migration_level"], 6)
 
     def test_healthz_reports_old_migration_level(self):
         with mock.patch("app.db.migration_level", return_value=3):

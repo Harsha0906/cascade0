@@ -35,7 +35,7 @@ export function CrisisSandboxModal() {
   // Form states
   const [freeformPrompt, setFreeformPrompt] = useState("");
   const [targetOrderChoice, setTargetOrder] = useState<string | null>(null);
-  const [shortfallUnits, setShortfallUnits] = useState(150);
+  const [shortfallUnits, setShortfallUnits] = useState<string>("");
   const [delayHours, setDelayHours] = useState(48);
   const [lineSpeeds, setLineSpeeds] = useState<Record<string, number>>({});
 
@@ -74,7 +74,9 @@ export function CrisisSandboxModal() {
     closeCustomCrisisModal();
     await simulateCustom({
       override_delay_hours: delayHours,
-      override_shortfall_units: shortfallUnits,
+      ...(shortfallUnits.trim() !== "" && Number.isFinite(Number(shortfallUnits))
+        ? { override_shortfall_units: Number(shortfallUnits) }
+        : {}),
       override_line_speeds,
       order_id: targetOrder || undefined,
     });
@@ -241,22 +243,20 @@ export function CrisisSandboxModal() {
                 </div>
 
                 <div>
-                  <div className="flex items-center justify-between text-[11px] font-mono font-bold text-charcoal-700 mb-1">
-                    <span>Material Shortfall</span>
-                    <span className="text-coral">{shortfallUnits} Units</span>
-                  </div>
+                  <label className="text-[11px] font-mono font-bold text-charcoal-700 block mb-1">
+                    Material Shortfall (units, optional)
+                  </label>
                   <input
-                    type="range"
-                    min="25"
-                    max="450"
-                    step="25"
+                    type="number"
+                    min="0"
+                    step="1"
                     value={shortfallUnits}
-                    onChange={(e) => setShortfallUnits(Number(e.target.value))}
-                    className="w-full accent-coral"
+                    onChange={(e) => setShortfallUnits(e.target.value)}
+                    placeholder="blank = computed from inventory"
+                    className="w-full p-2.5 rounded-xl border border-charcoal-900/15 text-xs font-mono bg-white"
                   />
                 </div>
               </div>
-
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <div className="flex items-center justify-between text-[11px] font-mono font-bold text-charcoal-700 mb-1">
@@ -302,7 +302,7 @@ export function CrisisSandboxModal() {
                 className="w-full py-3 rounded-xl bg-acid hover:bg-acid-hover text-charcoal-950 font-mono font-extrabold text-xs shadow-pill transition-all active:scale-95 flex items-center justify-center gap-2 mt-4"
               >
                 <Zap className="w-4 h-4 fill-current" />
-                <span>Inject Custom Crisis ({shortfallUnits} Units / +{delayHours}h)</span>
+                <span>Inject Custom Crisis ({shortfallUnits.trim() !== "" ? `${shortfallUnits} Units` : "shortfall from inventory"} / +{delayHours}h)</span>
               </button>
             </div>
           )}

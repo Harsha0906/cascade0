@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 from app.config import settings
@@ -26,6 +27,7 @@ from app.db import (
 from app.schemas import DisruptionExtraction, LineImpactExtraction
 from app.disruption import DisruptionResolutionError, ResolvedDisruption, resolve_reference
 from app.factory_model import FactoryModel
+from app.inventory import deadline_hours
 from app.solver import generate_playbooks
 
 logger = logging.getLogger("cascadezero.tools")
@@ -351,15 +353,19 @@ def extract_disruption_entities(
 
 # ─── 2. Blast-Radius SQL Query & Realtime State Updater ──────────────────────
 
-def query_blast_radius_sql(model: FactoryModel, disruption: ResolvedDisruption) -> Dict[str, Any]:
+def query_blast_radius_sql(
+    model: FactoryModel, disruption: ResolvedDisruption, now: Optional[datetime] = None,
+) -> Dict[str, Any]:
     """
     Computes the blast radius of a resolved disruption and writes it to the database: the delayed
     supplier, every impacted line and the order at risk. Realtime subscribers see the change.
     Everything returned about the order comes from the order row; nothing is defaulted.
+    `hours_remaining` is the time left until the order's due_at at `now` (the MILP deadline).
     """
     order = get_order(disruption.order_id)
     if order is None:
         raise DisruptionResolutionError(f"Unknown order '{disruption.order_id}'")
+    hours_remaining = round(deadline_hours(order, now or datetime.now(timezone.utc)), 2)
     delay = disruption.delay_hours
 
     if disruption.supplier_id and delay > 0:
@@ -399,7 +405,7 @@ def query_blast_radius_sql(model: FactoryModel, disruption: ResolvedDisruption) 
         "shortfall_units": disruption.shortfall_units,
         "sla_penalty_inr": order["sla_penalty_inr"],
         "partial_delay_penalty_inr": order["partial_delay_penalty_inr"],
-        "hours_remaining": order["hours_remaining"],
+        "hours_remaining": hours_remaining,
         "inbound_delay_hours": delay,
         "affected_supplier_id": disruption.supplier_id,
         "line_impacts": [

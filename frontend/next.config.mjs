@@ -1,6 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
+  // A full analysis (MILP + Monte Carlo + several AI narration calls) can exceed the 30 s default.
+  experimental: { proxyTimeout: 120_000 },
   async rewrites() {
     return [
       {
