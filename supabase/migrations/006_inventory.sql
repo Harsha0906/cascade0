@@ -85,9 +85,9 @@ INSERT INTO order_lines (order_id, item_code, qty)
 VALUES ('EV-402', 'CASING', 500), ('EV-405', 'CASING', 300)
 ON CONFLICT (order_id, item_code) DO NOTHING;
 
-UPDATE orders SET priority = 10 WHERE order_id = 'EV-402';
-UPDATE orders SET priority = 20 WHERE order_id = 'EV-405';
-UPDATE factories SET stock_item_code = 'CASING' WHERE id = 'apex-volt-blr2';
+UPDATE orders SET priority = 10 WHERE order_id = 'EV-402' AND priority = 100;
+UPDATE orders SET priority = 20 WHERE order_id = 'EV-405' AND priority = 100;
+UPDATE factories SET stock_item_code = 'CASING' WHERE id = 'apex-volt-blr2' AND stock_item_code IS NULL;
 UPDATE scenarios SET shortfall_units = NULL WHERE factory_id = 'apex-volt-blr2' AND scenario_id = 1;
 
 INSERT INTO schema_migrations (version) VALUES (6) ON CONFLICT DO NOTHING;
