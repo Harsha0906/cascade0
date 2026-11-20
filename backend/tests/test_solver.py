@@ -304,5 +304,35 @@ class TallyXmlTests(unittest.TestCase):
         self.assertEqual(root.findtext(".//STOCKITEMNAME"), "Widget")
 
 
+class IndexNamedVariableTests(unittest.TestCase):
+    @staticmethod
+    def _colliding_factory():
+        from tests.factories import _vendor
+        from app.factory_model import FactoryModel
+        return FactoryModel(
+            factory_id="collide", name="Collide", stock_item_name="Widget",
+            qa_dispatch_hours=2.0, safety_stock_units=30, production_hours_in_window=10.0,
+            vendors=(
+                _vendor("V-1", "BACKUP", 30, 500, 0, 4, 90),
+                _vendor("V_1", "BACKUP", 30, 600, 0, 4, 90),
+            ),
+            lines=(
+                ProductionLine("L-B", "Line B", 10.0, 20, 5000, 6),
+                ProductionLine("L_B", "Line B2", 10.0, 10, 3000, 2),
+            ),
+        )
+
+    def test_colliding_ids_do_not_collide_in_milp(self):
+        lp = solve_pulp_milp(self._colliding_factory(), 50, {"L-B": 50}, 40)
+        self.assertTrue(set(lp["overtime_line_hours"]) <= {"L-B", "L_B"})
+        self.assertTrue(lp["feasible"])  # both vendors usable -> 50 units covered
+
+    def test_solver_result_reports_line_speeds(self):
+        res = generate_playbooks(small_factory(), 40, 5, {"L-B": 60}, order_id="WO-1",
+                                 sla_penalty_inr=100_000, partial_penalty_inr=20_000,
+                                 deadline_hours=30, client="Client")
+        self.assertEqual(res.line_speeds, {"L-B": 60})
+
+
 if __name__ == "__main__":
     unittest.main()

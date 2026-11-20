@@ -104,7 +104,7 @@ class SolverResult(BaseModel):
     """Output from the PuLP Optimizer and Monte Carlo Risk Simulator."""
     shortfall_units: int
     delay_hours: int
-    line2_speed_pct: int
+    line_speeds: dict[str, int]
     order_id: str
     total_sla_exposure_inr: int
     playbooks: List[PlaybookOption]

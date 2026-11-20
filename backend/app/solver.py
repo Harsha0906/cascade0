@@ -86,10 +86,6 @@ def _val(var) -> float:
     return float(v or 0.0)
 
 
-def _var_name(prefix: str, ident: str) -> str:
-    return f"{prefix}_" + "".join(c if c.isalnum() else "_" for c in ident)
-
-
 def _unsolved(status: str, solver_status: str, shortfall_units: int, gap: int) -> Dict[str, Any]:
     return {
         "status": status,
@@ -152,9 +148,10 @@ def solve_pulp_milp(
     lines = model.overtime_lines
 
     prob = pulp.LpProblem("CascadeZero_Recovery", pulp.LpMinimize)
-    x = {v.supplier_id: _new_var(prob, _var_name("x", v.supplier_id), 0, v.max_units, "Integer") for v in vendors}
-    y = {v.supplier_id: _new_var(prob, _var_name("y", v.supplier_id), cat="Binary") for v in vendors}
-    h = {l.line_id: _new_var(prob, _var_name("h", l.line_id), 0, l.max_ot_hours, "Integer") for l in lines}
+    # Index-based names: ids may contain any characters and sanitised ids can collide.
+    x = {v.supplier_id: _new_var(prob, f"x_{i}", 0, v.max_units, "Integer") for i, v in enumerate(vendors)}
+    y = {v.supplier_id: _new_var(prob, f"y_{i}", cat="Binary") for i, v in enumerate(vendors)}
+    h = {l.line_id: _new_var(prob, f"h_{j}", 0, l.max_ot_hours, "Integer") for j, l in enumerate(lines)}
     window = _new_var(prob, "H_ot_window", 0, max((l.max_ot_hours for l in lines), default=0))
     w_window, w_unit = _tie_break_weights(model)
     u_mat = _new_var(prob, "u_material", 0, None)
@@ -171,12 +168,12 @@ def solve_pulp_milp(
     prob += (pulp.lpSum(x.values()) + u_mat >= shortfall_units, "Material_Coverage")
     prob += (pulp.lpSum(l.ot_units_per_hour * h[l.line_id] for l in lines) + u_cap >= gap,
              "Throughput_Recovery")
-    for l in lines:
-        prob += (window >= h[l.line_id], _var_name("Window", l.line_id))
-    for v in vendors:
+    for j, l in enumerate(lines):
+        prob += (window >= h[l.line_id], f"Window_{j}")
+    for i, v in enumerate(vendors):
         sid = v.supplier_id
-        prob += (x[sid] <= v.max_units * y[sid], _var_name("Engage", sid))
-        prob += (v.lead_hours * y[sid] + window + qa <= deadline_hours, _var_name("Deadline", sid))
+        prob += (x[sid] <= v.max_units * y[sid], f"Engage_{i}")
+        prob += (v.lead_hours * y[sid] + window + qa <= deadline_hours, f"Deadline_{i}")
     prob += (window + qa <= deadline_hours, "Deadline_Overtime")
     if force_vendor_id is not None:
         prob += (y[force_vendor_id] == 1, "Policy_Forced_Vendor")
@@ -722,8 +719,7 @@ def generate_playbooks(
     return SolverResult(
         shortfall_units=shortfall_units,
         delay_hours=delay_hours,
-        # Slowest reported line speed (kept for the existing API field until Phase 3).
-        line2_speed_pct=min(line_speeds.values(), default=100),
+        line_speeds=dict(line_speeds),
         order_id=order_id,
         total_sla_exposure_inr=sla_penalty_inr,
         playbooks=plans,
@@ -736,30 +732,3 @@ def generate_playbooks(
         ranking_rule="argmin(mitigation_cost + (1 - P_on_time) × SLA_penalty)",
         capacity_exhausted=any_infeasible,
     )
-
-
-# ─── 5. CLI ──────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import io
-    import sys
-
-    from app.factory_model import load_factory_model
-
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    factory = load_factory_model()
-    order = dict(order_id="EV-402", sla_penalty_inr=2_500_000, partial_penalty_inr=500_000,
-                 deadline_hours=38, client="Ather-Grid Mobility Corp")
-    for label, (shortfall, delay, speed) in [
-        ("Scenario 1 (150u, 48h, 50%)", (150, 48, 50)),
-        ("Scenario 2 (25u, 6h, 85%)", (25, 6, 85)),
-        ("Scenario 3 (350u, 72h, 25%)", (350, 72, 25)),
-        ("Over capacity (1000u, 72h, 25%)", (1000, 72, 25)),
-    ]:
-        res = generate_playbooks(factory, shortfall, delay, {"LINE-2": speed}, **order)
-        print(f"\n== {label} → {res.recommended_plan_id} | {res.lp_status} | {res.solve_duration_ms}ms")
-        for p in res.playbooks:
-            mark = "*" if p.recommended else " "
-            print(f" {mark} {p.id}: cost ₹{p.total_mitigation_cost_inr:,}  P(on-time) {p.confidence_pct}% "
-                  f"[{p.confidence_ci_low_pct}-{p.confidence_ci_high_pct}]  E[cost] ₹{p.expected_cost_inr:,}  "
-                  f"feasible={p.feasible}  — {p.description}")
