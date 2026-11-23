@@ -142,11 +142,12 @@ Then apply `002_sourcing_agent.sql`, `003_factory_model.sql`, `004_durable_state
 the atomic `execute_plan_tx` function and a `schema_migrations` table.
 `005_generic_disruptions.sql` adds the `scenarios` table (preset disruptions per factory) and new `disruption_events` columns, and records `schema_migrations` level 5.
 `006_inventory.sql` adds `items`, `stock_levels`, `inbound_shipments`, `order_lines`, `orders.priority`, `orders.due_at` (absolute deadline, backfilled as now + `hours_remaining` for orders that have none), `factories.stock_item_code` and a nullable `scenarios.shortfall_units`, seeds the demo plant's inventory, and records level 6. Its seed `UPDATE`s are guarded so a re-run does not overwrite edited data; re-run it after upgrading to add `due_at`.
-`007_learning_and_coordination.sql` (requires 006) adds `delivery_outcomes` (promised-vs-actual delivery per PO line, `PENDING` until recorded), `order_coordination` (one Client/Sourcing record per root run, optimistic concurrency, service-role only), and replaces `execute_plan_tx` with a 9-argument version whose `p_outcomes` writes the PENDING outcomes in the same transaction as the PO. It records level 7, which is now required.
+`007_learning_and_coordination.sql` (requires 006) adds `delivery_outcomes` (promised-vs-actual delivery per PO line, `PENDING` until recorded), `order_coordination` (one Client/Sourcing record per root run, optimistic concurrency, service-role only), and replaces `execute_plan_tx` with a 9-argument version whose `p_outcomes` writes the PENDING outcomes in the same transaction as the PO. It records level 7.
+`008_identity.sql` (requires 007) is the identity and tenancy migration: `factory_members`, a `factory_id` on every tenant table, member-only Row-Level Security (no anon access, no open policies), `user_channels` and `link_codes` (chat identities, service-only), `suppliers.telegram_chat_id` and `orders.client_contact` (Telegram contacts), and a final RLS check that rolls the whole migration back if any policy is open or any table lacks RLS. It records level 8, which is now required. It refuses to run below level 7. Apply it in the Supabase SQL editor.
 
 Check it with `GET /healthz`, which returns
 `{"storage", "db", "migration_level", "required_migration_level", "ready"}` and HTTP 200 when ready,
-503 otherwise. The backend logs an error at startup if the database is below level 7 (production refuses to start).
+503 otherwise. The backend logs an error at startup if the database is below level 8 (production refuses to start).
 
 ### Storage modes
 
@@ -343,7 +344,7 @@ The planner's vendor numbers are assumptions; the Sourcing Agent replaces them w
 
 1. After an analysis, click **Confirm with suppliers first** (dashboard) or `POST /api/v1/sourcing/start {run_id}`.
 2. The agent sends an enquiry to each vendor in the chosen plan — explicitly *not* a purchase order.
-3. Replies arrive over WhatsApp (`SOURCING_MODE=whatsapp`, vendor numbers in `suppliers.whatsapp_number`) or are typed on the dashboard (simulated mode, or a reply received by phone).
+3. Replies arrive over WhatsApp (`SOURCING_MODE=whatsapp`, vendor numbers in `suppliers.whatsapp_number`), over Telegram (`SOURCING_MODE=telegram`, vendor chat ids in `suppliers.telegram_chat_id`) or are typed on the dashboard (simulated mode, or a reply received by phone).
 4. Each reply becomes a structured offer. Declines and timeouts remove that vendor; partial or re-priced offers update capacity, price and lead time for this run only (a confirmed ETA also caps the vendor's minimum lead time, see Route and Weather Risk).
 5. When no enquiry is outstanding it re-solves. If the best plan needs an unconfirmed vendor, it asks that vendor (next round); otherwise it hands a **confirmed plan** back for human approval (`<run_id>-S<round>`).
 
@@ -352,6 +353,42 @@ Apply `supabase/migrations/002_sourcing_agent.sql` for vendor numbers and the en
 
 Known limits: WhatsApp messages are de-duplicated by Meta message id and recorded before processing, so a replayed approval or vendor reply never runs twice. If processing fails unexpectedly after recording (database error or other exception) the id is released and the webhook returns 503/500, so Meta's retry is processed; messages that were handled (including error replies sent to the sender) stay recorded.
 Sourcing sessions use optimistic concurrency (`version` column; 409 after 3 conflicting retries), but multiple backend workers are not yet supported for sourcing.
+
+## 👤 Login, Roles and Tenant Isolation
+
+- **Login.** The dashboard signs users in with Supabase Auth (email and password). Every request carries the user's access token, which the backend verifies server-side. There is no shared browser key.
+- **Roles per factory.** A user belongs to one or more factories with a role in `factory_members`: **owner** (everything, including `/reset`), **approver** (run analyses, start sourcing, approve plans) or **viewer** (read only). A new user signs up on the dashboard first; then an operator grants access:
+
+  ```bash
+  cd backend
+  python -m app.admin add-member --email user@example.com --factory apex-volt-blr2 --role owner
+  ```
+
+  The command needs `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in `backend/.env`. `approved_by` on every purchase order and receipt is the signed-in user's email (`telegram:<email>` / `whatsapp:<email>` for a linked chat), never a request field.
+- **Tenant isolation.** Every tenant table has a `factory_id`. Row-Level Security lets a signed-in user read only the rows of factories they are a member of; the browser has no write privileges and anon has none at all. The backend also authorises every route and every run against the run's own factory, so a user of factory A gets a 404 for factory B's runs, plans, sourcing sessions and receipts.
+- **API key for automation only.** `CASCADE_API_KEY` (`X-API-Key`) is a machine key for scripts and PLC telemetry on `/api/v1/ingest/*` and `/api/v1/simulate-crisis`. It is bound to `CASCADE_API_KEY_FACTORY`, cannot approve plans and is never used by the browser.
+
+## 💬 Chat Channels: WhatsApp and Telegram
+
+WhatsApp and Telegram are two implementations of one channel adapter (`backend/app/channels/`: `send_text`, `send_buttons`, `parse_inbound`). The shared flow in `backend/app/inbound.py` gives both channels the same commands (`/link`, `status`, a disruption alert, a vendor reply, the Approve button), the same de-duplication and the same authorisation: a chat can approve only after it is linked to a user, and only when that user is an owner or approver of the run's factory (a chat linked for factory A cannot act on factory B). Chats that are not linked get the `/link` instructions and nothing else. While no WhatsApp chat is linked, the legacy `WA_APPROVER_NUMBERS` fallback applies to the default factory only; linking the first WhatsApp chat ends it.
+
+**Telegram setup (free, no card)**
+
+1. Create a bot with BotFather (`/newbot`) and put the token in `backend/.env`: `TELEGRAM_BOT_TOKEN=...` (secret; never commit it).
+2. Receive messages in one of two ways (they are exclusive):
+   - **Polling (laptop, no public URL):** `cd backend && python -m app.telegram_poll`. It clears any webhook, long-polls `getUpdates`, remembers its offset in a local file and stops cleanly on Ctrl-C.
+   - **Webhook (public HTTPS):** set `TELEGRAM_WEBHOOK_SECRET` in `backend/.env`, then point Telegram at `POST /api/v1/telegram/webhook` with `setWebhook` and the same `secret_token`. Without the secret every update is refused.
+3. **Link a chat to your user:** in the dashboard create a link code (`POST /api/v1/channels/link-code`; valid 15 minutes, single use), then send `/link <code>` to the bot. From then on the chat acts as that user in that factory.
+4. **Vendors and clients on Telegram:** set `SOURCING_MODE=telegram`, then record the numeric chat ids (the person starts the bot first):
+
+   ```bash
+   cd backend
+   python -m app.admin set-vendor-contact --supplier SUP-PNY-02 --channel telegram --address 123456789
+   python -m app.admin set-client-contact --order EV-402 --channel telegram --address 987654321
+   ```
+
+   RFQs go to the vendor chats, a vendor's reply in the chat (for example `YES 150 @600 in 4h`) is matched to the open enquiry, and the Client Agent's approved message goes to the order's `client_contact`. A vendor without a chat id gets a `SEND_FAILED` enquiry; an order without a contact returns 409 "no client contact". `--channel whatsapp` sets the WhatsApp number instead.
+5. Apply migration `008_identity.sql` (level 8 is required; it adds `user_channels`, `link_codes`, `suppliers.telegram_chat_id` and `orders.client_contact`).
 
 ## 🔐 Security Setup
 
