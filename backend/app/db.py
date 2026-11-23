@@ -343,7 +343,7 @@ def _seed_inbound_shipments(now: datetime | None = None) -> list[dict[str, Any]]
     }]
 
 
-REQUIRED_MIGRATION_LEVEL = 8
+REQUIRED_MIGRATION_LEVEL = 9
 
 # The only factory with demo seed data (POST /api/v1/reset restores it; other factories -> 409).
 DEMO_FACTORY_ID = "apex-volt-blr2"
@@ -403,6 +403,7 @@ class InMemoryMirror:
         # Chat identities (Round B Task 5): (channel, address) -> user + factory; one-time codes.
         self.user_channels: list[dict[str, Any]] = []
         self.link_codes: list[dict[str, Any]] = []
+        self.contact_invites: list[dict[str, Any]] = []   # Round S: Telegram contact deep links
         self.schema_migrations: list[dict[str, Any]] = [
             {"version": v} for v in range(1, REQUIRED_MIGRATION_LEVEL + 1)
         ]
@@ -1033,23 +1034,23 @@ def _parse_ts(value: Any) -> datetime | None:
         return None
 
 
-def consume_link_code(code_hash: str) -> dict[str, Any] | None:
-    """Atomically mark an unused, unexpired code as used and return its row; None for an unknown,
-    used or expired code. One conditional UPDATE live, so two chats racing on one code cannot both
-    win."""
+def _consume_once(table: str, column: str, value: str) -> dict[str, Any] | None:
+    """Atomically mark an unused, unexpired single-use row (matched on `column`) as used and return
+    it; None for an unknown, used or expired one. One conditional UPDATE live, so two chats racing
+    on one token cannot both win."""
     now = datetime.now(timezone.utc)
     client = _get_supabase()
     if client is not None:
         try:
-            rows = (client.table("link_codes").update({"used_at": now.isoformat()})
-                    .eq("code", code_hash).is_("used_at", "null").gt("expires_at", now.isoformat())
+            rows = (client.table(table).update({"used_at": now.isoformat()})
+                    .eq(column, value).is_("used_at", "null").gt("expires_at", now.isoformat())
                     .execute().data or [])
         except Exception as exc:
-            raise _fail("consume", "link_codes", exc) from exc
+            raise _fail("consume", table, exc) from exc
         return rows[0] if rows else None
     with _conditional_lock:
-        for row in _mirror.link_codes:
-            if row.get("code") != code_hash or row.get("used_at") is not None:
+        for row in _mirror.get_table(table):
+            if row.get(column) != value or row.get("used_at") is not None:
                 continue
             expires = _parse_ts(row.get("expires_at"))
             if expires is None or expires <= now:
@@ -1057,6 +1058,29 @@ def consume_link_code(code_hash: str) -> dict[str, Any] | None:
             row["used_at"] = now.isoformat()
             return copy.deepcopy(row)
     return None
+
+
+def consume_link_code(code_hash: str) -> dict[str, Any] | None:
+    """Atomically mark an unused, unexpired link code as used and return its row (else None)."""
+    return _consume_once("link_codes", "code", code_hash)
+
+
+# ─── Telegram contact invites (Round S): deep-link tokens, stored hashed, single use, service-only ──
+
+def create_contact_invite(token_hash: str, factory_id: str, kind: str, target_id: str, expires_at: str) -> None:
+    insert_row("contact_invites", {"token_hash": token_hash, "factory_id": factory_id, "kind": kind,
+                                   "target_id": target_id, "expires_at": expires_at, "used_at": None})
+
+
+def consume_contact_invite(token_hash: str) -> dict[str, Any] | None:
+    """The invite row, marked used, or None for an unknown, used or expired token."""
+    return _consume_once("contact_invites", "token_hash", token_hash)
+
+
+def get_factory_members(factory_id: str) -> list[dict[str, Any]]:
+    """Every membership of a factory ({user_id, factory_id, role, email}), ordered by email."""
+    rows = fetch_where("factory_members", {"factory_id": factory_id})
+    return sorted(rows, key=lambda r: (r.get("email") or "", str(r.get("user_id"))))
 
 
 def get_receipt(root_run_id: str) -> dict[str, Any] | None:

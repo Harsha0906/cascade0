@@ -61,10 +61,11 @@ def normalize_header(header: str) -> str:
     return _norm(header).replace(" ", "_")
 
 
-def _read(csv_text: str, wanted: dict[str, bool], qty_aliases: tuple = ()):
+def _read(csv_text: str, wanted: dict[str, bool], qty_aliases: tuple = (),
+          extra_aliases: Mapping[str, tuple] | None = None):
     """Return ([(line, {field: value})], header errors). `wanted` maps field -> required;
     `qty_aliases` are the accepted quantity headers for this file, in priority order."""
-    aliases = {**_ALIASES, "qty": qty_aliases}
+    aliases = {**_ALIASES, "qty": qty_aliases, **(extra_aliases or {})}
     reader = csv.reader(io.StringIO((csv_text or "").lstrip("\ufeff")))
     try:
         header = next(reader)
@@ -260,3 +261,78 @@ def parse_sales_order_lines(
         seen.add((oid, code))
         result.rows.append({"order_id": oid, "item_code": code, "qty": qty})
     return result
+
+
+# ─── Setup data (Round S): suppliers and production lines ─────────────────────
+# These parsers only read and type the cells; the API validates bounds and writes. A row's
+# `_line` is its CSV line number (for the API's row-level errors).
+
+_SUPPLIER_FIELDS = {
+    "name": ("name", "supplier", "supplier name"),
+    "sourcing_role": ("sourcing_role", "role", "sourcing role"),
+    "unit_cost": ("unit_cost", "unit cost", "extra cost per unit"),
+    "flat_cost": ("flat_cost", "flat cost", "flat charter cost"),
+    "max_units": ("max_units", "max units", "max qty", "max available qty"),
+    "lead_hours": ("lead_hours", "lead hours", "lead time hours"),
+    "min_lead_hours": ("min_lead_hours", "min lead hours", "minimum lead hours"),
+    "route": ("route",),
+    "risk_profile": ("risk_profile", "risk profile", "risk"),
+    "past_orders": ("past_orders", "past orders"),
+    "on_time": ("on_time", "on time", "on time deliveries"),
+    "telegram_chat_id": ("telegram_chat_id", "telegram chat id", "telegram"),
+}
+_SUPPLIER_REQUIRED = {"name", "sourcing_role", "max_units", "lead_hours", "route", "risk_profile"}
+_SUPPLIER_NUMBERS = {"unit_cost", "flat_cost", "max_units", "lead_hours", "min_lead_hours", "past_orders", "on_time"}
+
+_LINE_FIELDS = {
+    "name": ("name", "line", "line name"),
+    "rated_units_per_hour": ("rated_units_per_hour", "rated units per hour", "rated rate"),
+    "ot_units_per_hour": ("ot_units_per_hour", "ot units per hour", "extra units per ot hour"),
+    "ot_cost_per_hour": ("ot_cost_per_hour", "ot cost per hour", "overtime cost per hour"),
+    "max_ot_hours": ("max_ot_hours", "max ot hours"),
+}
+_LINE_REQUIRED = {"name", "rated_units_per_hour"}
+_LINE_NUMBERS = {"rated_units_per_hour", "ot_units_per_hour", "ot_cost_per_hour", "max_ot_hours"}
+
+
+def _cell_number(raw: str, name: str) -> float:
+    try:
+        value = float(raw.replace(",", ""))
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from None
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} must be a finite number")
+    return value
+
+
+def _parse_table(csv_text: str, fields: dict, required: set, numbers: set) -> ImportResult:
+    result = ImportResult()
+    wanted = {f: f in required for f in fields}
+    rows, header_errors = _read(csv_text, wanted, (), fields)
+    result.errors.extend(header_errors)
+    result.header_ok = not header_errors
+    for line, r in rows:
+        try:
+            row: dict[str, Any] = {"_line": line}
+            for name, raw in r.items():
+                if raw == "":
+                    if name in required:
+                        raise ValueError(f"missing {name}")
+                    continue
+                row[name] = _cell_number(raw, name) if name in numbers else raw
+        except ValueError as exc:
+            result.errors.append({"line": line, "error": str(exc)})
+            continue
+        result.rows.append(row)
+    return result
+
+
+def parse_suppliers_csv(csv_text: str) -> ImportResult:
+    """Supplier rows (required columns: name, sourcing_role, max_units, lead_hours, route,
+    risk_profile). Numbers are read as numbers, text is kept as written."""
+    return _parse_table(csv_text, _SUPPLIER_FIELDS, _SUPPLIER_REQUIRED, _SUPPLIER_NUMBERS)
+
+
+def parse_lines_csv(csv_text: str) -> ImportResult:
+    """Production line rows (required columns: name, rated_units_per_hour)."""
+    return _parse_table(csv_text, _LINE_FIELDS, _LINE_REQUIRED, _LINE_NUMBERS)

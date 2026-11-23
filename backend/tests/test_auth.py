@@ -239,7 +239,7 @@ class ActorTests(unittest.TestCase):
         two_no_default = auth.Actor("user", "u", "a@x", {"test-plant": "owner", "f3": "viewer"})
         with self.assertRaises(HTTPException) as cm:
             two_no_default.factory_for()
-        self.assertEqual(cm.exception.status_code, 404)
+        self.assertEqual(cm.exception.status_code, 409)
         with self.assertRaises(HTTPException) as cm:
             auth.Actor("user", "u", "a@x", {}).factory_for()
         self.assertEqual(cm.exception.status_code, 404)

@@ -46,6 +46,8 @@ class Settings:
     # ── Telegram Bot API ──────────────────────────────────────────────────
     # Bot token (BotFather). Secret: env only, never logged. Unset: nothing is sent to Telegram.
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    # The bot's public @username (no @): contact invites are https://t.me/<username>?start=<token>.
+    TELEGRAM_BOT_USERNAME: str = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
     # Shared secret Telegram echoes in X-Telegram-Bot-Api-Secret-Token (setWebhook secret_token).
     # Unset: the Telegram webhook refuses every update (fail closed).
     TELEGRAM_WEBHOOK_SECRET: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")

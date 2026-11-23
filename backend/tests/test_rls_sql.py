@@ -172,7 +172,7 @@ class Migration008RlsTests(unittest.TestCase):
         self.assertEqual(self.sql.strip().splitlines()[-1],
                          "INSERT INTO schema_migrations (version) VALUES (8) ON CONFLICT DO NOTHING;")
         self.assertLess(self.sql.index("CREATE POLICY suppliers_member_read"), self.sql.index("APPEND their parts HERE"))
-        self.assertEqual(sorted(p.name for p in MIGRATIONS.glob("*.sql"))[-1], "008_identity.sql")
+        self.assertEqual(sorted(p.name for p in MIGRATIONS.glob("*.sql"))[-1], "009_setup.sql")
 
 
     def test_log_rows_and_outcomes_always_get_the_executing_factory(self):

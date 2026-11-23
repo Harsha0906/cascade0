@@ -3,7 +3,7 @@
 import React, { useState } from "react";
 import { Zap } from "lucide-react";
 import { supabase } from "@/lib/supabase";
-import { apiFetch, NO_MEMBERSHIP_MESSAGE } from "@/lib/session";
+import { apiFetch } from "@/lib/session";
 
 export default function LoginPage() {
   const [mode, setMode] = useState<"signin" | "signup">("signin");
@@ -37,11 +37,8 @@ export default function LoginPage() {
       }
       // Signed in: does this user belong to a factory? The backend answers 404 on /factory if not.
       const res = await apiFetch("/api/v1/factory");
-      if (res.status === 404) {
-        setNotice(NO_MEMBERSHIP_MESSAGE);
-        return;
-      }
-      window.location.assign("/");
+      // No factory yet: the setup wizard creates one.
+      window.location.assign(res.status === 404 ? "/setup" : "/");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sign-in failed");
     } finally {

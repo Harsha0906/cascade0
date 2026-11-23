@@ -24,6 +24,7 @@ OFFLINE = {
     # Telegram: never the real bot token from backend/.env; tests use fake transports.
     "TELEGRAM_BOT_TOKEN": "",
     "TELEGRAM_WEBHOOK_SECRET": "",
+    "TELEGRAM_BOT_USERNAME": "",
     "META_APP_ID": "",
     "SOURCING_MODE": "simulated",
     "SOURCING_RFQ_TEMPLATE": "",

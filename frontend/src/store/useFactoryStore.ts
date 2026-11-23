@@ -223,6 +223,7 @@ interface FactoryState {
     override_line_speeds?: Record<string, number>;
     order_id?: string;
   }) => Promise<void>;
+  selectPlaybook: (playbookId: string) => void;
   executePlaybook: (playbookId: string) => Promise<void>;
   startSourcing: () => Promise<void>;
   refreshSourcing: () => Promise<void>;
@@ -489,6 +490,11 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     runSimulation({ scenario_id: scenarioId, raw_message: customText }, scenarioId ?? null),
 
   simulateCustom: async (input) => runSimulation(input, null),
+
+  selectPlaybook: (playbookId: string) => {
+    set({ selectedPlaybookId: playbookId });
+    get().updateNodesAndEdges();
+  },
 
   executePlaybook: async (playbookId: string) => {
     const { activeRunId, playbooks } = get();

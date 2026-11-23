@@ -5,7 +5,7 @@ import { useFactoryStore } from "@/store/useFactoryStore";
 import { clientStatusText } from "@/lib/clientStatus";
 import { Loader2, MailCheck } from "lucide-react";
 
-const FIELD = "text-[11px] font-mono px-2.5 py-1.5 rounded-xl bg-white border border-charcoal-900/15";
+const FIELD = "text-[11px] px-2.5 py-1.5 rounded-xl bg-white border border-charcoal-900/15";
 
 export function ClientPanel() {
   const {
@@ -37,7 +37,7 @@ export function ClientPanel() {
 
   return (
     <div className="p-3 rounded-2xl bg-sky-50 border border-sky-200 space-y-2" aria-live="polite">
-      <div className="flex items-center justify-between text-[10px] font-mono font-bold text-sky-950">
+      <div className="flex items-center justify-between text-[10px] font-bold text-sky-950">
         <span className="flex items-center gap-1.5">
           <MailCheck className="w-3.5 h-3.5" /> CLIENT AGENT
         </span>
@@ -70,7 +70,7 @@ export function ClientPanel() {
           <button
             type="submit"
             disabled={isClientBusy || !hoursOk}
-            className="px-3 rounded-xl bg-sky-700 text-white font-mono font-bold text-[11px] disabled:opacity-40"
+            className="px-3 rounded-xl bg-sky-700 text-white font-bold text-[11px] disabled:opacity-40"
           >
             {clientRecord ? "Redraft" : "Draft extension request"}
           </button>
@@ -78,7 +78,7 @@ export function ClientPanel() {
       )}
 
       {clientRecord?.draft_message && (
-        <pre className="whitespace-pre-wrap text-[10px] font-mono bg-white/80 border border-sky-100 rounded-xl p-2.5 text-charcoal-800">
+        <pre className="whitespace-pre-wrap text-[10px] bg-white/80 border border-sky-100 rounded-xl p-2.5 text-charcoal-800">
           {clientRecord.draft_message}
         </pre>
       )}
@@ -101,7 +101,7 @@ export function ClientPanel() {
           <button
             type="submit"
             disabled={isClientBusy || !approver.trim()}
-            className="px-3 rounded-xl bg-charcoal-900 text-acid font-mono font-bold text-[11px] disabled:opacity-40"
+            className="px-3 rounded-xl bg-charcoal-900 text-acid font-bold text-[11px] disabled:opacity-40"
           >
             Approve &amp; send
           </button>
@@ -132,7 +132,7 @@ export function ClientPanel() {
               type="button"
               disabled={isClientBusy || !deadlineOk}
               onClick={() => answerClientExtension(true, answerText, newDeadline.trim() ? Number(newDeadline) : undefined)}
-              className="flex-1 py-2 rounded-xl bg-emerald-700 text-white font-mono font-bold text-[11px] disabled:opacity-40"
+              className="flex-1 py-2 rounded-xl bg-emerald-700 text-white font-bold text-[11px] disabled:opacity-40"
             >
               Accepted (+{clientRecord?.extension_hours ?? "?"}h)
             </button>
@@ -140,7 +140,7 @@ export function ClientPanel() {
               type="button"
               disabled={isClientBusy}
               onClick={() => answerClientExtension(false, answerText)}
-              className="flex-1 py-2 rounded-xl bg-coral text-white font-mono font-bold text-[11px] disabled:opacity-40"
+              className="flex-1 py-2 rounded-xl bg-coral text-white font-bold text-[11px] disabled:opacity-40"
             >
               Refused
             </button>

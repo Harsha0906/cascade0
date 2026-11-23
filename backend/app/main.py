@@ -60,8 +60,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import importers, inbound, reliability, run_store
+from app import importers, inbound, reliability, run_store, setup_api
 from app.auth import (
+    ChooseFactory,
     ANY_ROLE,
     OWNER_ONLY,
     WRITE_ROLES,
@@ -140,9 +141,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+app.include_router(setup_api.router)
 
 # Endpoints that touch no factory resource (configuration checks, weather): a role in the
 # caller's own factory. Everything factory-scoped authorises per resource (helpers below).
@@ -261,6 +264,11 @@ def _startup_migration_check() -> None:
 @app.get("/api/v1/state")
 def get_state(factory_id: Optional[str] = None, actor: Actor = Depends(user_actor)):
     return get_full_state(actor.authorize(factory_id, *ANY_ROLE))
+
+
+@app.exception_handler(ChooseFactory)
+async def _choose_factory_handler(request, exc):
+    return JSONResponse(status_code=409, content={"detail": exc.detail, "factories": exc.factories})
 
 
 @app.exception_handler(db.DatabaseError)

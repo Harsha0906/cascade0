@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { authHeaders, isAuthError, describeApiError, NO_MEMBERSHIP_MESSAGE } from "./session";
+import { scopeRequest, authHeaders, isAuthError, describeApiError, NO_MEMBERSHIP_MESSAGE } from "./session";
 
 describe("authHeaders", () => {
   it("adds a bearer token from the session", () => {
@@ -35,5 +35,24 @@ describe("describeApiError", () => {
   it("falls back to detail or null", () => {
     expect(describeApiError(500, "/api/v1/state", "boom")).toBe("boom");
     expect(describeApiError(500, "/api/v1/state", undefined)).toBeNull();
+  });
+});
+
+describe("scopeRequest", () => {
+  it("adds factory_id to the query, keeping an existing one", () => {
+    expect(scopeRequest("/api/v1/lines", undefined, "f1").path).toBe("/api/v1/lines?factory_id=f1");
+    expect(scopeRequest("/api/v1/x?a=1", undefined, "f1").path).toBe("/api/v1/x?a=1&factory_id=f1");
+    expect(scopeRequest("/api/v1/factory/settings?factory_id=demo", undefined, "f1").path).toBe("/api/v1/factory/settings?factory_id=demo");
+  });
+  it("does nothing without a selection or for unscoped routes", () => {
+    expect(scopeRequest("/api/v1/lines", undefined, null).path).toBe("/api/v1/lines");
+    expect(scopeRequest("/api/v1/factories", "{}", "f1")).toEqual({ path: "/api/v1/factories", body: "{}" });
+    expect(scopeRequest("/api/v1/my/factories", undefined, "f1").path).toBe("/api/v1/my/factories");
+  });
+  it("merges factory_id into the body of body routes only", () => {
+    expect(scopeRequest("/api/v1/reset", undefined, "f1").body).toBe('{"factory_id":"f1"}');
+    expect(scopeRequest("/api/v1/reset", '{"factory_id":"demo"}', "f1").body).toBe('{"factory_id":"demo"}');
+    expect(scopeRequest("/api/v1/ingest/erp-csv", '{"csv_content":"a"}', "f1").body).toBe('{"csv_content":"a","factory_id":"f1"}');
+    expect(scopeRequest("/api/v1/lines", '{"name":"A"}', "f1").body).toBe('{"name":"A"}');
   });
 });
