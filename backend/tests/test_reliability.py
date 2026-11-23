@@ -12,7 +12,7 @@ from app.factory_model import load_factory_model
 from app.reliability import beta_reliability, on_time
 
 KEY = {"X-API-Key": "test-operator-key"}
-NOW = datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)   # fixed, in the past (future deliveries are 422)
 
 
 class BetaMathTests(unittest.TestCase):
@@ -186,7 +186,11 @@ class ExecuteCreatesPendingOutcomesTests(_Api):
         receipt, _ = self._simulate_and_execute(1)
         o = db.get_delivery_outcomes(status="PENDING")[0]
         before = self._reliability(o["supplier_id"])
-        late = datetime.fromisoformat(o["promised_at"]) + timedelta(hours=30)
+        # The promise is hours ahead; move it into the past so a 30h-late delivery is not in the future.
+        promised = datetime.now(timezone.utc) - timedelta(hours=40)
+        db.update_rows_where("delivery_outcomes", {"po_number": o["po_number"], "supplier_id": o["supplier_id"]},
+                             {"promised_at": promised.isoformat()})
+        late = promised + timedelta(hours=30)
         r = self.client.post("/api/v1/deliveries", headers=KEY, json={
             "po_number": receipt["po_number"], "supplier_id": o["supplier_id"], "delivered_at": late.isoformat()})
         self.assertEqual(r.status_code, 200, r.text)

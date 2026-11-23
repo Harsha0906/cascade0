@@ -121,8 +121,8 @@ class ClientAgentTests(unittest.TestCase):
         replan = run_store.get_run(c["replan_run_id"])
         self.assertEqual(replan["parent_run_id"], run_id)
         self.assertEqual(replan["solver_result"]["deadline_hours"], 86.0)
-        plan_c = next(p for p in replan["playbooks"] if p["id"] == "PLAN_C")
-        self.assertEqual(plan_c["confidence_pct"], 100.0)   # the actual answer, not the heuristic
+        # The extension is granted: "ask for an extension" is no longer a plan (final review I-2).
+        self.assertNotIn("SLA_RENEGOTIATION", [p["strategy_type"] for p in replan["playbooks"]])
         s = sourcing.view(run_id)
         self.assertEqual(s["status"], "ACTIVE")
         open_rfqs = [x for x in s["rfqs"] if x["status"] == "SENT"]

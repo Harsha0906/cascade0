@@ -159,8 +159,17 @@ class SourcingSession:
 # ─── Reply parsing (perception) ──────────────────────────────────────────────
 
 _DECLINE = re.compile(
-    r"\b(no|nope|nahi|nahin|nai|not\s+available|unavailable|can\s*not|can't|cant|unable|sorry|"
-    r"out\s+of\s+stock|regret|not\s+possible|mushkil)\b", re.I)
+    r"\b(no|nope|nahi|nahin|nai|not\s+available|unavailable|can\s*not|can['’]?t|unable|sorry|"
+    r"out\s+of\s+stock|regret|not\s+possible|mushkil|won['’]?t|will\s+not|not\s+able|"
+    r"no\s+way|denied|pass\s+on|not\s+(?:in|within|by)\s+\d[\d.]*)\b", re.I)
+# An explicit smaller counter-offer inside a decline: "only 100 units", "80 units only",
+# "can't do 150 but can do 60 units". Any other reply with a decline cue is a decline.
+_NOT_TIME = r"(?!\s*(?:h|hr|hrs|hour|hours|ghante|ghanta|day|days|din)\b)"
+_PARTIAL = re.compile(
+    r"\bonly\s+(\d(?:[\d,]*\d)?)\b" + _NOT_TIME
+    + r"|\b(\d(?:[\d,]*\d)?)\s*(?:units?|pcs|pieces|nos|casings|piece)?\s+only\b"
+    + r"|\bbut\s+(?:we\s+)?(?:can|could|will)\s+(?:do|supply|send|manage|give|provide)\s+(\d(?:[\d,]*\d)?)\b"
+    + _NOT_TIME, re.I)
 _ACCEPT = re.compile(
     r"\b(yes|yeah|ok|okay|haan|han|ha|ji|confirm(?:ed)?|done|sure|can\s+do|available|possible|ho\s*jayega)\b", re.I)
 _PRICE = re.compile(r"(?:₹|(?<![a-z])rs\.?|(?<![a-z])inr|@|rate\s*(?:is|:)?)\s*(\d(?:[\d,]*\d)?)", re.I)
@@ -196,14 +205,55 @@ def _regex_parse(text: str, rfq: RFQ) -> VendorOffer:
     # "not available" can never read as "available"; an accept cue must stand outside any decline.
     declines = bool(_DECLINE.search(t))
     accepts = bool(_ACCEPT.search(_DECLINE.sub(" ", t)))
-    if declines and not (accepts and units):
+    # Any decline cue beats any accept cue ("Yes but unable for 300 units"); only an explicit
+    # smaller quantity ("only 100 units") turns a decline into a partial offer. An explicit
+    # "only N" is the offered quantity even without a decline cue ("2000 chahiye? only 120 units").
+    partial = _PARTIAL.search(t)
+    if declines and not partial:
         return VendorOffer(declined=True, available_units=0, notes=t[:200])
+    if partial:
+        units = int(next(g for g in partial.groups() if g).replace(",", ""))
     if units is None and accepts:
         units = rfq.units_requested   # only an explicit acceptance defaults to the quantity asked for
     if units is None:
         # Could not understand the reply (or a price/ETA with no acceptance): no offer, never a guess.
         return VendorOffer(declined=True, available_units=0, notes=f"Unparsed reply: {t[:180]}")
     return VendorOffer(declined=units == 0, available_units=units, unit_price_inr=price, eta_hours=eta, notes=t[:200])
+
+
+def _ground_offer(offer: VendorOffer, text: str, rfq: RFQ) -> VendorOffer:
+    """Keep only the numbers the vendor actually wrote (as for disruption alerts): Gemini sees our
+    enquiry's quantity, price and deadline and could copy them back as the vendor's offer.
+    A price or ETA not in the reply becomes None; a quantity not in the reply is kept only for a
+    plain acceptance of the requested quantity, otherwise the reply goes to operator review.
+    The regex decline cues are a veto: a decline is never read as an acceptance."""
+    t = (text or "").strip()
+    plain = re.sub(r"(?<=\d),(?=\d)", "", t)
+    stated = {float(x) for x in re.findall(r"\d+(?:\.\d+)?", plain)}
+
+    def said(value) -> bool:
+        return value is not None and float(value) in stated
+
+    if offer.declined or (_DECLINE.search(t) and not _PARTIAL.search(t)):
+        return VendorOffer(declined=True, available_units=0, notes=(offer.notes or t)[:200])
+    eta = offer.eta_hours
+    if eta is not None and not (said(eta) or (eta % 24 == 0 and said(eta / 24))
+                                or (eta == 24 and re.search(r"\b(tomorrow|kal)\b", t, re.I))):
+        logger.warning("Gemini returned eta %r, which the reply does not state; ignored", eta)
+        eta = None
+    price = offer.unit_price_inr if said(offer.unit_price_inr) else None
+    if offer.unit_price_inr is not None and price is None:
+        logger.warning("Gemini returned price %r, which the reply does not state; ignored", offer.unit_price_inr)
+    units = offer.available_units
+    accepts = bool(_ACCEPT.search(_DECLINE.sub(" ", t)))
+    if units is not None and not said(units) and not (units == rfq.units_requested and accepts):
+        logger.warning("Gemini returned %r units, which the reply does not state; operator review", units)
+        units = None
+    if not units:
+        return VendorOffer(declined=True, available_units=0,
+                           notes=f"Unparsed reply (operator review): {t[:160]}")
+    return VendorOffer(declined=False, available_units=units, unit_price_inr=price, eta_hours=eta,
+                       notes=(offer.notes or t)[:200])
 
 
 def parse_vendor_reply(text: str, rfq: RFQ, item: str = "units") -> Tuple[VendorOffer, str]:
@@ -232,7 +282,8 @@ def parse_vendor_reply(text: str, rfq: RFQ, item: str = "units") -> Tuple[Vendor
             logger.info("Gemini reply parsing: %s", {
                 "latency_ms": round((time.perf_counter() - started) * 1000, 1), **usage_tokens(resp)})
             if resp.text:
-                return VendorOffer(**json.loads(resp.text)), f"gemini:{settings.GEMINI_MODEL}"
+                offer = _ground_offer(VendorOffer(**json.loads(resp.text)), text, rfq)
+                return offer, f"gemini:{settings.GEMINI_MODEL}"
         except Exception as exc:
             logger.warning("Gemini reply parsing failed (%s) — using regex fallback", exc)
     return _regex_parse(text, rfq), "regex-fallback"
@@ -361,6 +412,7 @@ def _solve(session: SourcingSession):
         vendor_overrides=session.overrides,
         confirmed_vendor_ids=session.confirmed,
         renegotiation_acceptance=p.get("renegotiation_acceptance"),
+        renegotiation_used=bool(p.get("renegotiation_used")),
     )
 
 
@@ -572,7 +624,12 @@ def _apply_reply(session: SourcingSession, supplier_id: str, text: str, source: 
         rfq.status = "CONFIRMED" if units >= rfq.units_requested else "PARTIAL"
         rfq.offered_units = units
         rfq.offered_eta_hours = offer.eta_hours if offer.eta_hours is not None else vendor.lead_hours
-        override: Dict[str, Any] = {"max_units": units, "lead_hours": rfq.offered_eta_hours}
+        # The vendor's own ETA replaces the planning model's (possibly route-shifted) lead, and the
+        # minimum lead never floors it above what the vendor promised (else MILP and MC disagree).
+        override: Dict[str, Any] = {"max_units": units, "lead_hours": rfq.offered_eta_hours,
+                                    "min_lead_hours": min(vendor.min_lead_hours, rfq.offered_eta_hours)}
+        if offer.eta_hours is not None:
+            override["confirmed_eta_hours"] = offer.eta_hours   # the vendor's own promise (delivery outcomes)
         if _is_charter(vendor):
             rfq.offered_unit_price_inr = offer.unit_price_inr or vendor.flat_cost  # quoted as charter total
             override["flat_cost"] = rfq.offered_unit_price_inr

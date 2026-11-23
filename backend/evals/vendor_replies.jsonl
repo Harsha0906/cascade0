@@ -28,3 +28,9 @@
 {"text": "possible nahi hai", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
 {"text": "Haan ho jayega", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": null, "eta_hours": null}}
 {"text": "Cannot supply this week", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "won't be able to do 300 units", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "will not manage 300 units", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "We won't make it, 300 units", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Yes but unable for 300 units", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "can do 300 units but not in 34 hrs", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "won't manage 300, only 120 units", "rfq_units": 300, "expected": {"accepted": true, "units": 120, "unit_price_inr": null, "eta_hours": null}}

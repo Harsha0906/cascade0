@@ -650,12 +650,13 @@ def generate_playbooks(
     vendor_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     confirmed_vendor_ids: Optional[set] = None,
     renegotiation_acceptance: Optional[float] = None,
+    renegotiation_used: bool = False,
 ) -> SolverResult:
     """
     Build candidate playbooks and rank them by risk-adjusted expected cost:
-      - Plan A: the Ops position — MILP with the factory's EXPEDITE vendor forced on
+      - Plan A: the speed scenario — MILP with the factory's EXPEDITE vendor forced on
                 (only when the run's model has one).
-      - Plan B: the CFO position — unconstrained cost-minimal MILP (optionally
+      - Plan B: the cost scenario — unconstrained cost-minimal MILP (optionally
                 restricted to vendors above a reliability floor after a rebuttal).
       - Plan C: overtime + safety stock when the shortfall fits in stock,
                 otherwise a paid SLA renegotiation.
@@ -666,6 +667,9 @@ def generate_playbooks(
     `renegotiation_acceptance` is the client's actual answer to an extension request when the
     caller knows it (1.0 accepted, 0.0 refused); None keeps the `renegotiation_acceptance_prob`
     heuristic. The solver never reads it from the database.
+    `renegotiation_used` is True once the client has already granted an extension: the deadline
+    passed in is the extended one, so "ask for an extension" is no longer an option and the
+    renegotiation plan is left out (a further extension is a new request, not a plan).
     """
     if renegotiation_acceptance is not None and not 0.0 <= float(renegotiation_acceptance) <= 1.0:
         raise SolverInputError("renegotiation_acceptance must be within [0, 1]")
@@ -678,7 +682,7 @@ def generate_playbooks(
     expedite_id = model.expedite_vendor_id
     if expedite_id is not None:
         lp_a = solve_pulp_milp(model, shortfall_units, line_speeds, deadline_hours, force_vendor_id=expedite_id)
-        plans.append(_build_plan(model, "PLAN_A", "Plan A — Ops Hawk Emergency Expedite", "AIR_CHARTER_MAX_OT",
+        plans.append(_build_plan(model, "PLAN_A", "Plan A — Emergency Expedite (speed scenario)", "AIR_CHARTER_MAX_OT",
                                  lp_a, sla_penalty_inr, deadline_hours, delay_hours, confirmed))
 
     lp_b = solve_pulp_milp(model, shortfall_units, line_speeds, deadline_hours,
@@ -689,7 +693,7 @@ def generate_playbooks(
     if shortfall_units <= model.safety_stock_units:
         plans.append(_build_ot_only_plan(model, shortfall_units, line_speeds, sla_penalty_inr,
                                          deadline_hours, delay_hours))
-    else:
+    elif not renegotiation_used:
         plans.append(_build_renegotiation_plan(model, sla_penalty_inr, partial_penalty_inr, delay_hours,
                                                deadline_hours, renegotiation_acceptance))
 

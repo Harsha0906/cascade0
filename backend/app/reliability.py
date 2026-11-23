@@ -15,11 +15,12 @@ so 48 on-time of 50 gives 49 / 52 = 94.2 %. The result is always inside [0, 100]
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Union
+from typing import Optional, Union
 
 DEFAULT_GRACE_HOURS = 2.0
 # A delivery recorded as arriving more than this long before it was promised is a data-entry error.
 MAX_EARLY_DAYS = 30
+MAX_FUTURE_HOURS = 1   # a delivery cannot be recorded as happening later than now + this
 
 
 def beta_reliability(prior_on_time: int, prior_total: int,
@@ -49,3 +50,9 @@ def on_time(promised_at: Union[str, datetime], delivered_at: Union[str, datetime
 def implausibly_early(promised_at: Union[str, datetime], delivered_at: Union[str, datetime]) -> bool:
     """True when delivered_at is more than MAX_EARLY_DAYS before promised_at."""
     return parse_timestamp(delivered_at) < parse_timestamp(promised_at) - timedelta(days=MAX_EARLY_DAYS)
+
+
+def in_the_future(delivered_at: Union[str, datetime], now: Optional[datetime] = None) -> bool:
+    """True when delivered_at is more than MAX_FUTURE_HOURS after now (a typo, not a delivery)."""
+    now = now or datetime.now(timezone.utc)
+    return parse_timestamp(delivered_at) > now + timedelta(hours=MAX_FUTURE_HOURS)

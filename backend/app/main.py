@@ -900,18 +900,19 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         for a in playbook["vendor_allocations"]
     ]
     overtime_line_ids = [lid for lid, hrs in (playbook.get("overtime_line_hours") or {}).items() if hrs > 0]
-    # One PENDING delivery outcome per vendor allocation, promised at execution time + the vendor's lead time.
+    # One PENDING delivery outcome per vendor allocation, promised at execution time + what the
+    # vendor itself promised: the ETA it confirmed to the Sourcing Agent, else its own (unshifted)
+    # lead time from the live factory model; never the run's risk-shifted planning lead.
     # Recorded deliveries later move the vendor's learned reliability (POST /api/v1/deliveries).
-    model = run.get("factory_model")
-    lead_by_vendor = {v.supplier_id: v.lead_hours for v in getattr(model, "vendors", ())}
     outcome_factory = run.get("factory_id") or settings.DEFAULT_FACTORY_ID
+    promised_lead = _promised_leads(root_id, outcome_factory)
     executed_at = datetime.fromisoformat(now)
     outcomes = [
         {
             "factory_id": outcome_factory, "supplier_id": a["supplier_id"], "po_number": po_number,
             "units": a["units_allocated"],
             "promised_at": (executed_at + timedelta(
-                hours=lead_by_vendor.get(a["supplier_id"], a["lead_time_hours"]))).isoformat(),
+                hours=promised_lead.get(a["supplier_id"], a["lead_time_hours"]))).isoformat(),
         }
         for a in playbook["vendor_allocations"] if a["units_allocated"] > 0
     ]
@@ -965,6 +966,23 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
     return receipt
 
 
+def _promised_leads(root_id: str, factory_id: str) -> Dict[str, float]:
+    """Hours each vendor promised: a confirmed ETA from the run's sourcing session wins over the
+    vendor's live (unshifted) lead time. Vendors in neither fall back to the allocation's lead."""
+    leads: Dict[str, float] = {}
+    try:
+        leads.update({v.supplier_id: v.lead_hours for v in load_factory_model(factory_id).vendors})
+    except FactoryDataError as exc:
+        logger.warning("Live factory model unavailable for delivery promises (%s); using the plan's leads", exc)
+    session = sourcing.sourcing_store.load(root_id)
+    if session is not None:
+        for sid in session.confirmed:
+            eta = session.overrides.get(sid, {}).get("confirmed_eta_hours")
+            if eta is not None:
+                leads[sid] = float(eta)
+    return leads
+
+
 @app.post("/api/v1/execute-plan", dependencies=[Depends(require_api_key)])
 def execute_plan(req: ExecutePlanRequest):
     logger.info("Executing %s from run %s (approved_by=%s)", req.playbook_id, req.run_id, req.approved_by)
@@ -983,6 +1001,11 @@ def record_delivery(req: DeliveryRecordRequest):
     outcome = matches[0]
     if outcome["status"] == "DELIVERED":
         raise HTTPException(status_code=409, detail="This delivery was already recorded.")
+    if reliability.in_the_future(req.delivered_at):
+        raise HTTPException(
+            status_code=422,
+            detail=f"delivered_at is in the future (more than {reliability.MAX_FUTURE_HOURS}h after now).",
+        )
     if reliability.implausibly_early(outcome["promised_at"], req.delivered_at):
         raise HTTPException(
             status_code=422,
@@ -997,7 +1020,8 @@ def record_delivery(req: DeliveryRecordRequest):
         raise HTTPException(status_code=409, detail="This delivery was already recorded.")
     row = updated[0]
     try:
-        vendor = next((v for v in load_factory_model().vendors if v.supplier_id == req.supplier_id), None)
+        vendor = next((v for v in load_factory_model(outcome.get("factory_id")).vendors
+                       if v.supplier_id == req.supplier_id), None)
     except FactoryDataError as exc:
         raise _factory_503(exc)
     return {

@@ -17,7 +17,11 @@ Status: DRAFTED → (APPROVED, transient while sending) → SENT → (ANSWERING,
 ACCEPTED | REFUSED. A failed send returns to DRAFTED; a failed answer step stays ANSWERING
 and is resumed by recording the same answer again.
 Lock order: sourcing → client is allowed; client → sourcing is forbidden (see the answer section).
-One negotiation per root run: once a request exists, a sourcing failure never drafts another.
+One open negotiation per root run: while a request is DRAFTED/APPROVED/SENT/ANSWERING a sourcing
+failure never drafts another. After an ACCEPTED extension the renegotiation plan is no longer
+offered by re-plans (the deadline already is the extended one); if sourcing then fails again the
+Client Agent drafts a follow-up request (request_number + 1; the earlier request moves to
+`history`). After a REFUSED answer nothing more is drafted; the failure is logged.
 
 Human sign-off: nothing reaches the client before `approve_extension(..., approved_by)`.
 Sending uses the Sourcing Agent's channel setting (`SOURCING_MODE`): simulated records the
@@ -161,13 +165,41 @@ def draft_extension(run_id: str, extension_hours: int, reason: str = "") -> Dict
     return _draft(run_id, extension_hours, reason, drafted_by="operator")
 
 
-def _draft(run_id: str, extension_hours: int, reason: str, drafted_by: str) -> Dict[str, Any]:
+# Fields of one request; a follow-up moves them into `history` and starts afresh.
+_REQUEST_FIELDS = (
+    "request_number", "status", "drafted_by", "drafted_at", "extension_hours", "reason", "original_due_at",
+    "proposed_due_at", "partial_penalty_inr", "draft_message", "approved_by", "approved_at", "answer",
+    "new_due_at", "replan_deadline_hours", "replan_run_id", "replan_recommended_plan_id",
+    "sourcing_target_plan_id", "sourcing_restarted",
+)
+
+
+def _request_number(record: Optional[Dict[str, Any]]) -> int:
+    return int((record or {}).get("request_number") or 1)
+
+
+def _renegotiation_used(record: Optional[Dict[str, Any]]) -> bool:
+    """True once the client has granted an extension for this run (any earlier request)."""
+    return any(h.get("status") == "ACCEPTED" for h in (record or {}).get("history", []))
+
+
+def _draft(run_id: str, extension_hours: int, reason: str, drafted_by: str,
+           follow_up: bool = False) -> Dict[str, Any]:
     if isinstance(extension_hours, bool) or not isinstance(extension_hours, int) or extension_hours <= 0:
         raise ClientAgentError("extension_hours must be a positive whole number of hours.", 422)
     with _lock:
         root_id, root = _root(run_id)
         existing = load(root_id)
-        if existing is not None and existing["status"] != "DRAFTED":
+        if follow_up:
+            if existing is None or existing["status"] != "ACCEPTED" or not existing.get("replan_run_id"):
+                raise ClientAgentError("A follow-up request needs an earlier ACCEPTED extension.", 409)
+            earlier = {k: copy.deepcopy(existing.get(k)) for k in _REQUEST_FIELDS}
+            earlier["request_number"] = _request_number(existing)
+            existing.setdefault("history", []).append(earlier)
+            for k in _REQUEST_FIELDS:
+                existing[k] = None
+            existing["request_number"] = earlier["request_number"] + 1
+        elif existing is not None and existing["status"] != "DRAFTED":
             raise ClientAgentError(
                 f"An extension request for this run is already {existing['status']}; only a draft can be changed.", 409)
 
@@ -202,7 +234,7 @@ def _draft(run_id: str, extension_hours: int, reason: str, drafted_by: str) -> D
         record = existing or {
             "root_run_id": root_id, "order_id": order_id,
             "factory_id": root.get("factory_id") or (model.factory_id if model is not None else None),
-            "version": 0, "events": [], "outbox": [], "log_step": 40,
+            "version": 0, "events": [], "outbox": [], "log_step": 40, "history": [], "request_number": 1,
         }
         record.update({
             "status": "DRAFTED",
@@ -219,8 +251,9 @@ def _draft(run_id: str, extension_hours: int, reason: str, drafted_by: str) -> D
             "sourcing_status_at_draft": session.status if session is not None else None,
             "approved_by": None, "approved_at": None, "answer": None,
         })
-        _log(record, f"Drafted {extension_hours}h extension for {order_id} ({drafted_by})",
-             f"📝 Drafted a {extension_hours}h deadline-extension request to {client_name} for #{order_id} "
+        label = "follow-up " if follow_up else ""
+        _log(record, f"Drafted {label}{extension_hours}h extension for {order_id} ({drafted_by})",
+             f"📝 Drafted a {label}{extension_hours}h deadline-extension request to {client_name} for #{order_id} "
              f"(new deadline {_fmt(proposed)}, offering ₹{int(partial):,}). Awaiting human approval; nothing sent.",
              "draft_extension()")
         _save_or_409(record)
@@ -231,17 +264,34 @@ def on_sourcing_failed(run_id: str, reason: str = "") -> Optional[Dict[str, Any]
     """Called by the Sourcing Agent when a session ends without full cover.
 
     Drafts an extension request of the run's upstream delay (DRAFTED, drafted_by
-    "sourcing_failure"); does nothing (returns None) when this run already has a request.
+    "sourcing_failure"). Returns None when a request is already open (DRAFTED, APPROVED, SENT,
+    ANSWERING) or the client REFUSED (logged, nothing drafted). After an ACCEPTED extension the
+    order is still not covered, so a follow-up request is drafted from the extended deadline.
     """
     with _lock:
         root_id, root = _root(run_id)
-        if load(root_id) is not None:
-            return None
+        existing = load(root_id)
+        follow_up = False
+        if existing is not None:
+            answered = existing["status"] in ("ACCEPTED", "REFUSED") and existing.get("replan_run_id")
+            if not answered:
+                return None   # a request is still open: never a duplicate
+            if existing["status"] == "REFUSED":
+                _log(existing, "Not covered after the client's refusal",
+                     f"⚠ #{existing['order_id']} is still not covered after {existing['client']} refused the "
+                     f"extension; no further request drafted. Re-plan manually.", "client.on_sourcing_failed()")
+                try:
+                    save(existing)
+                except ConcurrentUpdateError:
+                    pass   # the note is best effort; the state is unchanged
+                return None
+            follow_up = True
         delay = root.get("delay_hours")
         if not isinstance(delay, int) or isinstance(delay, bool) or delay <= 0:
             raise ClientAgentError("the run has no upstream delay to base an extension request on", 409)
-        note = f"Sourcing ended without full cover. {reason}".strip()
-        return _draft(root_id, delay, note, drafted_by="sourcing_failure")
+        note = (f"Not covered after the client's accepted extension. {reason}" if follow_up
+                else f"Sourcing ended without full cover. {reason}").strip()
+        return _draft(root_id, delay, note, drafted_by="sourcing_failure", follow_up=follow_up)
 
 
 # ─── Approve & send (human sign-off) ─────────────────────────────────────────
@@ -326,11 +376,12 @@ def _refusal_target(playbooks, expedite_id: Optional[str]):
     return min(with_expedite, key=lambda p: p.expected_cost_inr)
 
 
-def _answer_ref(root_id: str, accepted: bool) -> str:
-    return f"{root_id}:{'ACCEPTED' if accepted else 'REFUSED'}"
+def _answer_ref(root_id: str, accepted: bool, number: int = 1) -> str:
+    prefix = root_id if number <= 1 else f"{root_id}#{number}"
+    return f"{prefix}:{'ACCEPTED' if accepted else 'REFUSED'}"
 
 
-def _replan(root_id: str, root: Dict[str, Any], accepted: bool, hours: float):
+def _replan(root_id: str, root: Dict[str, Any], accepted: bool, hours: float, used: bool = False):
     """Pure: re-plan on the run's stored (risk-adjusted) model with the answered deadline.
     Returns (result, target playbook, vendor ids to allow again)."""
     model = root["factory_model"]
@@ -358,6 +409,7 @@ def _replan(root_id: str, root: Dict[str, Any], accepted: bool, hours: float):
             vendor_overrides=overrides,
             confirmed_vendor_ids=confirmed,
             renegotiation_acceptance=1.0 if accepted else 0.0,
+            renegotiation_used=used,
         )
     except SolverInputError as exc:
         raise ClientAgentError(f"Cannot re-plan: {exc}", 409)
@@ -420,7 +472,10 @@ def record_client_answer(run_id: str, accepted: bool, text: str = "",
         hours = float(stored["deadline_hours"])
 
     # Pure re-plan (no lock held): solver input problems are reported before anything is claimed.
-    result, target, widen = _replan(root_id, root, accepted, hours)
+    # Once an extension is granted (now or earlier) the plan "ask for an extension" is gone.
+    number = _request_number(record)
+    used = accepted or _renegotiation_used(record)
+    result, target, widen = _replan(root_id, root, accepted, hours, used)
 
     if not resumable:
         # Phase 2: claim the answer (compare-and-set). From here a different answer is 409.
@@ -440,7 +495,7 @@ def record_client_answer(run_id: str, accepted: bool, text: str = "",
             "updated_at": now.isoformat(),
         })
     br = root.get("blast_radius") or {}
-    replan_id = f"{root_id}-C"
+    replan_id = f"{root_id}-C" if number <= 1 else f"{root_id}-C{number}"
     replan = dict(root)
     replan.update({
         "run_id": replan_id,
@@ -453,7 +508,7 @@ def record_client_answer(run_id: str, accepted: bool, text: str = "",
     })
     run_store.save_run(replan)
 
-    ref = _answer_ref(root_id, accepted)
+    ref = _answer_ref(root_id, accepted, number)
     session = sourcing_store.load(root_id)
     restarted = False
     if session is not None:
@@ -464,7 +519,7 @@ def record_client_answer(run_id: str, accepted: bool, text: str = "",
             sourcing.restart_with_plan(
                 root_id, target.model_dump(), why,
                 params_update={"deadline_hours": hours, "renegotiation_acceptance": 1.0 if accepted else 0.0,
-                               "client_answer_ref": ref},
+                               "renegotiation_used": used, "client_answer_ref": ref},
                 allow_vendor_ids=widen,
             )
 
