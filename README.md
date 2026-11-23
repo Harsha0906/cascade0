@@ -30,7 +30,7 @@ When an Indian EV battery plant faces compound disruptions (e.g., an NH48 highwa
                                          │
                                          ▼
                   ┌──────────────────────────────────────────────┐
-                  │          BLAST-RADIUS DETECTIVE AGENT        │
+                  │          DISRUPTION DETECTIVE (agent)        │
                   │    • Gemini Entity Extractor (NLP)           │
                   │    • Causal Graph SQL Blast-Radius Mapper    │
                   └──────────────────────┬───────────────────────┘
@@ -39,17 +39,17 @@ When an Indian EV battery plant faces compound disruptions (e.g., an NH48 highwa
                    │                                           │
                    ▼                                           ▼
    ┌───────────────────────────────┐           ┌───────────────────────────────┐
-   │     OPERATIONS HAWK AGENT     │           │       CFO WATCHDOG AGENT      │
-   │  • Objective: Minimize Delay  │ ◄───────► │  • Objective: Maximize Margin │
-   │  • Demands: BlueDart Air Cargo│  REBUTTAL │  • Vetoes Air Charter Waste   │
-   │  • Authorizes 8h Max Overtime │   CYCLE   │  • Demands Peenya Regional SME│
+   │ SPEED SCENARIO (solver)       │           │ COST SCENARIO (solver)        │
+   │ • Expedite-first MILP         │ ◄───────► │ • Cheapest feasible MILP      │
+   │ • Scored by Monte Carlo       │ RISK CHECK│ • Scored by Monte Carlo       │
+   │ • Planning scenario, no agent │   CYCLE   │ • Planning scenario, no agent │
    └───────────────┬───────────────┘           └───────────────┬───────────────┘
                    │                                           │
                    └─────────────────────┬─────────────────────┘
                                          │ Competing Proposals
                                          ▼
                   ┌──────────────────────────────────────────────┐
-                  │       MATHEMATICAL ARBITRATOR AGENT          │
+                  │    ARBITRATOR (solver ranking)               │
                   │    • Symbolic PuLP MILP Optimization Solver  │
                   │    • 1,000-run seeded Monte Carlo            │
                   │    • Ranks by risk-adjusted expected cost    │
@@ -71,7 +71,7 @@ When an Indian EV battery plant faces compound disruptions (e.g., an NH48 highwa
 ## 🌟 Key Capabilities
 
 ### 1. 👔 Executive Story View vs 🏭 2.5D Twin Studio
-- **Executive Mode:** Eliminates cognitive clutter. Shows the plain-English crisis narrative, the Ops vs. CFO debate summary, the PuLP mathematical proof, and a single thumb-friendly **`[⚡ APPROVE PLAN B & EXECUTE]`** action.
+- **Executive Mode:** Eliminates cognitive clutter. Shows the plain-English crisis narrative, the Speed vs. Cost scenario comparison, the PuLP mathematical proof, and a single thumb-friendly **`[⚡ APPROVE PLAN B & EXECUTE]`** action.
 - **2.5D Twin Studio:** Interactive React Flow canvas built from `/api/v1/factory` and `/api/v1/state` (one node per supplier, line and order), showing causal blast radii for whatever the factory contains.
 
 ### 2. 🎛️ Custom Crisis Scenario Studio
@@ -137,15 +137,16 @@ Mobile Field Controller: `http://localhost:3000/mobile`
 Run `supabase/schema.sql`, then `supabase/migrations/001_rls_and_audit.sql` in the Supabase SQL editor.
 The migration enables Row-Level Security (browser = read-only) and adds approval audit columns.
 After it, backend writes require `SUPABASE_SERVICE_ROLE_KEY`.
-Then apply `002_sourcing_agent.sql`, `003_factory_model.sql`, `004_durable_state.sql`, `005_generic_disruptions.sql` and `006_inventory.sql` in order.
+Then apply `002_sourcing_agent.sql`, `003_factory_model.sql`, `004_durable_state.sql`, `005_generic_disruptions.sql`, `006_inventory.sql` and `007_learning_and_coordination.sql` in order.
 `004_durable_state.sql` adds `analysis_runs`, `sourcing_sessions`, `execution_receipts`, `webhook_events`,
 the atomic `execute_plan_tx` function and a `schema_migrations` table.
 `005_generic_disruptions.sql` adds the `scenarios` table (preset disruptions per factory) and new `disruption_events` columns, and records `schema_migrations` level 5.
-`006_inventory.sql` adds `items`, `stock_levels`, `inbound_shipments`, `order_lines`, `orders.priority`, `orders.due_at` (absolute deadline, backfilled as now + `hours_remaining` for orders that have none), `factories.stock_item_code` and a nullable `scenarios.shortfall_units`, seeds the demo plant's inventory, and records level 6, which is now required. Its seed `UPDATE`s are guarded so a re-run does not overwrite edited data; re-run it after upgrading to add `due_at`.
+`006_inventory.sql` adds `items`, `stock_levels`, `inbound_shipments`, `order_lines`, `orders.priority`, `orders.due_at` (absolute deadline, backfilled as now + `hours_remaining` for orders that have none), `factories.stock_item_code` and a nullable `scenarios.shortfall_units`, seeds the demo plant's inventory, and records level 6. Its seed `UPDATE`s are guarded so a re-run does not overwrite edited data; re-run it after upgrading to add `due_at`.
+`007_learning_and_coordination.sql` (requires 006) adds `delivery_outcomes` (promised-vs-actual delivery per PO line, `PENDING` until recorded), `order_coordination` (one Client/Sourcing record per root run, optimistic concurrency, service-role only), and replaces `execute_plan_tx` with a 9-argument version whose `p_outcomes` writes the PENDING outcomes in the same transaction as the PO. It records level 7, which is now required.
 
 Check it with `GET /healthz`, which returns
 `{"storage", "db", "migration_level", "required_migration_level", "ready"}` and HTTP 200 when ready,
-503 otherwise. The backend logs an error at startup if the database is below level 6 (production refuses to start).
+503 otherwise. The backend logs an error at startup if the database is below level 7 (production refuses to start).
 
 ### Storage modes
 
@@ -162,6 +163,7 @@ python -m unittest discover -s tests -t .
 cd ../frontend
 npm test        # vitest: digital-twin graph builder and store
 ```
+`python -m app.evals` measures extraction accuracy (see Evals below).
 Offline suite (no Supabase, LLM or WhatsApp calls): solver correctness, infeasibility reporting,
 ranking, Monte Carlo sensitivity, Tally XML well-formedness, API auth, webhook signatures,
 WhatsApp approver allowlist, idempotent execution and CSV import.
@@ -237,6 +239,66 @@ Every zeroing, removal or closure is listed in `warnings` (with `line: null`). R
 
 Tally header aliases, quantity formats (`1,20,000`, `500 Nos`, `500.00`) and IST dates (`20-Nov-2026`, date alone = 17:00 IST) are documented in [`samples/tally/README.md`](samples/tally/README.md), with sample files that reproduce the demo seed. The dashboard shows the shortfall explanation and its source, and has a CSV import picker.
 
+## 📈 Learned Vendor Reliability
+
+Vendor reliability is learned, not typed (`backend/app/reliability.py`, read by `factory_model.py`).
+
+```
+alpha = on_time_total + 1          # prior history + recorded deliveries, plus the Beta(1,1) prior
+beta  = (total - on_time_total) + 1
+reliability = alpha / (alpha + beta)
+```
+
+- **Prior:** the vendor's `vendor_history` (`past_orders_count`, `on_time_deliveries`) counts as past deliveries, so 48 on-time of 50 gives 49 / 52 = 94.2 %.
+- **Evidence:** each `DELIVERED` outcome adds one observation. A delivery is on time when it arrives no later than the promised time plus a **2 h grace**.
+- **PENDING outcomes:** executing a plan writes one `PENDING` outcome per vendor allocation (promised at execution time + the vendor's lead time), in the same transaction as the PO. Pending rows do not count until a delivery is recorded.
+- `POST /api/v1/deliveries` `{po_number, supplier_id, delivered_at}` records a delivery (API key; 404 unknown PO line, 409 already recorded, 422 when `delivered_at` is more than 30 days before the promised time). `GET /api/v1/deliveries?status=PENDING|DELIVERED` lists outcomes.
+
+## 🛣️ Route and Weather Risk
+
+The disruption changes the model the planners use (`risk_adjusted_model` in `backend/app/disruption.py`).
+
+- **Blocked routes:** a route is blocked only when the alert gives a block cue for it ("blocked", "closed", "flooded", "diverted"...); a clear or negated cue ("NH48 is clear", "not blocked") does not block. Vendors on a blocked route get the alert's delay added to their lead time and minimum lead time. A route that matches none or several known routes is ignored with a note, never guessed onto a vendor. With no named route, a delayed supplier's own route is blocked.
+- **Weather alert:** a weather cue (flood, cyclone, heavy rain, storm, landslide, waterlogging) that is neither negated ("no flooding") nor figurative ("flood of orders") doubles every vendor's delay-shock probability, capped at **90 %**.
+- With neither effect the model is unchanged. `extracted_parameters` reports `blocked_routes`, `weather_alert` and `route_note`.
+
+## 🧑‍💼 Client Agent (deadline negotiation)
+
+When the shortfall cannot be covered in time, the Client Agent (`backend/app/agents/client.py`) negotiates with the customer and coordinates with the Sourcing Agent through one durable `order_coordination` record per root run.
+
+States: `DRAFTED` → `SENT` → `ANSWERING` (resumable) → `ACCEPTED` | `REFUSED`.
+
+1. **Draft:** `POST /api/v1/client/draft {run_id, extension_hours?, reason?}` writes a request quoting only data (order, client, current and proposed deadlines, the disruption headline, the order's partial-delay penalty); no number is written by an LLM. A request is also drafted automatically when sourcing fails.
+2. **Human sign-off:** nothing reaches the client until `POST /api/v1/client/approve {run_id, approved_by}` names a person.
+3. **Send:** uses the `SOURCING_MODE` channel. Simulated mode records the message; `whatsapp` sends it to the order's `client_whatsapp_number` and returns **409** when the order has no client contact, so for now a real WhatsApp send needs a contact on the order.
+4. **Answer:** `POST /api/v1/client/answer {run_id, accepted, text?, new_deadline_hours?, entered_by}` is typed in by an operator (answers are not read from WhatsApp yet). **Accepted:** the order's `due_at` is extended, the run is re-planned on the longer deadline and sourcing restarts on the new target. **Refused:** the expedite vendor is allowed again and sourcing restarts on the best feasible plan that uses it. Recording the same answer again resumes an interrupted one; a different answer is a 409.
+5. `GET /api/v1/client/{run_id}` returns the draft, sent message, answer and re-plan. One negotiation per root run.
+
+Known limit: a fresh analysis does not yet read the client's answer; the extension acts through the extended `due_at` on the order.
+
+## 🧩 Evals
+
+```bash
+cd backend
+python -m app.evals                 # offline: regex fallback only, no network
+python -m app.evals --live          # also scores Gemini (calls the live API; needs GEMINI_API_KEY)
+```
+
+`backend/evals/disruptions.jsonl` holds 62 labelled English/Hinglish/noisy alerts (scored after resolution against the demo factory) and `backend/evals/vendor_replies.jsonl` 30 vendor replies. Current offline regex numbers:
+
+| Disruption field | Precision | Recall |
+|---|---|---|
+| delay_hours | 0.96 | 0.83 |
+| lines | 1.00 | 0.82 |
+| supplier_id | 0.96 | 0.83 |
+| order_id | 0.94 | 0.83 |
+| shortfall_units | 0.94 | 0.83 |
+| error category | 0.73 | 0.91 |
+
+53 of 62 rows are fully correct. Vendor replies (25 of 30 fully correct), precision / recall: accepted 0.97 / 0.97, units 0.94 / 0.90, unit_price_inr 1.00 / 0.80, eta_hours 1.00 / 0.87. A decline is never read as an acceptance. A recall drop is caught by a regression test. The regex path prefers missing a value to guessing one. Gemini numbers appear only when run with `--live`.
+
+**Narration guard:** the LLM only narrates computed results. If Gemini writes a number that is not in the computed facts, the message is replaced by the template and labelled `template-guarded` (otherwise `gemini` or `template`). The analysis trace records per-node latency and input/output tokens, with totals.
+
 ## ✅ What Is Real vs Simulated
 
 | Component | Status |
@@ -251,6 +313,9 @@ Tally header aliases, quantity formats (`1,20,000`, `500 Nos`, `500.00`) and IST
 | Digital twin | Built from the factory model (`/api/v1/factory`) and live state (`/api/v1/state`): one node per supplier, line and order. Layout is generic, not geographic |
 | LLM | Extracts parameters from free text and narrates. The UI shows when it fell back to regex/templates |
 | Vendor costs, capacities, lead times | Loaded per factory from the database (`suppliers`, `vendor_history`, `production_lines`, `factories`) |
+| Vendor reliability | Learned: Beta posterior from `vendor_history` plus recorded deliveries (`delivery_outcomes`, 2 h grace). Delivery dates are entered through the API; nothing is detected automatically |
+| Route and weather risk | Cue-driven from the alert text: a blocked route adds the delay to its vendors, a weather cue doubles shock probability (cap 90 %). The underlying distributions remain assumptions |
+| Client Agent | Drafts and, after human approval, sends a deadline-extension request; the client's answer is entered by an operator and drives a re-plan. WhatsApp to the client needs a contact on the order |
 | PLC telemetry | Simulated, HTTP JSON; `line_id` is required (unknown line returns 404) |
 | Weather | OpenWeatherMap city weather if a key is set; otherwise shown as offline |
 | WhatsApp | Meta Cloud API with HMAC verification; approvals only from allow-listed numbers |
