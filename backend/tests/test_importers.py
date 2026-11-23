@@ -6,8 +6,9 @@ from pathlib import Path
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede any app import)
-
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 from fastapi.testclient import TestClient
+
 
 from app import db
 from app.importers import (
@@ -18,7 +19,7 @@ from app.importers import (
 from app.main import app
 
 SAMPLES = Path(__file__).resolve().parents[2] / "samples" / "tally"
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 FACTORY = "apex-volt-blr2"
 TODAY = date(2026, 11, 20)
 
@@ -222,7 +223,7 @@ class CompositeUpsertTests(unittest.TestCase):
 class EndpointTests(unittest.TestCase):
     def setUp(self):
         db.reset_to_seed()
-        self.client = TestClient(app)
+        self.client = dev_client(app)
 
     def tearDown(self):
         db.reset_to_seed()
@@ -234,7 +235,9 @@ class EndpointTests(unittest.TestCase):
     def test_api_key_required(self):
         for path in ("stock-summary", "open-purchase-orders", "sales-order-lines"):
             with self.subTest(path=path):
-                self.assertEqual(self._post(path, "a\nb", headers={}).status_code, 401)
+                anon = TestClient(app)  # no credentials
+                r = anon.post(f"/api/v1/ingest/{path}", json={"filename": "f.csv", "csv_content": "a\nb"})
+                self.assertEqual(r.status_code, 401)
 
     def test_empty_body_is_400(self):
         self.assertEqual(self._post("stock-summary", "  ").status_code, 400)
@@ -309,7 +312,7 @@ class EndpointTests(unittest.TestCase):
 class ErpCsvHardeningTests(unittest.TestCase):
     def setUp(self):
         db.reset_to_seed()
-        self.client = TestClient(app)
+        self.client = dev_client(app)
 
     def tearDown(self):
         db.reset_to_seed()

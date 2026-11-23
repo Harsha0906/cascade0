@@ -341,6 +341,17 @@ def _seed_inbound_shipments(now: datetime | None = None) -> list[dict[str, Any]]
 
 REQUIRED_MIGRATION_LEVEL = 7
 
+# Dev/test identities (offline mirror only, AUTH_MODE=dev). Live memberships live in Supabase
+# `factory_members` and are managed with `python -m app.admin add-member`.
+_SEED_FACTORY_MEMBERS: list[dict[str, Any]] = [
+    {"user_id": "00000000-0000-4000-8000-000000000001", "factory_id": "apex-volt-blr2",
+     "role": "owner", "email": "dev-owner@example.test"},
+    {"user_id": "00000000-0000-4000-8000-000000000002", "factory_id": "apex-volt-blr2",
+     "role": "viewer", "email": "dev-viewer@example.test"},
+    {"user_id": "00000000-0000-4000-8000-000000000003", "factory_id": "test-plant",
+     "role": "owner", "email": "other@example.test"},
+]
+
 # Durable-state tables cleared on reset, with their primary-key column.
 _DURABLE_TABLES: tuple[tuple[str, str], ...] = (
     ("analysis_runs", "run_id"),
@@ -381,6 +392,7 @@ class InMemoryMirror:
         self.order_coordination: list[dict[str, Any]] = []   # Client Agent records (Round A)
         self.execution_receipts: list[dict[str, Any]] = []
         self.webhook_events: list[dict[str, Any]] = []
+        self.factory_members: list[dict[str, Any]] = copy.deepcopy(_SEED_FACTORY_MEMBERS)
         self.schema_migrations: list[dict[str, Any]] = [
             {"version": v} for v in range(1, REQUIRED_MIGRATION_LEVEL + 1)
         ]
@@ -829,6 +841,31 @@ def _insert_pending_outcome(o: dict[str, Any], now: str) -> None:
         "units": int(o["units"]), "promised_at": o["promised_at"], "delivered_at": None,
         "status": "PENDING", "recorded_at": now,
     })
+
+
+def get_memberships(user_id: str) -> dict[str, str]:
+    """factory_id -> role for a verified user id (live `factory_members`, else the mirror)."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            response = (client.table("factory_members").select("factory_id,role")
+                        .eq("user_id", user_id).execute())
+        except Exception as exc:
+            raise _fail("get_memberships", "factory_members", exc) from exc
+        rows = response.data or []
+    else:
+        rows = [r for r in _mirror.factory_members if r.get("user_id") == user_id]
+    return {r["factory_id"]: r["role"] for r in rows}
+
+
+def get_dev_user(email: str) -> tuple[str, dict[str, str]] | None:
+    """(user_id, factory_id -> role) of a dev user seeded in the offline mirror (AUTH_MODE=dev
+    only); None for an unknown email. Never reads the live database."""
+    wanted = email.strip().lower()
+    rows = [r for r in _mirror.factory_members if (r.get("email") or "").lower() == wanted]
+    if not rows:
+        return None
+    return rows[0]["user_id"], {r["factory_id"]: r["role"] for r in rows}
 
 
 def get_receipt(root_run_id: str) -> dict[str, Any] | None:

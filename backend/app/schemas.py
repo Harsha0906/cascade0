@@ -219,11 +219,11 @@ class DeliveryRecordRequest(BaseModel):
 class ExecutePlanRequest(BaseModel):
     """
     HITL execution approval. The server executes the playbook it computed for `run_id`;
-    costs and allocations are never accepted from the client.
+    costs, allocations and the approver are never accepted from the client (`approved_by` is
+    the verified actor; an `approved_by` field in the body is ignored).
     """
     run_id: str
     playbook_id: str
-    approved_by: str = Field(default="dashboard-operator", max_length=120)
 
 
 class ExecutionReceiptResponse(BaseModel):
@@ -259,7 +259,7 @@ class SourcingReplyRequest(BaseModel):
     """A vendor's reply, entered by an operator (e.g. after a phone call) or a simulated vendor."""
     supplier_id: str = Field(max_length=32)
     text: str = Field(min_length=1, max_length=1000)
-    entered_by: str = Field(default="dashboard-operator", max_length=120)
+    # entered_by is the verified actor (an `entered_by` field in the body is ignored)
 
 
 class ClientDraftRequest(BaseModel):
@@ -270,9 +270,9 @@ class ClientDraftRequest(BaseModel):
 
 
 class ClientApproveRequest(BaseModel):
-    """Human sign-off: the named approver releases the drafted message to the client."""
+    """Human sign-off: the signed-in approver releases the drafted message to the client
+    (`approved_by` is the verified actor; an `approved_by` field in the body is ignored)."""
     run_id: str = Field(max_length=64)
-    approved_by: str = Field(min_length=1, max_length=120)
 
 
 class ClientAnswerRequest(BaseModel):
@@ -281,4 +281,4 @@ class ClientAnswerRequest(BaseModel):
     accepted: StrictBool
     text: str = Field(default="", max_length=1000)
     new_deadline_hours: Optional[StrictInt] = Field(default=None, gt=0, le=24 * 60)
-    entered_by: str = Field(default="dashboard-operator", max_length=120)
+    # entered_by is the verified actor (an `entered_by` field in the body is ignored)

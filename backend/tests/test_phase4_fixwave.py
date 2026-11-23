@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
-from fastapi.testclient import TestClient
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 
 from app import db, main
 from app.agents.graph import run_cascade_pipeline
@@ -20,7 +20,7 @@ from app.inventory import FINISHED_STATUSES, InventoryDataError, compute_shortfa
 from app.schemas import DisruptionExtraction
 from tests.factories import small_factory
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 FACTORY = "apex-volt-blr2"
 ROOT = Path(__file__).resolve().parents[2]
 SAMPLES = ROOT / "samples" / "tally"
@@ -47,7 +47,7 @@ def _sf(order="EV-402", orders=None, stock=None, ships=(), **kw):
 class _Api(unittest.TestCase):
     def setUp(self):
         db.reset_to_seed()
-        self.client = TestClient(main.app)
+        self.client = dev_client(main.app)
 
     def tearDown(self):
         db.reset_to_seed()

@@ -1,18 +1,17 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 /**
- * Injects the backend operator key (server-side env, never sent to the browser) into
- * proxied /api/v1 requests. Any X-API-Key supplied by the client is discarded.
+ * Proxied /api/v1 requests carry the signed-in user's own `Authorization: Bearer <token>`
+ * (passed through untouched); the backend verifies it and checks the user's factory role.
  *
- * This gates the FastAPI backend so it cannot be driven directly from the internet,
- * but anyone who can load this Next.js app can still use it. Put the app behind real
- * user auth (e.g. Supabase Auth or your SSO) before exposing it beyond a trusted network.
+ * The browser path never uses the machine key: any `X-API-Key` (automation only) or
+ * `X-Dev-User` (backend dev mode only) header a client sends is discarded here, and no key
+ * is injected.
  */
 export function middleware(req: NextRequest) {
   const headers = new Headers(req.headers);
   headers.delete("x-api-key");
-  const key = process.env.CASCADE_API_KEY;
-  if (key) headers.set("x-api-key", key);
+  headers.delete("x-dev-user");
   return NextResponse.next({ request: { headers } });
 }
 

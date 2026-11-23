@@ -46,8 +46,14 @@ class Settings:
     # ── Security ──────────────────────────────────────────────────────────
     # "production" makes the API key, webhook secret and explicit CORS origins mandatory.
     CASCADE_ENV: str = os.getenv("CASCADE_ENV", "development").lower()
-    # Shared operator key required on mutating endpoints (sent as X-API-Key).
+    # Machine key (X-API-Key) for automation on /api/v1/ingest/* and /api/v1/simulate-crisis.
+    # The browser never sends it. Unset: no machine access at all (fail closed).
     CASCADE_API_KEY: str = os.getenv("CASCADE_API_KEY", "")
+    # The factory a machine actor acts on (as an approver); defaults to DEFAULT_FACTORY_ID.
+    CASCADE_API_KEY_FACTORY: str = os.getenv("CASCADE_API_KEY_FACTORY", "")
+    # "supabase" (default): users authenticate with a Supabase access token (Authorization: Bearer).
+    # "dev": offline storage only, never in production; X-Dev-User: <email> picks a seeded dev user.
+    AUTH_MODE: str = os.getenv("AUTH_MODE", "").strip().lower() or "supabase"
     ALLOWED_ORIGINS: list[str] = [
         o.strip() for o in os.getenv(
             "ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
@@ -85,11 +91,25 @@ class Settings:
         """Prefer the service-role key (bypasses RLS server-side); fall back to anon for local dev."""
         return self.SUPABASE_SERVICE_ROLE_KEY or self.SUPABASE_ANON_KEY
 
+    @property
+    def api_key_factory(self) -> str:
+        return self.CASCADE_API_KEY_FACTORY or self.DEFAULT_FACTORY_ID
+
+    def auth_problems(self) -> list[str]:
+        """Authentication misconfigurations that refuse startup in every environment (fail closed)."""
+        problems = []
+        if self.AUTH_MODE not in ("supabase", "dev"):
+            problems.append(f"AUTH_MODE={self.AUTH_MODE!r} is not one of 'supabase', 'dev'")
+        if self.AUTH_MODE == "dev":
+            if self.is_production:
+                problems.append("AUTH_MODE=dev is not allowed in production")
+            if self.storage_mode != "offline":
+                problems.append("AUTH_MODE=dev is allowed only in offline storage mode (Supabase is configured)")
+        return problems
+
     def security_problems(self) -> list[str]:
         """Configuration gaps that must be fixed before running in production."""
         problems = []
-        if not self.CASCADE_API_KEY:
-            problems.append("CASCADE_API_KEY is not set: mutating endpoints are unauthenticated")
         if not self.META_APP_SECRET:
             problems.append("META_APP_SECRET is not set: WhatsApp webhook signatures are not verified")
         if not self.META_WA_VERIFY_TOKEN:

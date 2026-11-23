@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede any app import)
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 
-from fastapi.testclient import TestClient
 
 from app import db
 from app.factory_model import FactoryDataError, FactoryModel, load_factory_model
@@ -118,7 +118,7 @@ class StockItemCodeTests(unittest.TestCase):
 class HealthzLevelTests(unittest.TestCase):
     def test_required_level_is_seven(self):
         from app.main import app
-        r = TestClient(app).get("/healthz")
+        r = dev_client(app).get("/healthz")
         self.assertEqual(r.json()["required_migration_level"], 7)
         self.assertEqual(db.REQUIRED_MIGRATION_LEVEL, 7)
 

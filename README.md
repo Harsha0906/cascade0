@@ -123,7 +123,7 @@ cd ../frontend
 # Install Node dependencies
 npm install
 
-# Configure environment (set CASCADE_API_KEY to the same value as the backend; server-side only)
+# Configure environment (the browser no longer uses CASCADE_API_KEY; users sign in with Supabase Auth)
 cp .env.local.example .env.local
 
 # Start Next.js dev server
@@ -270,7 +270,7 @@ When the shortfall cannot be covered in time, the Client Agent (`backend/app/age
 States: `DRAFTED` → `SENT` → `ANSWERING` (resumable) → `ACCEPTED` | `REFUSED`.
 
 1. **Draft:** `POST /api/v1/client/draft {run_id, extension_hours?, reason?}` writes a request quoting only data (order, client, current and proposed deadlines, the disruption headline, the order's partial-delay penalty); no number is written by an LLM. A request is also drafted automatically when sourcing fails.
-2. **Human sign-off:** nothing reaches the client until `POST /api/v1/client/approve {run_id, approved_by}` names a person.
+2. **Human sign-off:** nothing reaches the client until `POST /api/v1/client/approve {run_id}` is called by a signed-in approver (recorded as `approved_by`).
 3. **Send:** uses the `SOURCING_MODE` channel. Simulated mode records the message; `whatsapp` sends it to the order's `client_whatsapp_number` and returns **409** when the order has no client contact, so for now a real WhatsApp send needs a contact on the order.
 4. **Answer:** `POST /api/v1/client/answer {run_id, accepted, text?, new_deadline_hours?, entered_by}` is typed in by an operator (answers are not read from WhatsApp yet). **Accepted:** the order's `due_at` is extended, the run is re-planned on the longer deadline and sourcing restarts on the new target. **Refused:** the expedite vendor is allowed again and sourcing restarts on the best feasible plan that uses it. Recording the same answer again resumes an interrupted one; a different answer is a 409.
 5. `GET /api/v1/client/{run_id}` returns the draft, sent message, answer and re-plan (`request_number`, earlier requests in `history`). One open request per root run: a sourcing failure never drafts a second request while one is drafted, sent or being answered.
@@ -355,10 +355,12 @@ Sourcing sessions use optimistic concurrency (`version` column; 409 after 3 conf
 
 ## 🔐 Security Setup
 
-- `CASCADE_API_KEY` gates every mutating endpoint. The Next.js middleware injects it server-side; it never reaches the browser. This is an operator-level gate, not per-user auth.
+- Every API route except `/`, `/healthz` and the signed WhatsApp webhook needs a verified actor: a Supabase Auth user (`Authorization: Bearer <access token>`, verified server-side) with a role in the factory (`factory_members`: owner, approver or viewer; add one with `python -m app.admin add-member --email E --factory F --role R` after the user signs up). Reads need any role, changes need owner or approver, `/reset` needs owner. `approved_by` is always the signed-in user's email, never a request field.
+- `CASCADE_API_KEY` (`X-API-Key`) is a machine key for automation on `/api/v1/ingest/*` and `/api/v1/simulate-crisis` only; it acts as an approver of `CASCADE_API_KEY_FACTORY` and cannot approve plans. The browser never sends it.
+- `AUTH_MODE=dev` (offline storage only; refused in production) trusts an `X-Dev-User: <email>` header for seeded dev users; the tests use it.
 - `META_APP_SECRET` verifies WhatsApp webhook signatures; `WA_APPROVER_NUMBERS` lists who may approve.
 - `ALLOWED_ORIGINS` replaces the old `*` CORS policy.
-- `CASCADE_ENV=production` refuses to start if any of the above is missing, and disables `/reset` and the Twilio sandbox.
+- `CASCADE_ENV=production` refuses to start if a required secret is missing, and disables `/reset` and the Twilio sandbox.
 - Execution uses the plan the server computed for a `run_id`, once per run. Costs are never accepted from the client.
 
 ## 🏗️ Repository Architecture

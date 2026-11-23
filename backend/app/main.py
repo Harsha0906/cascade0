@@ -1,33 +1,35 @@
 """
 CascadeZero — FastAPI server
 
-  GET  /api/v1/state                       factory snapshot (read-only, open)
-  GET  /api/v1/factory                     factory model: vendors + lines (read-only, open)
-  POST /api/v1/simulate-crisis             run the agent graph + solver          [API key]
+  GET  /api/v1/state                       factory snapshot                      [any role]
+  GET  /api/v1/factory                     factory model: vendors + lines        [any role]
+  POST /api/v1/simulate-crisis             run the agent graph + solver          [owner/approver, API key]
   GET  /api/v1/webhooks/whatsapp           Meta verification handshake
   POST /api/v1/webhooks/whatsapp           Meta (HMAC-verified) / Twilio webhook
-  POST /api/v1/ingest/plc-telemetry        line telemetry (HTTP JSON, simulated) [API key]
-  POST /api/v1/ingest/erp-csv              Tally/Excel CSV order upsert          [API key]
-  POST /api/v1/ingest/stock-summary        Tally stock summary CSV               [API key]
-  POST /api/v1/ingest/open-purchase-orders open purchase orders CSV              [API key]
-  POST /api/v1/ingest/sales-order-lines    sales order lines CSV                 [API key]
-  POST /api/v1/ingest/live-highway-check   weather check (labelled when offline)
-  POST /api/v1/execute-plan                execute a server-computed playbook    [API key]
-  POST /api/v1/deliveries                  record a vendor delivery (learns reliability) [API key]
-  GET  /api/v1/deliveries                  delivery outcomes (?status=PENDING|DELIVERED)
-  POST /api/v1/sourcing/start              Sourcing Agent: send vendor enquiries [API key]
-  GET  /api/v1/sourcing/{run_id}           enquiry status + confirmed plan
-  POST /api/v1/sourcing/{run_id}/vendor-reply  record a vendor reply           [API key]
-  POST /api/v1/client/draft                Client Agent: draft an extension request [API key]
-  POST /api/v1/client/approve              human sign-off: send it to the client [API key]
-  POST /api/v1/client/answer               record the client's answer (re-plans) [API key]
-  GET  /api/v1/client/{run_id}             the run's extension request / answer
-  POST /api/v1/reset                       reset demo data                       [API key]
+  POST /api/v1/ingest/plc-telemetry        line telemetry (HTTP JSON, simulated) [owner/approver, API key]
+  POST /api/v1/ingest/erp-csv              Tally/Excel CSV order upsert          [owner/approver, API key]
+  POST /api/v1/ingest/stock-summary        Tally stock summary CSV               [owner/approver, API key]
+  POST /api/v1/ingest/open-purchase-orders open purchase orders CSV              [owner/approver, API key]
+  POST /api/v1/ingest/sales-order-lines    sales order lines CSV                 [owner/approver, API key]
+  POST /api/v1/ingest/live-highway-check   weather check (labelled when offline) [any role, API key]
+  POST /api/v1/execute-plan                execute a server-computed playbook    [owner/approver]
+  POST /api/v1/deliveries                  record a vendor delivery (learns reliability) [owner/approver]
+  GET  /api/v1/deliveries                  delivery outcomes (?status=PENDING|DELIVERED) [any role]
+  POST /api/v1/sourcing/start              Sourcing Agent: send vendor enquiries [owner/approver]
+  GET  /api/v1/sourcing/{run_id}           enquiry status + confirmed plan       [any role]
+  POST /api/v1/sourcing/{run_id}/vendor-reply  record a vendor reply           [owner/approver]
+  POST /api/v1/client/draft                Client Agent: draft an extension request [owner/approver]
+  POST /api/v1/client/approve              human sign-off: send it to the client [owner/approver]
+  POST /api/v1/client/answer               record the client's answer (re-plans) [owner/approver]
+  GET  /api/v1/client/{run_id}             the run's extension request / answer  [any role]
+  GET  /api/v1/whatsapp/health             WhatsApp configuration check          [owner/approver, API key]
+  POST /api/v1/reset                       reset demo data                       [owner]
 
-Security model: mutating endpoints require the shared operator key in `X-API-Key`
-(set CASCADE_API_KEY). The Next.js middleware injects it server-side so it never reaches
-the browser. This is an operator-level gate, not per-user auth; add Supabase Auth (or SSO)
-before giving access to more than one trusted team.
+Security model (app/auth.py): every route except `/`, `/healthz` and the signature-checked
+WhatsApp webhook needs a verified actor: a Supabase user (Authorization: Bearer <access token>)
+with a role in the factory (`factory_members`), or, on automation endpoints only, the machine
+key in X-API-Key. `approved_by` / `entered_by` always come from the verified user, never from
+the request body. AUTH_MODE=dev (offline storage only, never production) accepts X-Dev-User.
 """
 
 from __future__ import annotations
@@ -45,12 +47,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import importers, reliability, run_store
+from app.auth import (
+    Actor,
+    machine_write_access,
+    owner_access,
+    read_access,
+    require,
+    write_access,
+)
 from app.agents import client as client_agent
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
@@ -92,27 +102,32 @@ app = FastAPI(
 )
 
 # ─── Startup security posture ────────────────────────────────────────────────
-_problems = settings.security_problems()
-if settings.is_production and _problems:
-    raise RuntimeError("Refusing to start in production: " + "; ".join(_problems))
-for _p in _problems:
-    logger.warning("SECURITY (dev mode): %s", _p)
+def _enforce_startup_security(cfg) -> None:
+    """Refuse to start on an auth misconfiguration (always) or any security gap (production)."""
+    fatal = cfg.auth_problems()
+    if fatal:
+        raise RuntimeError("Refusing to start: " + "; ".join(fatal))
+    problems = cfg.security_problems()
+    if cfg.is_production and problems:
+        raise RuntimeError("Refusing to start in production: " + "; ".join(problems))
+    for p in problems:
+        logger.warning("SECURITY (dev mode): %s", p)
+    if cfg.AUTH_MODE == "dev":
+        logger.warning("SECURITY (dev mode): AUTH_MODE=dev, X-Dev-User headers are trusted")
+
+
+_enforce_startup_security(settings)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-
-def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
-    """Shared operator key on mutating endpoints. Open only in dev mode with no key configured."""
-    if not settings.CASCADE_API_KEY:
-        return
-    if not x_api_key or not secrets.compare_digest(x_api_key, settings.CASCADE_API_KEY):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing X-API-Key")
+# Read-only automation endpoints: any member role, and the machine actor (X-API-Key).
+machine_read_access = require("owner", "approver", "viewer", machine=True)
 
 
 def _run_pipeline(
@@ -192,7 +207,7 @@ def _startup_migration_check() -> None:
         _check_migration_level()
 
 
-@app.get("/api/v1/state")
+@app.get("/api/v1/state", dependencies=[Depends(read_access)])
 def get_state():
     return get_full_state()
 
@@ -215,7 +230,7 @@ def _factory_503(exc: Exception) -> HTTPException:
     return HTTPException(status_code=503, detail=f"Factory data invalid: {exc}")
 
 
-@app.get("/api/v1/factory")
+@app.get("/api/v1/factory", dependencies=[Depends(read_access)])
 def get_factory():
     """The factory model the planner uses (vendors + lines), loaded from the database."""
     try:
@@ -239,7 +254,7 @@ def get_factory():
     }
 
 
-@app.get("/api/v1/runs/latest")
+@app.get("/api/v1/runs/latest", dependencies=[Depends(read_access)])
 def get_latest_run():
     """Summary of the most recent analysis run (used by the mobile controller to approve it)."""
     run_id = run_store.latest_run_id()
@@ -258,7 +273,7 @@ def get_latest_run():
     }
 
 
-@app.get("/api/v1/runs/{run_id}")
+@app.get("/api/v1/runs/{run_id}", dependencies=[Depends(read_access)])
 def get_run_by_id(run_id: str):
     """A stored run in the simulate-crisis response shape, so the dashboard can restore the latest
     run after a reload; plus its root run id (for the Sourcing and Client panels) and whether it
@@ -277,7 +292,7 @@ def get_run_by_id(run_id: str):
 
 # ─── 2. Crisis simulation ────────────────────────────────────────────────────
 
-@app.get("/api/v1/scenarios")
+@app.get("/api/v1/scenarios", dependencies=[Depends(read_access)])
 def list_scenarios():
     """Preset disruption scenarios of the default factory (read-only)."""
     return [
@@ -335,7 +350,7 @@ def _run_response(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-@app.post("/api/v1/simulate-crisis", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/simulate-crisis", dependencies=[Depends(machine_write_access)])
 def simulate_crisis(req: SimulateCrisisRequest):
     scenarios = {r["scenario_id"]: r for r in db.get_scenarios(settings.DEFAULT_FACTORY_ID)}
     if req.scenario_id is not None and req.scenario_id not in scenarios:
@@ -484,7 +499,7 @@ async def _process_meta_message(msg: Dict[str, Any], sender: str) -> Dict[str, A
                 return {"status": "forbidden"}
             try:
                 receipt = await run_in_threadpool(
-                    _execute, ExecutePlanRequest(run_id=run_id, playbook_id=playbook_id, approved_by=f"whatsapp:{sender}")
+                    _execute, ExecutePlanRequest(run_id=run_id, playbook_id=playbook_id), f"whatsapp:{sender}"
                 )
             except HTTPException as exc:
                 await run_in_threadpool(send_whatsapp_text, sender, f"⚠️ Could not execute: {exc.detail}")
@@ -607,7 +622,7 @@ async def whatsapp_webhook(request: Request):
     return Response(content=twiml, media_type="text/xml")
 
 
-@app.get("/api/v1/whatsapp/health", dependencies=[Depends(require_api_key)])
+@app.get("/api/v1/whatsapp/health", dependencies=[Depends(machine_write_access)])
 def whatsapp_health():
     """Verify token, phone number, app secret and webhook subscription. Never returns secrets."""
     from app.whatsapp_health import check_whatsapp_health
@@ -617,7 +632,7 @@ def whatsapp_health():
 
 # ─── 4. Telemetry (simulated PLC over HTTP) ──────────────────────────────────
 
-@app.post("/api/v1/ingest/plc-telemetry", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/ingest/plc-telemetry", dependencies=[Depends(machine_write_access)])
 def ingest_plc_telemetry(telemetry: PlcTelemetryRequest):
     if db.get_production_line(telemetry.line_id) is None:
         raise HTTPException(status_code=404, detail=f"Unknown line_id {telemetry.line_id}")
@@ -650,7 +665,7 @@ def _int_field(row: Dict[str, str], key: str, default: Optional[int] = None) -> 
 DEFAULT_ORDER_PRIORITY = 100
 
 
-@app.post("/api/v1/ingest/erp-csv", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/ingest/erp-csv", dependencies=[Depends(machine_write_access)])
 def ingest_erp_csv(payload: ErpCsvSyncRequest):
     """Upsert orders from a Tally/Excel CSV export. New orders are inserted, existing ones updated.
 
@@ -744,7 +759,7 @@ def _snapshot_warning(text: str) -> Dict[str, Any]:
     return {"line": None, "warning": text}
 
 
-@app.post("/api/v1/ingest/stock-summary", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/ingest/stock-summary", dependencies=[Depends(machine_write_access)])
 def ingest_stock_summary(payload: ErpCsvSyncRequest):
     """Replace on-hand stock from a Tally Stock Summary export (creates items with new codes).
 
@@ -771,7 +786,7 @@ def ingest_stock_summary(payload: ErpCsvSyncRequest):
     return _import_response(payload, result)
 
 
-@app.post("/api/v1/ingest/open-purchase-orders", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/ingest/open-purchase-orders", dependencies=[Depends(machine_write_access)])
 def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
     """Import open inbound shipments from a pending purchase orders export (dates are IST).
 
@@ -802,7 +817,7 @@ def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
     return _import_response(payload, result)
 
 
-@app.post("/api/v1/ingest/sales-order-lines", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/ingest/sales-order-lines", dependencies=[Depends(machine_write_access)])
 def ingest_sales_order_lines(payload: ErpCsvSyncRequest):
     """Import order lines (item quantities per sales order) from a sales order export.
 
@@ -827,7 +842,7 @@ def ingest_sales_order_lines(payload: ErpCsvSyncRequest):
 
 # ─── 6. Highway weather ──────────────────────────────────────────────────────
 
-@app.post("/api/v1/ingest/live-highway-check")
+@app.post("/api/v1/ingest/live-highway-check", dependencies=[Depends(machine_read_access)])
 def live_highway_check(req: LiveHighwayCheckRequest):
     if settings.has_weather:
         try:
@@ -866,7 +881,8 @@ def live_highway_check(req: LiveHighwayCheckRequest):
 
 # ─── 7. Plan execution (human-approved, server-computed) ─────────────────────
 
-def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
+def _execute(req: ExecutePlanRequest, approved_by: str) -> ExecutionReceiptResponse:
+    """Execute a playbook. `approved_by` is the verified approver (never taken from a request body)."""
     run = run_store.get_run(req.run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Unknown or expired run_id; run the simulation again.")
@@ -913,7 +929,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         "shift_broadcast_msg": playbook["shift_broadcast_msg"],
         "client_sla_notice": playbook["client_sla_notice"],
         "status": "APPROVED_DRAFT",
-        "approved_by": req.approved_by,
+        "approved_by": approved_by,
         "run_id": req.run_id,
         "created_at": now,
     }
@@ -946,9 +962,9 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         "run_id": req.run_id, "step_order": 10,
         "agent_name": "Human Approver", "agent_role": "HITL Execution", "badge_color": "emerald",
         "tool_called": "commit_purchase_order()",
-        "tool_output_summary": f"PO {po_number} approved by {req.approved_by}; order #{order_id} → {new_order_status}.",
+        "tool_output_summary": f"PO {po_number} approved by {approved_by}; order #{order_id} → {new_order_status}.",
         "message": (
-            f"✅ {playbook['id']} approved by {req.approved_by}. Draft Tally PO {po_number}, "
+            f"✅ {playbook['id']} approved by {approved_by}. Draft Tally PO {po_number}, "
             f"shift notice ({playbook['overtime_hours']}h) and client notice generated. "
             f"Nothing has been sent to suppliers automatically."
         ),
@@ -960,7 +976,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         po_number=po_number,
         playbook_id=playbook["id"],
         order_id=order_id,
-        approved_by=req.approved_by,
+        approved_by=approved_by,
         total_cost_inr=playbook["total_mitigation_cost_inr"],
         net_sla_saved_inr=playbook["net_sla_saved_inr"],
         confidence_pct=playbook["confidence_pct"],
@@ -1009,15 +1025,16 @@ def _promised_leads(root_id: str, factory_id: str) -> Dict[str, float]:
     return leads
 
 
-@app.post("/api/v1/execute-plan", dependencies=[Depends(require_api_key)])
-def execute_plan(req: ExecutePlanRequest):
-    logger.info("Executing %s from run %s (approved_by=%s)", req.playbook_id, req.run_id, req.approved_by)
-    return _execute(req)
+@app.post("/api/v1/execute-plan")
+def execute_plan(req: ExecutePlanRequest, actor: Actor = Depends(write_access)):
+    approved_by = actor.approver_name
+    logger.info("Executing %s from run %s (approved_by=%s)", req.playbook_id, req.run_id, approved_by)
+    return _execute(req, approved_by)
 
 
 # ─── 7b. Delivery outcomes (vendor reliability is learned from these) ────────
 
-@app.post("/api/v1/deliveries", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/deliveries", dependencies=[Depends(write_access)])
 def record_delivery(req: DeliveryRecordRequest):
     """Record that a purchase-order line was delivered. Moves the vendor's learned reliability."""
     matches = [o for o in db.get_delivery_outcomes(supplier_id=req.supplier_id)
@@ -1057,7 +1074,7 @@ def record_delivery(req: DeliveryRecordRequest):
     }
 
 
-@app.get("/api/v1/deliveries")
+@app.get("/api/v1/deliveries", dependencies=[Depends(read_access)])
 def list_deliveries(status: Optional[str] = None):
     """Delivery outcomes, newest facts first by id order; filter with ?status=PENDING or DELIVERED."""
     if status is not None and status not in ("PENDING", "DELIVERED"):
@@ -1076,22 +1093,23 @@ def _sourcing_call(fn, *args):
         raise _factory_503(exc)
 
 
-@app.post("/api/v1/sourcing/start", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/sourcing/start", dependencies=[Depends(write_access)])
 def start_sourcing(req: SourcingStartRequest):
     """Send enquiries to the vendors in a plan and start the confirm → re-plan loop."""
     return _sourcing_call(sourcing.start_sourcing, req.run_id, req.playbook_id)
 
 
-@app.get("/api/v1/sourcing/{run_id}")
+@app.get("/api/v1/sourcing/{run_id}", dependencies=[Depends(read_access)])
 def get_sourcing(run_id: str):
     """Current enquiries, offers and (when finished) the confirmed plan. Also expires timed-out enquiries."""
     return _sourcing_call(sourcing.view, run_id)
 
 
-@app.post("/api/v1/sourcing/{run_id}/vendor-reply", dependencies=[Depends(require_api_key)])
-def post_vendor_reply(run_id: str, req: SourcingReplyRequest):
+@app.post("/api/v1/sourcing/{run_id}/vendor-reply")
+def post_vendor_reply(run_id: str, req: SourcingReplyRequest, actor: Actor = Depends(write_access)):
     """Record a vendor's reply typed by an operator (phone call) or, in simulated mode, a simulated vendor."""
-    return _sourcing_call(sourcing.record_reply, run_id, req.supplier_id, req.text, f"operator:{req.entered_by}")
+    return _sourcing_call(sourcing.record_reply, run_id, req.supplier_id, req.text,
+                          f"operator:{actor.approver_name}")
 
 
 # ─── 8b. Client Agent (deadline extension; human sign-off before sending) ──
@@ -1109,26 +1127,26 @@ def _client_call(fn, *args, **kwargs):
         raise _factory_503(exc)
 
 
-@app.post("/api/v1/client/draft", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/client/draft", dependencies=[Depends(write_access)])
 def client_draft(req: ClientDraftRequest):
     """Draft a deadline-extension request for the run's order. Nothing is sent."""
     return _client_call(client_agent.draft_extension, req.run_id, req.extension_hours, req.reason)
 
 
-@app.post("/api/v1/client/approve", dependencies=[Depends(require_api_key)])
-def client_approve(req: ClientApproveRequest):
-    """A named person approves the draft; only then is it sent (SOURCING_MODE channel)."""
-    return _client_call(client_agent.approve_extension, req.run_id, req.approved_by)
+@app.post("/api/v1/client/approve")
+def client_approve(req: ClientApproveRequest, actor: Actor = Depends(write_access)):
+    """The signed-in user approves the draft; only then is it sent (SOURCING_MODE channel)."""
+    return _client_call(client_agent.approve_extension, req.run_id, actor.approver_name)
 
 
-@app.post("/api/v1/client/answer", dependencies=[Depends(require_api_key)])
-def client_answer(req: ClientAnswerRequest):
+@app.post("/api/v1/client/answer")
+def client_answer(req: ClientAnswerRequest, actor: Actor = Depends(write_access)):
     """Record the client's answer: extends the deadline (accepted), re-plans and restarts sourcing."""
     return _client_call(client_agent.record_client_answer, req.run_id, req.accepted, req.text,
-                        req.new_deadline_hours, f"operator:{req.entered_by}")
+                        req.new_deadline_hours, f"operator:{actor.approver_name}")
 
 
-@app.get("/api/v1/client/{run_id}")
+@app.get("/api/v1/client/{run_id}", dependencies=[Depends(read_access)])
 def get_client(run_id: str):
     """The run's extension request: draft, sent message, answer and re-plan."""
     return _client_call(client_agent.view, run_id)
@@ -1136,7 +1154,7 @@ def get_client(run_id: str):
 
 # ─── 9. Reset ────────────────────────────────────────────────────────────────
 
-@app.post("/api/v1/reset", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/reset", dependencies=[Depends(owner_access)])
 def reset_factory():
     if settings.is_production:
         raise HTTPException(status_code=403, detail="Reset is disabled in production")

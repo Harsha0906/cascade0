@@ -6,13 +6,13 @@ import unittest
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
-from fastapi.testclient import TestClient
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 
 from app import db, main, run_store
 from tests.fake_supabase import FailingClient
 from tests.test_persistence import ExecutePlanTxTests, _meta_text
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 
 
 def _meta_button(sender, button_id, msg_id):
@@ -48,7 +48,7 @@ class _DeleteRecorder:
 class WebhookReleaseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(main.app, raise_server_exceptions=False)
+        cls.client = dev_client(main.app, raise_server_exceptions=False)
         cls._patches = [
             mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: True),
             mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: True),

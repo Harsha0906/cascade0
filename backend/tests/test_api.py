@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 from fastapi.testclient import TestClient
 
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from app import db, main, run_store
 from app.factory_model import FactoryDataError
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 
 
 def _signed(body: dict):
@@ -37,7 +38,7 @@ def _button_payload(sender: str, button_id: str) -> dict:
 class ApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(main.app)
+        cls.client = dev_client(main.app)
         cls.sent = []
         cls._patches = [
             mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: cls.sent.append(a) or True),
@@ -141,7 +142,8 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("bad data", r.text)  # no internal detail goes to WhatsApp senders
 
     # ── auth ──
-    def test_mutating_endpoints_require_api_key(self):
+    def test_mutating_endpoints_require_credentials(self):
+        anon = TestClient(main.app)  # no X-Dev-User / bearer
         for path, body in [
             ("/api/v1/simulate-crisis", {"scenario_id": 1}),
             ("/api/v1/execute-plan", {"run_id": "x", "playbook_id": "PLAN_B"}),
@@ -150,11 +152,12 @@ class ApiTests(unittest.TestCase):
             ("/api/v1/ingest/plc-telemetry", {}),
         ]:
             with self.subTest(path=path):
-                self.assertEqual(self.client.post(path, json=body).status_code, 401)
-                self.assertEqual(self.client.post(path, json=body, headers={"X-API-Key": "wrong"}).status_code, 401)
+                self.assertEqual(anon.post(path, json=body).status_code, 401)
+                self.assertEqual(anon.post(path, json=body, headers={"X-API-Key": "wrong"}).status_code, 401)
 
-    def test_state_is_readable_without_key(self):
+    def test_state_needs_credentials(self):
         self.assertEqual(self.client.get("/api/v1/state").status_code, 200)
+        self.assertEqual(TestClient(main.app).get("/api/v1/state").status_code, 401)
 
     # ── simulation discloses AI mode ──
     def test_simulation_reports_fallback_mode(self):
@@ -178,11 +181,11 @@ class ApiTests(unittest.TestCase):
         sim = self._simulate(1)
         plan = next(p for p in sim["playbooks"] if p["id"] == sim["recommended_plan_id"])
         body = {"run_id": sim["run_id"], "playbook_id": plan["id"], "approved_by": "tester",
-                "total_cost_inr": 1}  # extra client field must be ignored
+                "total_cost_inr": 1}  # extra client fields (cost, approver) must be ignored
         r1 = self.client.post("/api/v1/execute-plan", json=body, headers=KEY)
         self.assertEqual(r1.status_code, 200, r1.text)
         self.assertEqual(r1.json()["total_cost_inr"], plan["total_mitigation_cost_inr"])
-        self.assertEqual(r1.json()["approved_by"], "tester")
+        self.assertEqual(r1.json()["approved_by"], "dev-owner@example.test")  # the verified actor
         r2 = self.client.post("/api/v1/execute-plan", json=body, headers=KEY)
         self.assertTrue(r2.json()["already_executed"])
         self.assertEqual(r2.json()["po_number"], r1.json()["po_number"])
