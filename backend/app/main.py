@@ -327,6 +327,7 @@ def simulate_crisis(req: SimulateCrisisRequest):
             "order_selection": result["order_selection"],
             "other_order_shortfalls": result["other_order_shortfalls"],
             "blocked_route": result.get("blocked_route"),
+            "blocked_routes": result.get("blocked_routes", []),
             "weather_alert": result.get("weather_alert", False),
             "route_note": result.get("route_note"),
             "source": result.get("extraction_source", "unknown"),

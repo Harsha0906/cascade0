@@ -63,6 +63,10 @@ class DisruptionExtraction(BaseModel):
         default=None,
         description="Road/route named as blocked or delayed, as written (e.g. 'NH48', 'Hosur corridor'); null if not named"
     )
+    affected_routes: List[str] = Field(
+        default_factory=list,
+        description="Every road/route the alert says is blocked, as written (set by the rules, not the LLM)"
+    )
     weather_alert: bool = Field(
         default=False,
         description="True if the alert reports flood, cyclone, heavy rain, storm, landslide or waterlogging"

@@ -113,6 +113,53 @@ _SUPPLIER_CUE_CHARS = 60
 
 _WEATHER_RE = re.compile(
     r"\b(?:flood(?:s|ed|ing)?|cyclone|heavy\s+rain(?:s|fall)?|storm|landslides?|waterlogg(?:ed|ing))\b", re.I)
+# "flood of orders", "storm of complaints", "storm in a teacup": figurative, not weather.
+_FIGURATIVE_AFTER_RE = re.compile(r"\s+(?:of|in\s+a)\b", re.I)
+
+
+def _has_weather(text: str) -> bool:
+    """A weather cue that is neither negated ("no flooding", "without storms") nor figurative."""
+    for m in _WEATHER_RE.finditer(text or ""):
+        if _FIGURATIVE_AFTER_RE.match(text, m.end()):
+            continue
+        if _NEGATED_BEFORE_RE.search(text[max(0, m.start() - 30):m.start()]):
+            continue
+        return True
+    return False
+
+
+# A route counts as blocked only with a block cue in its clause; "clear"/"open" cues say it is not.
+_BLOCK_CUE_RE = re.compile(
+    r"\b(?:block(?:ed|age)?|clos(?:ed|ure)|shut(?:\s+down)?|jam(?:med)?|flood(?:ed|ing)|submerged|"
+    r"washed\s+out|landslide|accident|divert(?:ed|ion)|stuck)\b", re.I)
+_CLEAR_CUE_RE = re.compile(r"\b(?:clear(?:ed)?|open(?:ed)?|reopen(?:ed)?|normal|moving|restored)\b", re.I)
+_CLAUSE_BREAK_RE = re.compile(r"[;.!?\n]")
+
+
+def _is_blocked_mention(text: str, start: int, end: int) -> bool:
+    """The nearest cue (block or clear) in the mention's clause decides, preferring one that
+    follows the mention; a negated block cue ("not blocked") does not block."""
+    lo = max([m.end() for m in _CLAUSE_BREAK_RE.finditer(text, 0, start)] or [0])
+    nxt = _CLAUSE_BREAK_RE.search(text, end)
+    hi = nxt.start() if nxt else len(text)
+    after = before = None   # nearest cue after / before the mention: (distance, kind)
+    for kind, rx in (("block", _BLOCK_CUE_RE), ("clear", _CLEAR_CUE_RE)):
+        for m in rx.finditer(text, lo, hi):
+            k = kind
+            if k == "block" and _NEGATED_BEFORE_RE.search(text[max(lo, m.start() - 30):m.start()]):
+                k = "clear"
+            if m.start() >= end:
+                if after is None or m.start() - end < after[0]:
+                    after = (m.start() - end, k)
+            elif m.end() <= start:
+                if before is None or start - m.end() < before[0]:
+                    before = (start - m.end(), k)
+    # A cue that follows the mention describes it ("NH48 is clear but Hosur corridor blocked");
+    # one before it ("flooding on NH48") counts only when nothing follows.
+    best = after or before
+    return best is not None and best[1] == "block"
+
+
 _ROUTE_NOUNS = r"corridor|highway|road|route|area|industrial|bypass|expressway|flyover|belt|zone|junction"
 _UNKNOWN_NOUNS = "corridor|highway|road|route|bypass|expressway|flyover"
 _ROUTE_STOP = {"area", "industrial", "corridor", "highway", "cargo", "road", "route", "air"}
@@ -135,10 +182,12 @@ def _supplier_spans(text: str, model: FactoryModel) -> list:
     return spans
 
 
-def _extract_route(text: str, model: FactoryModel) -> Optional[str]:
-    """A route named in the alert, as written: a known route's identifying word (NH48, Hosur
-    corridor) first, else a road-shaped name that matches no route (resolution then notes it).
-    A word that is part of a supplier's name ("Hosur Precision Castings") is not a route."""
+def _blocked_routes(text: str, model: FactoryModel) -> list:
+    """Routes the alert names as blocked, as written, in order of mention: a known route's
+    identifying word (NH48, Hosur corridor) first, else (only when no known route is named) a
+    road-shaped name that matches no route, so resolution can note it. A word that is part of a
+    supplier's name ("Hosur Precision Castings") is not a route, and neither is a route whose
+    clause says it is clear or open."""
     spans = _supplier_spans(text, model)
     routes = {v.route for v in model.vendors} | {r for _, r in model.primary_routes}
     found = []
@@ -149,14 +198,17 @@ def _extract_route(text: str, model: FactoryModel) -> Optional[str]:
             tail = "" if any(c.isdigit() for c in tok) else rf"(?=\s+(?:{_ROUTE_NOUNS})\b)"
             for m in re.finditer(rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9]){tail}", text, re.I):
                 if not any(a <= m.start() and m.end() <= b for a, b in spans):
-                    found.append((m.start(), m.group(0)))
-    if found:
-        return min(found)[1]
-    for m in _UNKNOWN_ROUTE_RE.finditer(text):
-        name = m.group(1) or m.group(2)
-        if name.split()[0].lower() not in _GENERIC_ROUTE_WORDS:
-            return name
-    return None
+                    found.append((m.start(), m.end(), m.group(0)))
+    if not found:
+        for m in _UNKNOWN_ROUTE_RE.finditer(text):
+            name = m.group(1) or m.group(2)
+            if name.split()[0].lower() not in _GENERIC_ROUTE_WORDS:
+                found.append((m.start(), m.end(), name))
+    out: list = []
+    for st, en, written in sorted(found):
+        if _is_blocked_mention(text, st, en) and _norm_text(written) not in {_norm_text(x) for x in out}:
+            out.append(written)
+    return out
 
 
 def _to_int(s: str) -> int:
@@ -310,8 +362,9 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         affected_supplier=supplier,
         affected_order=order,
         shortfall_units=shortfall,
-        affected_route=_extract_route(text, model),
-        weather_alert=bool(_WEATHER_RE.search(text)),
+        affected_route=(_blocked_routes(text, model) or [None])[0],
+        affected_routes=_blocked_routes(text, model),
+        weather_alert=_has_weather(text),
         delay_mentioned=delay_mentioned,
         raw_summary=raw_text[:200],
     )
@@ -343,7 +396,8 @@ def _norm_text(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
-def _ground_numbers(extraction: DisruptionExtraction, raw_text: str) -> DisruptionExtraction:
+def _ground_numbers(extraction: DisruptionExtraction, raw_text: str,
+                    model: Optional[FactoryModel] = None) -> DisruptionExtraction:
     """Null every LLM number that does not appear in the alert text (no invented numbers).
     Thousands separators are ignored; a delay may also be a stated number of days x 24."""
     text = re.sub(r"(?<=\d),(?=\d)", "", raw_text or "")
@@ -357,14 +411,18 @@ def _ground_numbers(extraction: DisruptionExtraction, raw_text: str) -> Disrupti
         logger.warning("Gemini returned %r, which the alert does not state; ignored", value)
         return None
 
+    # A Gemini route is kept only when the deterministic rules also find it blocked outside any
+    # supplier-name mention ("Hosur Precision Castings delayed" is a supplier, not a route).
+    blocked = _blocked_routes(raw_text or "", model) if model is not None else []
     route = extraction.affected_route
-    if route and _norm_text(route) not in _norm_text(raw_text):
-        logger.warning("Gemini returned route %r, which the alert does not state; ignored", route)
+    if route and not any(_norm_text(route) and _norm_text(route) in _norm_text(b) for b in blocked):
+        logger.warning("Gemini returned route %r, which the alert does not name as blocked; ignored", route)
         route = None
     return extraction.model_copy(update={
         "affected_route": route,
+        "affected_routes": blocked,
         # the weather flag is deterministic: the LLM cannot raise it without a cue in the text
-        "weather_alert": bool(_WEATHER_RE.search(raw_text or "")),
+        "weather_alert": _has_weather(raw_text or ""),
         "delay_hours": grounded(extraction.delay_hours, days_ok=True),
         "shortfall_units": grounded(extraction.shortfall_units),
         "affected_lines": [
@@ -407,7 +465,7 @@ def extract_disruption_entities(
             )
             if response.text:
                 data = json.loads(response.text)
-                extraction = _ground_numbers(DisruptionExtraction(**data), raw_text)
+                extraction = _ground_numbers(DisruptionExtraction(**data), raw_text, model)
                 return extraction, f"gemini:{settings.GEMINI_MODEL}"
         except Exception as exc:
             logger.warning("⚠ Gemini structured extraction failed (%s) — using deterministic fail-safe", exc)

@@ -163,6 +163,7 @@ class CascadeGraphState(TypedDict, total=False):
     order_selection: str
     other_order_shortfalls: List[Dict[str, Any]]
     blocked_route: Optional[str]
+    blocked_routes: List[str]
     weather_alert: bool
     route_note: Optional[str]
     now: datetime
@@ -309,9 +310,9 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     # on the blocked route are slower, and a weather alert raises every vendor's shock probability.
     planning_model = risk_adjusted_model(model, disruption)
     risk_bits = []
-    if disruption.blocked_route and disruption.delay_hours > 0:
-        slowed = [v.name.split(" (")[0] for v in model.vendors if v.route == disruption.blocked_route]
-        risk_bits.append(f"route '{disruption.blocked_route}' blocked +{disruption.delay_hours}h"
+    for route in (disruption.all_blocked_routes if disruption.delay_hours > 0 else ()):
+        slowed = [v.name.split(" (")[0] for v in model.vendors if v.route == route]
+        risk_bits.append(f"route '{route}' blocked +{disruption.delay_hours}h"
                          + (f": {', '.join(slowed)} slower" if slowed else " (no vendor on it)"))
     if disruption.weather_alert:
         risk_bits.append("weather alert: delay-shock probability doubled (cap 90%)")
@@ -360,6 +361,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         "factory_id": model.factory_id,
         "factory_model": planning_model,
         "blocked_route": disruption.blocked_route,
+        "blocked_routes": list(disruption.all_blocked_routes),
         "weather_alert": disruption.weather_alert,
         "route_note": disruption.route_note,
         "line_speeds": disruption.line_speeds,
