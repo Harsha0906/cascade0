@@ -122,6 +122,7 @@ def _run_pipeline(
     shortfall=None,
     line_speeds=None,
     order_id=None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     result = run_cascade_pipeline(
         raw_message=message,
@@ -131,6 +132,7 @@ def _run_pipeline(
         override_line_speeds=line_speeds,
         order_id=order_id,
     )
+    result.update(extra or {})   # request context kept with the run (GET /api/v1/runs/{run_id})
     run_store.save_run(result)
     insert_row("disruption_events", {
         "source_channel": source_channel,
@@ -256,6 +258,23 @@ def get_latest_run():
     }
 
 
+@app.get("/api/v1/runs/{run_id}")
+def get_run_by_id(run_id: str):
+    """A stored run in the simulate-crisis response shape, so the dashboard can restore the latest
+    run after a reload; plus its root run id (for the Sourcing and Client panels) and whether it
+    was executed."""
+    run = run_store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Unknown run {run_id}")
+    root_id = run.get("parent_run_id") or run_id
+    return {
+        **_run_response(run),
+        "root_run_id": root_id,
+        "parent_run_id": run.get("parent_run_id"),
+        "executed": db.get_receipt(root_id) is not None,
+    }
+
+
 # ─── 2. Crisis simulation ────────────────────────────────────────────────────
 
 @app.get("/api/v1/scenarios")
@@ -268,6 +287,52 @@ def list_scenarios():
         )}
         for row in db.get_scenarios(settings.DEFAULT_FACTORY_ID)
     ]
+
+
+def _run_response(result: Dict[str, Any]) -> Dict[str, Any]:
+    """The simulate-crisis response for a pipeline result or a stored run (same shape)."""
+    line_names = {l.line_id: l.name for l in result["factory_model"].lines}
+    return {
+        "success": True,
+        "run_id": result["run_id"],
+        "scenario_id": result.get("scenario_id"),
+        "headline": result.get("crisis_headline", ""),
+        "extracted_parameters": {
+            "delay_hours": result["delay_hours"],
+            "line_impacts": [
+                {
+                    "line_id": li["line_id"],
+                    "name": line_names[li["line_id"]],
+                    "speed_pct": li["speed_pct"],
+                    "temp_celsius": li["temp_celsius"],
+                }
+                for li in result["line_impacts"]
+            ],
+            "affected_supplier_id": result["affected_supplier_id"],
+            "shortfall_units": result["shortfall_units"],
+            "shortfall_source": result["shortfall_source"],
+            "shortfall_breakdown": result["shortfall_breakdown"],
+            "alert_stated_shortfall": result["alert_stated_shortfall"],
+            "affected_order_id": result["order_id"],
+            "order_selection": result["order_selection"],
+            "other_order_shortfalls": result["other_order_shortfalls"],
+            "blocked_route": result.get("blocked_route"),
+            "blocked_routes": result.get("blocked_routes", []),
+            "weather_alert": result.get("weather_alert", False),
+            "route_note": result.get("route_note"),
+            "source": result.get("extraction_source", "unknown"),
+            "overridden_by_preset_or_slider": bool(result.get("overridden_by_preset_or_slider")),
+        },
+        "blast_radius": result.get("blast_radius", {}),
+        "ops_proposal": result.get("ops_proposal", {}),
+        "cfo_proposal": result.get("cfo_proposal", {}),
+        "rebuttal_occurred": result.get("rebuttal_count", 0) > 0,
+        "rebuttal_notes": result.get("rebuttal_notes", []),
+        "playbooks": result["playbooks"],
+        "recommended_plan_id": result["recommended_plan_id"],
+        "solver_result": result["solver_result"],
+        "ai_mode": result.get("ai_mode", {}),
+    }
 
 
 @app.post("/api/v1/simulate-crisis", dependencies=[Depends(require_api_key)])
@@ -303,54 +368,15 @@ def simulate_crisis(req: SimulateCrisisRequest):
 
     logger.info("Simulating crisis via %s: %s", req.source_channel, message[:80])
     try:
-        result = _run_pipeline(message, req.source_channel, delay, shortfall, line_speeds, order_id)
+        overridden = any(v is not None for v in (delay, shortfall, line_speeds))
+        result = _run_pipeline(message, req.source_channel, delay, shortfall, line_speeds, order_id,
+                               extra={"scenario_id": req.scenario_id, "overridden_by_preset_or_slider": overridden})
     except SolverInputError as exc:
         raise HTTPException(status_code=422, detail=f"Cannot plan for these inputs: {exc}")
     except FactoryDataError as exc:
         raise _factory_503(exc)
 
-    line_names = {l.line_id: l.name for l in result["factory_model"].lines}
-    return {
-        "success": True,
-        "run_id": result["run_id"],
-        "scenario_id": req.scenario_id,
-        "headline": result.get("crisis_headline", ""),
-        "extracted_parameters": {
-            "delay_hours": result["delay_hours"],
-            "line_impacts": [
-                {
-                    "line_id": li["line_id"],
-                    "name": line_names[li["line_id"]],
-                    "speed_pct": li["speed_pct"],
-                    "temp_celsius": li["temp_celsius"],
-                }
-                for li in result["line_impacts"]
-            ],
-            "affected_supplier_id": result["affected_supplier_id"],
-            "shortfall_units": result["shortfall_units"],
-            "shortfall_source": result["shortfall_source"],
-            "shortfall_breakdown": result["shortfall_breakdown"],
-            "alert_stated_shortfall": result["alert_stated_shortfall"],
-            "affected_order_id": result["order_id"],
-            "order_selection": result["order_selection"],
-            "other_order_shortfalls": result["other_order_shortfalls"],
-            "blocked_route": result.get("blocked_route"),
-            "blocked_routes": result.get("blocked_routes", []),
-            "weather_alert": result.get("weather_alert", False),
-            "route_note": result.get("route_note"),
-            "source": result.get("extraction_source", "unknown"),
-            "overridden_by_preset_or_slider": any(v is not None for v in (delay, shortfall, line_speeds)),
-        },
-        "blast_radius": result.get("blast_radius", {}),
-        "ops_proposal": result.get("ops_proposal", {}),
-        "cfo_proposal": result.get("cfo_proposal", {}),
-        "rebuttal_occurred": result.get("rebuttal_count", 0) > 0,
-        "rebuttal_notes": result.get("rebuttal_notes", []),
-        "playbooks": result["playbooks"],
-        "recommended_plan_id": result["recommended_plan_id"],
-        "solver_result": result["solver_result"],
-        "ai_mode": result.get("ai_mode", {}),
-    }
+    return _run_response(result)
 
 
 # ─── 3. WhatsApp webhook ─────────────────────────────────────────────────────

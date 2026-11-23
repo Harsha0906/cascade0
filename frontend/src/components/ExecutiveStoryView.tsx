@@ -168,7 +168,7 @@ export function ExecutiveStoryView() {
       {/* ─── 2. THE 3-STEP DECISION ARCHITECTURE (When Crisis or Protected) ───── */}
       {selectedPlan ? (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* STEP 1: The Multi-Agent Dispute */}
+          {/* STEP 1: The two planning scenarios */}
           <div className="island-card p-6 flex flex-col justify-between border border-white/70">
             <div>
               <div className="flex items-center justify-between text-xs font-mono mb-4">
@@ -186,10 +186,10 @@ export function ExecutiveStoryView() {
                 <div className="p-3.5 rounded-2xl bg-rose-50/80 border border-rose-200/60">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-rose-900 flex items-center gap-1.5">
-                      🦅 Speed scenario (expedite-first)
+                      ⚡ Speed scenario (expedite-first)
                     </span>
                     <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-rose-200 text-rose-900">
-                      SLA Survival
+                      Fastest
                     </span>
                   </div>
                   <p className="text-[11px] text-rose-950 mt-1.5 leading-relaxed">
@@ -203,10 +203,10 @@ export function ExecutiveStoryView() {
                 <div className="p-3.5 rounded-2xl bg-cyan-50/80 border border-cyan-200/60">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-cyan-900 flex items-center gap-1.5">
-                      🛡️ Cost scenario (cheapest feasible)
+                      ₹ Cost scenario (cheapest feasible)
                     </span>
                     <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-cyan-200 text-cyan-900">
-                      Capital Preservation
+                      Cheapest feasible
                     </span>
                   </div>
                   <p className="text-[11px] text-cyan-950 mt-1.5 leading-relaxed">
@@ -216,7 +216,7 @@ export function ExecutiveStoryView() {
                   </p>
                 </div>
 
-                {/* Dispute Resolution */}
+                {/* Rebuttal check */}
                 <div className="p-2.5 rounded-xl bg-charcoal-900/5 text-[11px] font-mono text-charcoal-700 flex items-center gap-2">
                   <CheckCircle2 className="w-3.5 h-3.5 text-forest shrink-0" />
                   <span>
@@ -229,7 +229,7 @@ export function ExecutiveStoryView() {
             </div>
 
             <p className="text-[10px] font-mono text-charcoal-500 mt-4 border-t border-charcoal-900/10 pt-2">
-              Positions computed by the solver <AiModeBadge className="ml-1" />
+              Scenarios computed by the solver <AiModeBadge className="ml-1" />
             </p>
           </div>
 

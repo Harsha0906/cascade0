@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { Edge, Node } from "@xyflow/react";
 import { subscribeToTable } from "@/lib/supabase";
 import { buildTwinGraph, type FactoryInfo, type Scenario, type ShortfallParams } from "@/lib/twinGraph";
+import { rootRunId, runViewState, type RunResponse } from "@/lib/runHydration";
 
 export type { FactoryInfo, Scenario };
 
@@ -336,40 +337,37 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || `Simulation failed (HTTP ${res.status})`);
       }
-      const data = await res.json();
-      const sr = data.solver_result || {};
-      set({
-        statusMode: "CRISIS",
-        playbooks: data.playbooks || [],
-        selectedPlaybookId: data.recommended_plan_id || null,
-        activeRunId: data.run_id,
-        activeOrderId: data.extracted_parameters?.affected_order_id ?? null,
-        shortfallInfo: data.extracted_parameters?.shortfall_source
-          ? {
-              shortfall_units: data.extracted_parameters.shortfall_units ?? 0,
-              shortfall_source: data.extracted_parameters.shortfall_source,
-              shortfall_breakdown: data.extracted_parameters.shortfall_breakdown ?? null,
-              alert_stated_shortfall: data.extracted_parameters.alert_stated_shortfall ?? null,
-            }
-          : null,
-        solveDurationMs: sr.solve_duration_ms ?? 0,
-        rebuttalOccurred: !!data.rebuttal_occurred,
-        rebuttalNotes: data.rebuttal_notes || [],
-        aiMode: data.ai_mode || null,
-        solverMeta: {
-          lp_status: sr.lp_status || "",
-          ranking_rule: sr.ranking_rule || "",
-          deadline_hours: sr.deadline_hours ?? 0,
-          capacity_exhausted: !!sr.capacity_exhausted,
-          throughput_gap_units: sr.throughput_gap_units ?? 0,
-        },
-      });
+      const data = (await res.json()) as RunResponse<PlaybookOption>;
+      set({ ...runViewState(data), statusMode: "CRISIS", aiMode: (data.ai_mode as AiMode) || null });
       await get().fetchInitialState();
     } catch (err) {
       console.error("Simulation error", err);
       set({ lastError: err instanceof Error ? err.message : "Simulation failed" });
     } finally {
       set({ isSimulating: false });
+    }
+  };
+
+  /** On the first load, restore the latest stored run (plans, Sourcing session, Client record),
+   *  so the dashboard and its Sourcing and Client panels keep working after a page reload. */
+  let hydrated = false;
+  const hydrateLatestRun = async () => {
+    if (hydrated || get().activeRunId) return;
+    hydrated = true;
+    try {
+      const latest = await fetch(`${API_BASE}/api/v1/runs/latest`);
+      if (!latest.ok) return;
+      const { run_id } = (await latest.json()) as { run_id: string | null };
+      if (!run_id || get().activeRunId) return;
+      const res = await fetch(`${API_BASE}/api/v1/runs/${encodeURIComponent(run_id)}`);
+      if (!res.ok || get().activeRunId) return;
+      const data = (await res.json()) as RunResponse<PlaybookOption>;
+      set({ ...runViewState(data), aiMode: (data.ai_mode as AiMode) || null });
+      const sourcingRes = await fetch(`${API_BASE}/api/v1/sourcing/${encodeURIComponent(rootRunId(data))}`);
+      if (sourcingRes.ok) applySourcing((await sourcingRes.json()) as SourcingState);
+      await get().loadClient();
+    } catch (err) {
+      console.warn("Could not restore the latest run", err);
     }
   };
 
@@ -432,6 +430,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     }
 
     await loadFactoryData();
+    await hydrateLatestRun();
     get().updateNodesAndEdges();
   },
 

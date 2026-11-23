@@ -264,5 +264,32 @@ class GeminiVendorReplyIsGrounded(unittest.TestCase):
         self.assertTrue(o.declined)
 
 
+class RunHydrationEndpoint(_Flow):
+    def test_stored_run_has_the_simulate_crisis_shape(self):
+        sim = self._post("/api/v1/simulate-crisis", {"scenario_id": 1})
+        r = self.api.get(f"/api/v1/runs/{sim['run_id']}")
+        self.assertEqual(r.status_code, 200, r.text)
+        got = r.json()
+        for key, value in sim.items():
+            if key == "ai_mode":
+                continue
+            with self.subTest(key=key):
+                self.assertEqual(got[key], value)
+        self.assertEqual((got["root_run_id"], got["parent_run_id"], got["executed"]), (sim["run_id"], None, False))
+
+    def test_latest_sourced_run_restores_with_its_root(self):
+        run_id = self._post("/api/v1/simulate-crisis", {"scenario_id": 1})["run_id"]
+        self._post("/api/v1/sourcing/start", {"run_id": run_id})
+        s = self._reply(run_id, "SUP-PNY-02", "YES 150 pcs @600 in 4h")
+        latest = self.api.get("/api/v1/runs/latest").json()["run_id"]
+        self.assertEqual(latest, s["sourced_run_id"])
+        got = self.api.get(f"/api/v1/runs/{latest}").json()
+        self.assertEqual((got["run_id"], got["root_run_id"]), (latest, run_id))
+        self.assertEqual(got["recommended_plan_id"], s["recommended_plan_id"])
+
+    def test_unknown_run_is_404(self):
+        self.assertEqual(self.api.get("/api/v1/runs/RUN-NOPE").status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()
