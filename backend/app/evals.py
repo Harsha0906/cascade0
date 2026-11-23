@@ -52,11 +52,11 @@ VENDOR_FIELDS = ("accepted", "units", "unit_price_inr", "eta_hours")
 # Recorded regex recall per field on the committed dataset; a drop is a regression (test_evals).
 BASELINE_RECALL: Dict[str, float] = {
     "delay_hours": 0.82,
-    "lines": 0.80,
+    "lines": 0.81,
     "supplier_id": 0.82,
-    "order_id": 0.81,
-    "shortfall_units": 0.81,
-    "error": 0.84,
+    "order_id": 0.82,
+    "shortfall_units": 0.82,
+    "error": 0.90,
 }
 
 

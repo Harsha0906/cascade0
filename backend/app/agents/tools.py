@@ -62,7 +62,9 @@ _TEMP_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:°\s*c\b|deg(?:rees)?\b|celsius\b|c
 _SPEED_CUE_RE = re.compile(
     r"\b(?:at|to)\s*(\d{1,3})\s*%(?!\s*of\b)|(\d{1,3})\s*%\s*(?:speed|capacity)\b", re.I)
 # A whole number, with optional thousands separators: 1,200 and Indian 1,20,000 grouping.
-_NUM = r"(\d{1,3}(?:,\d{2,3})+(?![\d,])|\d+)"
+# A digit run glued to a letter, "#" or "-" ("EV-402", "LINE-2", "#A123", "NH48") is part of an id or
+# reference, never a quantity.
+_NUM = r"(?<![A-Za-z0-9#_\-])(\d{1,3}(?:,\d{2,3})+(?![\d,])|\d+)"
 _HOURS = r"(?:h|hr|hrs|hours?)\b"
 _DAYS = r"days?\b"
 
@@ -99,6 +101,12 @@ def _mentions_delay(text: str) -> bool:
             continue
         return True
     return False
+
+
+def _delay_negated(text: str) -> bool:
+    """The alert says there is NO delay ("no delays", "not delayed", "without delay")."""
+    return any(_NEGATED_BEFORE_RE.search(text[max(0, m.start() - 30):m.start()])
+               for m in _DELAY_MENTION_RE.finditer(text))
 
 
 # A speed cue right after a line mention ("line a at 40%", "line a running at 40%").
@@ -315,6 +323,9 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
     supplier = None
     if len(mentioned) == 1:
         supplier = next(iter(mentioned))
+        # "No delays from Chennai Precision": a negated delay names no delayed supplier.
+        if delay_hours is None and not delay_mentioned and _delay_negated(text):
+            supplier = None
     elif len(mentioned) > 1:
         cues = [(c.start(), c.end()) for c in _SUPPLIER_DELAY_CUE_RE.finditer(text)]
         dist = {}

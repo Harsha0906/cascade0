@@ -23,3 +23,8 @@
 {"text": "Confirmed. 150 units. Rs.600. Delivery 90 minutes", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 600, "eta_hours": 1.5}}
 {"text": "will let you know later", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
 {"text": "150 units ready, ₹600, 6 hrs", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 600, "eta_hours": 6}}
+{"text": "sorry, only 100 units available", "rfq_units": 150, "expected": {"accepted": true, "units": 100, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Sorry, can not do", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "possible nahi hai", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Haan ho jayega", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Cannot supply this week", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}

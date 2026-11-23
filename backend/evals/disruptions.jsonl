@@ -57,3 +57,6 @@
 {"text": "Supplier Precision delayed 12 hours, EV-402, 500 short", "expected": {"delay_hours": null, "lines": {}, "supplier_id": null, "order_id": null, "shortfall_units": null, "error": "ambiguous"}}
 {"text": "Precision delayed 12 hours, EV-402, 500 units short", "expected": {"delay_hours": null, "lines": {}, "supplier_id": null, "order_id": null, "shortfall_units": null, "error": "ambiguous"}}
 {"text": "Welding line at 30%, EV-405, 200 units short", "expected": {"delay_hours": null, "lines": {}, "supplier_id": null, "order_id": null, "shortfall_units": null, "error": "ambiguous"}}
+{"text": "LINE-2 at 40%, EV-405 is short, need 300 units", "expected": {"delay_hours": null, "lines": {"LINE-2": 40}, "supplier_id": null, "order_id": "EV-405", "shortfall_units": 300, "error": null}}
+{"text": "EV-405 missing, Line 1 at 50%", "expected": {"delay_hours": null, "lines": {}, "supplier_id": null, "order_id": null, "shortfall_units": null, "error": "shortfall_not_stated"}}
+{"text": "Chennai Precision Casings is not delayed. Line 2 at 40%. EV-405 300 units short.", "expected": {"delay_hours": null, "lines": {"LINE-2": 40}, "supplier_id": null, "order_id": "EV-405", "shortfall_units": 300, "error": null}}

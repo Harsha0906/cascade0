@@ -159,9 +159,10 @@ class SourcingSession:
 # ─── Reply parsing (perception) ──────────────────────────────────────────────
 
 _DECLINE = re.compile(
-    r"\b(no|nope|nahi|nahin|nai|not\s+available|unavailable|cannot|can't|cant|unable|sorry|"
+    r"\b(no|nope|nahi|nahin|nai|not\s+available|unavailable|can\s*not|can't|cant|unable|sorry|"
     r"out\s+of\s+stock|regret|not\s+possible|mushkil)\b", re.I)
-_ACCEPT = re.compile(r"\b(yes|yeah|ok|okay|haan|han|ha|ji|confirm(?:ed)?|done|sure|can\s+do|available|possible)\b", re.I)
+_ACCEPT = re.compile(
+    r"\b(yes|yeah|ok|okay|haan|han|ha|ji|confirm(?:ed)?|done|sure|can\s+do|available|possible|ho\s*jayega)\b", re.I)
 _PRICE = re.compile(r"(?:₹|(?<![a-z])rs\.?|(?<![a-z])inr|@|rate\s*(?:is|:)?)\s*(\d(?:[\d,]*\d)?)", re.I)
 _ETA_H = re.compile(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours|ghante|ghanta)\b", re.I)
 _ETA_D = re.compile(r"(\d+)\s*(?:day|days|din)\b", re.I)
@@ -191,14 +192,16 @@ def _regex_parse(text: str, rfq: RFQ) -> VendorOffer:
             units = int(n.replace(",", ""))
             break
 
-    accepts = bool(_ACCEPT.search(t))
+    # A decline cue ("not available", "sorry") swallows the accept words inside it, so that
+    # "not available" can never read as "available"; an accept cue must stand outside any decline.
     declines = bool(_DECLINE.search(t))
-    if declines and not accepts and not units:
+    accepts = bool(_ACCEPT.search(_DECLINE.sub(" ", t)))
+    if declines and not (accepts and units):
         return VendorOffer(declined=True, available_units=0, notes=t[:200])
-    if units is None and (accepts or price is not None or eta is not None):
-        units = rfq.units_requested
+    if units is None and accepts:
+        units = rfq.units_requested   # only an explicit acceptance defaults to the quantity asked for
     if units is None:
-        # Could not understand the reply: treat as no offer rather than guess.
+        # Could not understand the reply (or a price/ETA with no acceptance): no offer, never a guess.
         return VendorOffer(declined=True, available_units=0, notes=f"Unparsed reply: {t[:180]}")
     return VendorOffer(declined=units == 0, available_units=units, unit_price_inr=price, eta_hours=eta, notes=t[:200])
 
