@@ -360,7 +360,7 @@ class ExecutePlanTxClassificationTests(unittest.TestCase):
         (name, params), = client.calls
         self.assertEqual(name, "execute_plan_tx")
         self.assertEqual(set(params), {"p_po", "p_order_id", "p_order_status", "p_supplier_updates",
-                                       "p_overtime_line_ids", "p_agent_log", "p_root_run_id", "p_receipt"})
+                                       "p_overtime_line_ids", "p_agent_log", "p_root_run_id", "p_receipt", "p_outcomes"})
         self.assertIsInstance(params["p_po"], dict)
         self.assertIsInstance(params["p_supplier_updates"], list)
         self.assertIsInstance(params["p_overtime_line_ids"], list)
@@ -448,7 +448,7 @@ class WebhookDedupeHealthTests(unittest.TestCase):
     def test_healthz_offline_ready(self):
         r = self.client.get("/healthz")
         self.assertEqual((r.status_code, r.json()["storage"], r.json()["ready"]), (200, "offline", True))
-        self.assertEqual(r.json()["required_migration_level"], 6)
+        self.assertEqual(r.json()["required_migration_level"], 7)
 
     def test_healthz_reports_old_migration_level(self):
         with mock.patch("app.db.migration_level", return_value=3):

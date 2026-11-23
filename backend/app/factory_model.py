@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from app.config import settings
-from app.db import fetch_all, get_all_production_lines, get_all_suppliers, get_factory_row
+from app.db import (
+    fetch_all, get_all_production_lines, get_all_suppliers, get_delivery_outcomes, get_factory_row,
+)
+from app.reliability import beta_reliability, on_time
 
 
 class FactoryDataError(ValueError):
@@ -32,6 +35,9 @@ class Vendor:
     unreliability_delay_range: tuple[float, float]
     min_lead_hours: float
     sourcing_role: str
+    # Learned-reliability evidence: seed history count and DELIVERED outcomes counted so far.
+    prior_total: int = 0
+    outcomes_total: int = 0
 
 
 @dataclass(frozen=True)
@@ -57,6 +63,9 @@ class FactoryModel:
     lines: tuple[ProductionLine, ...]
     # (supplier_id, name) of PRIMARY suppliers: the disrupted inbound source, not in `vendors`.
     primary_suppliers: tuple[tuple[str, str], ...] = ()
+    # (supplier_id, route) of PRIMARY suppliers, so a delayed primary's route can block vendors
+    # that share it. Payloads saved before Round A lack it (from_dict tolerates that).
+    primary_routes: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe representation (tuples become lists)."""
@@ -76,6 +85,7 @@ class FactoryModel:
         d["vendors"] = tuple(vendor(v) for v in d["vendors"])
         d["lines"] = tuple(ProductionLine(**l) for l in d["lines"])
         d["primary_suppliers"] = tuple(tuple(x) for x in d.get("primary_suppliers", ()))
+        d["primary_routes"] = tuple(tuple(x) for x in d.get("primary_routes", ()))
         return cls(**d)
 
     def vendor(self, supplier_id: str) -> Vendor:
@@ -110,7 +120,8 @@ class FactoryModel:
     def with_vendor_overrides(
         self, overrides: Optional[Mapping[str, Mapping[str, Any]]]
     ) -> "FactoryModel":
-        """Apply per-run vendor overrides (keys: max_units, unit_cost, flat_cost, lead_hours).
+        """Apply per-run vendor overrides (keys: max_units, unit_cost, flat_cost, lead_hours,
+        min_lead_hours, delay_shock_pct).
         max_units <= 0 drops the vendor. Unknown supplier ids raise FactoryDataError."""
         if not overrides:
             return self
@@ -133,6 +144,8 @@ class FactoryModel:
                 unit_cost=int(o.get("unit_cost", v.unit_cost)),
                 flat_cost=int(o.get("flat_cost", v.flat_cost)),
                 lead_hours=float(o.get("lead_hours", v.lead_hours)),
+                min_lead_hours=float(o.get("min_lead_hours", v.min_lead_hours)),
+                delay_shock_pct=float(o.get("delay_shock_pct", v.delay_shock_pct)),
             ))
         return replace(self, vendors=tuple(out))
 
@@ -196,7 +209,7 @@ def _range(lo: Optional[float], hi: Optional[float], label: str, name: str,
 
 
 def _load_vendor(row: Mapping[str, Any], history: Optional[Mapping[str, Any]],
-                 p: _Problems) -> Optional[Vendor]:
+                 p: _Problems, delivered: Sequence[Mapping[str, Any]] = ()) -> Optional[Vendor]:
     sid = row.get("id")
     label = f"supplier {sid}"
     t = "suppliers"
@@ -222,12 +235,25 @@ def _load_vendor(row: Mapping[str, Any], history: Optional[Mapping[str, Any]],
     shock_range = _range(s_min, s_max, label, "delay_shock", p)
     unrel_range = _range(u_min, u_max, label, "unreliable_delay", p)
 
+    # Reliability is learned, not typed: the seed history (past_orders_count / on_time_deliveries)
+    # counts as past deliveries, and every DELIVERED outcome adds one observation (Beta posterior).
+    # vendor_history.reliability_score_pct is no longer a source.
     reliability = None
+    prior_total = outcomes_total = 0
     if history is None:
         p.add(f"{label}: no vendor_history row (required for BACKUP/EXPEDITE vendors)")
     else:
-        reliability = _num(history, "vendor_history", "reliability_score_pct", label, p,
-                           minimum=0, maximum=100)
+        past = _num(history, "vendor_history", "past_orders_count", label, p, minimum=0)
+        ontime = _num(history, "vendor_history", "on_time_deliveries", label, p, minimum=0)
+        if past is not None and ontime is not None:
+            if ontime > past:
+                p.add(f"{label}: vendor_history.on_time_deliveries ({ontime:g}) exceeds past_orders_count ({past:g})")
+            else:
+                prior_total = int(round(past))
+                done = [o for o in (delivered or ()) if o.get("delivered_at") and o.get("promised_at")]
+                outcomes_total = len(done)
+                n_on_time = sum(1 for o in done if on_time(o["promised_at"], o["delivered_at"]))
+                reliability = beta_reliability(int(round(ontime)), prior_total, n_on_time, outcomes_total)
 
     text_ok = True
     for col in ("name", "tier", "route"):
@@ -245,6 +271,7 @@ def _load_vendor(row: Mapping[str, Any], history: Optional[Mapping[str, Any]],
         delay_shock_pct=shock_pct, delay_shock_range=shock_range,
         reliability_pct=reliability, unreliability_delay_range=unrel_range,
         min_lead_hours=min_lead, sourcing_role=row["sourcing_role"],
+        prior_total=prior_total, outcomes_total=outcomes_total,
     )
 
 
@@ -292,9 +319,13 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
     window = _num(frow, "factories", "production_hours_in_window", label, p, strictly_positive=True)
 
     history = {h.get("supplier_id"): h for h in fetch_all("vendor_history")}
+    delivered_by_supplier: dict[Any, list[dict[str, Any]]] = {}
+    for o in get_delivery_outcomes(status="DELIVERED"):
+        delivered_by_supplier.setdefault(o.get("supplier_id"), []).append(o)
 
     vendors: list[Vendor] = []
     primaries: list[tuple[str, str]] = []
+    primary_routes: list[tuple[str, str]] = []
     for row in get_all_suppliers():
         if row.get("factory_id") is None:
             p.missing("suppliers", "factory_id")
@@ -311,8 +342,10 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
             continue
         if role == "PRIMARY":
             primaries.append((row["id"], row.get("name") or row["id"]))
+            if row.get("route"):
+                primary_routes.append((row["id"], row["route"]))
             continue
-        v = _load_vendor(row, history.get(row.get("id")), p)
+        v = _load_vendor(row, history.get(row.get("id")), p, delivered_by_supplier.get(row.get("id"), ()))
         if v is not None:
             vendors.append(v)
 
@@ -338,4 +371,5 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
         vendors=tuple(sorted(vendors, key=lambda v: v.supplier_id)),
         lines=tuple(sorted(lines, key=lambda l: l.line_id)),
         primary_suppliers=tuple(sorted(primaries)),
+        primary_routes=tuple(sorted(primary_routes)),
     )

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, List, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictBool, StrictInt, field_validator
 
 
 # ─── 1. Gemini Structured Extraction Schemas ─────────────────────────────────
@@ -58,6 +58,18 @@ class DisruptionExtraction(BaseModel):
     shortfall_units: Optional[int] = Field(
         default=None,
         description="Stated unit shortfall; null if not stated"
+    )
+    affected_route: Optional[str] = Field(
+        default=None,
+        description="Road/route named as blocked or delayed, as written (e.g. 'NH48', 'Hosur corridor'); null if not named"
+    )
+    affected_routes: List[str] = Field(
+        default_factory=list,
+        description="Every road/route the alert says is blocked, as written (set by the rules, not the LLM)"
+    )
+    weather_alert: bool = Field(
+        default=False,
+        description="True if the alert reports flood, cyclone, heavy rain, storm, landslide or waterlogging"
     )
     delay_mentioned: bool = Field(
         default=False,
@@ -197,6 +209,13 @@ class LiveHighwayCheckRequest(BaseModel):
     city: str
 
 
+class DeliveryRecordRequest(BaseModel):
+    """A vendor delivery that actually happened (naive timestamps are taken as UTC)."""
+    po_number: str = Field(min_length=1, max_length=120)
+    supplier_id: str = Field(min_length=1, max_length=120)
+    delivered_at: datetime
+
+
 class ExecutePlanRequest(BaseModel):
     """
     HITL execution approval. The server executes the playbook it computed for `run_id`;
@@ -240,4 +259,26 @@ class SourcingReplyRequest(BaseModel):
     """A vendor's reply, entered by an operator (e.g. after a phone call) or a simulated vendor."""
     supplier_id: str = Field(max_length=32)
     text: str = Field(min_length=1, max_length=1000)
+    entered_by: str = Field(default="dashboard-operator", max_length=120)
+
+
+class ClientDraftRequest(BaseModel):
+    """Client Agent: draft a deadline-extension request (nothing is sent)."""
+    run_id: str = Field(max_length=64)
+    extension_hours: StrictInt = Field(gt=0, le=24 * 30)
+    reason: str = Field(default="", max_length=500)
+
+
+class ClientApproveRequest(BaseModel):
+    """Human sign-off: the named approver releases the drafted message to the client."""
+    run_id: str = Field(max_length=64)
+    approved_by: str = Field(min_length=1, max_length=120)
+
+
+class ClientAnswerRequest(BaseModel):
+    """The client's answer to a sent extension request (entered by an operator)."""
+    run_id: str = Field(max_length=64)
+    accepted: StrictBool
+    text: str = Field(default="", max_length=1000)
+    new_deadline_hours: Optional[StrictInt] = Field(default=None, gt=0, le=24 * 60)
     entered_by: str = Field(default="dashboard-operator", max_length=120)

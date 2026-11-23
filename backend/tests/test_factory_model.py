@@ -53,7 +53,7 @@ class FactoryModelTests(unittest.TestCase):
         p = m.vendor("SUP-PNY-02")
         self.assertEqual((p.max_units, p.unit_cost, p.lead_hours, p.lead_sigma, p.delay_shock_pct,
                           p.delay_shock_range, p.reliability_pct, p.min_lead_hours),
-                         (200, 600, 4.0, 0.45, 6.0, (1.0, 2.5), 93.3, 2.0))
+                         (200, 600, 4.0, 0.45, 6.0, (1.0, 2.5), 88.2, 2.0))
         self.assertEqual(m.vendor("SUP-AIR-04").flat_cost, 600_000)
         self.assertEqual(m.expedite_vendor_id, "SUP-AIR-04")
         self.assertNotIn("SUP-CHN-01", [v.supplier_id for v in m.vendors])  # PRIMARY excluded
@@ -70,14 +70,14 @@ class FactoryModelTests(unittest.TestCase):
         bad = {**_SEED_SUPPLIERS[1], "max_available_qty": -5,
                "delay_shock_min_hours": 3.0, "delay_shock_max_hours": 1.0,
                "lead_time_hours": 0, "min_lead_hours": 0}
-        history = [{**h, "reliability_score_pct": 120} if h["supplier_id"] == bad["id"] else h
+        history = [{**h, "on_time_deliveries": 99} if h["supplier_id"] == bad["id"] else h
                    for h in fetch_all("vendor_history")]
         with mock.patch("app.factory_model.get_all_suppliers", return_value=[bad]),                 mock.patch("app.factory_model.fetch_all", return_value=history):
             with self.assertRaises(FactoryDataError) as ctx:
                 load_factory_model()
         msg = str(ctx.exception)
         for field in ("max_available_qty", "delay_shock", "lead_time_hours", "min_lead_hours",
-                      "reliability_score_pct"):
+                      "on_time_deliveries"):
             self.assertIn(field, msg)
 
     def test_row_order_does_not_change_the_model(self):
@@ -122,9 +122,21 @@ class FactoryModelTests(unittest.TestCase):
         self.assertNotIn("PLAN_A", [p["id"] for p in r["playbooks"]])
         self.assertIn(r["recommended_plan_id"], {"PLAN_B", "PLAN_C", "PLAN_D"})
         ops = [l for l in get_agent_logs(r["run_id"])
-               if l["agent_name"] == "Operations Hawk" and l["tool_called"] == "factory_model.expedite_vendor_id"]
+               if l["agent_name"] == "Speed scenario (expedite-first)" and l["tool_called"] == "factory_model.expedite_vendor_id"]
         self.assertEqual(len(ops), 1)
         self.assertIn("no vendor with role EXPEDITE", ops[0]["message"])
+
+    def test_agent_log_names_are_honest(self):
+        """Scenario steps are labelled as scenarios, the solver as a solver, only the Detective as an agent."""
+        r = run_cascade_pipeline("x", override_shortfall_units=150, override_delay_hours=48,
+                                 override_line_speeds={"LINE-2": 50}, order_id="EV-402")
+        names = {l["agent_name"] for l in get_agent_logs(r["run_id"])}
+        self.assertTrue(names <= {"Disruption Detective (agent)", "Speed scenario (expedite-first)",
+                                  "Cost scenario (cheapest feasible)", "Arbitrator (solver ranking)"}, names)
+        self.assertIn("Disruption Detective (agent)", names)
+        self.assertIn("Arbitrator (solver ranking)", names)
+        for old in ("Operations Hawk", "CFO Watchdog", "Blast-Radius Detective", "Arbitrator"):
+            self.assertNotIn(old, names)
 
 
 if __name__ == "__main__":

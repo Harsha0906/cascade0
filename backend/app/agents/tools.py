@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence
 
@@ -60,7 +62,9 @@ _TEMP_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:°\s*c\b|deg(?:rees)?\b|celsius\b|c
 _SPEED_CUE_RE = re.compile(
     r"\b(?:at|to)\s*(\d{1,3})\s*%(?!\s*of\b)|(\d{1,3})\s*%\s*(?:speed|capacity)\b", re.I)
 # A whole number, with optional thousands separators: 1,200 and Indian 1,20,000 grouping.
-_NUM = r"(\d{1,3}(?:,\d{2,3})+(?![\d,])|\d+)"
+# A digit run glued to a letter, "#" or "-" ("EV-402", "LINE-2", "#A123", "NH48") is part of an id or
+# reference, never a quantity.
+_NUM = r"(?<![A-Za-z0-9#_\-])(\d{1,3}(?:,\d{2,3})+(?![\d,])|\d+)"
 _HOURS = r"(?:h|hr|hrs|hours?)\b"
 _DAYS = r"days?\b"
 
@@ -99,6 +103,12 @@ def _mentions_delay(text: str) -> bool:
     return False
 
 
+def _delay_negated(text: str) -> bool:
+    """The alert says there is NO delay ("no delays", "not delayed", "without delay")."""
+    return any(_NEGATED_BEFORE_RE.search(text[max(0, m.start() - 30):m.start()])
+               for m in _DELAY_MENTION_RE.finditer(text))
+
+
 # A speed cue right after a line mention ("line a at 40%", "line a running at 40%").
 _IMMEDIATE_SPEED_CUE_RE = re.compile(
     r"\s*(?:(?:is|was|now|running|down|dropped|slowed)\s+){0,2}(?:at|to)\s*\d{1,3}\s*%", re.I)
@@ -109,6 +119,106 @@ _SUPPLIER_MENTION_RE = re.compile(
     r"(?i:supplier|vendor)\s+([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,3})")
 _WINDOW_CHARS = 80
 _SUPPLIER_CUE_CHARS = 60
+
+
+_WEATHER_RE = re.compile(
+    r"\b(?:flood(?:s|ed|ing)?|cyclone|heavy\s+rain(?:s|fall)?|storm|landslides?|waterlogg(?:ed|ing))\b", re.I)
+# "flood of orders", "storm of complaints", "storm in a teacup": figurative, not weather.
+_FIGURATIVE_AFTER_RE = re.compile(r"\s+(?:of|in\s+a)\b", re.I)
+
+
+def _has_weather(text: str) -> bool:
+    """A weather cue that is neither negated ("no flooding", "without storms") nor figurative."""
+    for m in _WEATHER_RE.finditer(text or ""):
+        if _FIGURATIVE_AFTER_RE.match(text, m.end()):
+            continue
+        if _NEGATED_BEFORE_RE.search(text[max(0, m.start() - 30):m.start()]):
+            continue
+        return True
+    return False
+
+
+# A route counts as blocked only with a block cue in its clause; "clear"/"open" cues say it is not.
+_BLOCK_CUE_RE = re.compile(
+    r"\b(?:block(?:ed|age)?|clos(?:ed|ure)|shut(?:\s+down)?|jam(?:med)?|flood(?:ed|ing)|submerged|"
+    r"washed\s+out|landslide|accident|divert(?:ed|ion)|stuck)\b", re.I)
+_CLEAR_CUE_RE = re.compile(r"\b(?:clear(?:ed)?|open(?:ed)?|reopen(?:ed)?|normal|moving|restored)\b", re.I)
+_CLAUSE_BREAK_RE = re.compile(r"[;.!?\n]")
+
+
+def _is_blocked_mention(text: str, start: int, end: int) -> bool:
+    """The nearest cue (block or clear) in the mention's clause decides, preferring one that
+    follows the mention; a negated block cue ("not blocked") does not block."""
+    lo = max([m.end() for m in _CLAUSE_BREAK_RE.finditer(text, 0, start)] or [0])
+    nxt = _CLAUSE_BREAK_RE.search(text, end)
+    hi = nxt.start() if nxt else len(text)
+    after = before = None   # nearest cue after / before the mention: (distance, kind)
+    for kind, rx in (("block", _BLOCK_CUE_RE), ("clear", _CLEAR_CUE_RE)):
+        for m in rx.finditer(text, lo, hi):
+            k = kind
+            if k == "block" and _NEGATED_BEFORE_RE.search(text[max(lo, m.start() - 30):m.start()]):
+                k = "clear"
+            if m.start() >= end:
+                if after is None or m.start() - end < after[0]:
+                    after = (m.start() - end, k)
+            elif m.end() <= start:
+                if before is None or start - m.end() < before[0]:
+                    before = (start - m.end(), k)
+    # A cue that follows the mention describes it ("NH48 is clear but Hosur corridor blocked");
+    # one before it ("flooding on NH48") counts only when nothing follows.
+    best = after or before
+    return best is not None and best[1] == "block"
+
+
+_ROUTE_NOUNS = r"corridor|highway|road|route|area|industrial|bypass|expressway|flyover|belt|zone|junction"
+_UNKNOWN_NOUNS = "corridor|highway|road|route|bypass|expressway|flyover"
+_ROUTE_STOP = {"area", "industrial", "corridor", "highway", "cargo", "road", "route", "air"}
+# A road named in the alert that is not a known route ("Mysore Road", "NH44"): kept as written so the
+# resolver can say it matched nothing. Generic openers ("The highway", "National Highway") are not names.
+_UNKNOWN_ROUTE_RE = re.compile(
+    rf"\b([A-Z][A-Za-z-]+(?:\s+[A-Z][A-Za-z-]+)?\s+(?i:{_UNKNOWN_NOUNS}))\b"
+    r"|(?-i:\b((?:NH|SH|MDR|ORR)[\s-]?\d{1,3})\b)")
+_GENERIC_ROUTE_WORDS = {"the", "a", "an", "this", "that", "our", "main", "key", "national", "state", "local"}
+
+
+def _supplier_spans(text: str, model: FactoryModel) -> list:
+    """Every span of the text that names a supplier (id or leading words of the name)."""
+    spans = []
+    for sid, name in list(model.primary_suppliers) + [(v.supplier_id, v.name) for v in model.vendors]:
+        pats = [_mention_pattern(sid)]
+        words = name.split(" (")[0].split()
+        pats += [_name_pattern(" ".join(words[:n])) for n in range(len(words), 1, -1)]
+        spans += [(m.start(), m.end()) for pat in pats for m in re.finditer(pat, text, re.I)]
+    return spans
+
+
+def _blocked_routes(text: str, model: FactoryModel) -> list:
+    """Routes the alert names as blocked, as written, in order of mention: a known route's
+    identifying word (NH48, Hosur corridor) first, else (only when no known route is named) a
+    road-shaped name that matches no route, so resolution can note it. A word that is part of a
+    supplier's name ("Hosur Precision Castings") is not a route, and neither is a route whose
+    clause says it is clear or open."""
+    spans = _supplier_spans(text, model)
+    routes = {v.route for v in model.vendors} | {r for _, r in model.primary_routes}
+    found = []
+    for route in routes:
+        for tok in re.findall(r"[A-Za-z0-9]+", route.split(" (")[0]):
+            if len(tok) < 3 or tok.lower() in _ROUTE_STOP:
+                continue
+            tail = "" if any(c.isdigit() for c in tok) else rf"(?=\s+(?:{_ROUTE_NOUNS})\b)"
+            for m in re.finditer(rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9]){tail}", text, re.I):
+                if not any(a <= m.start() and m.end() <= b for a, b in spans):
+                    found.append((m.start(), m.end(), m.group(0)))
+    if not found:
+        for m in _UNKNOWN_ROUTE_RE.finditer(text):
+            name = m.group(1) or m.group(2)
+            if name.split()[0].lower() not in _GENERIC_ROUTE_WORDS:
+                found.append((m.start(), m.end(), name))
+    out: list = []
+    for st, en, written in sorted(found):
+        if _is_blocked_mention(text, st, en) and _norm_text(written) not in {_norm_text(x) for x in out}:
+            out.append(written)
+    return out
 
 
 def _to_int(s: str) -> int:
@@ -213,6 +323,9 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
     supplier = None
     if len(mentioned) == 1:
         supplier = next(iter(mentioned))
+        # "No delays from Chennai Precision": a negated delay names no delayed supplier.
+        if delay_hours is None and not delay_mentioned and _delay_negated(text):
+            supplier = None
     elif len(mentioned) > 1:
         cues = [(c.start(), c.end()) for c in _SUPPLIER_DELAY_CUE_RE.finditer(text)]
         dist = {}
@@ -262,6 +375,9 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         affected_supplier=supplier,
         affected_order=order,
         shortfall_units=shortfall,
+        affected_route=(_blocked_routes(text, model) or [None])[0],
+        affected_routes=_blocked_routes(text, model),
+        weather_alert=_has_weather(text),
         delay_mentioned=delay_mentioned,
         raw_summary=raw_text[:200],
     )
@@ -282,11 +398,19 @@ def _gemini_prompt(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         f"Refer to every line, supplier and order using exactly one of the ids listed above. "
         f"Leave a field null (or the list empty) when the alert does not state it; "
         f"never invent numbers. Report each affected line with its speed_pct and temp_celsius "
-        f"only if stated, delay_hours, and shortfall_units of {model.stock_item_name}."
+        f"only if stated, delay_hours, and shortfall_units of {model.stock_item_name}. "
+        f"Set affected_route to the road or route named as blocked or delayed, as written "
+        f"(e.g. 'NH48', 'Hosur corridor'), and weather_alert to true only if the alert reports "
+        f"a flood, cyclone, heavy rain, storm, landslide or waterlogging."
     )
 
 
-def _ground_numbers(extraction: DisruptionExtraction, raw_text: str) -> DisruptionExtraction:
+def _norm_text(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _ground_numbers(extraction: DisruptionExtraction, raw_text: str,
+                    model: Optional[FactoryModel] = None) -> DisruptionExtraction:
     """Null every LLM number that does not appear in the alert text (no invented numbers).
     Thousands separators are ignored; a delay may also be a stated number of days x 24."""
     text = re.sub(r"(?<=\d),(?=\d)", "", raw_text or "")
@@ -300,7 +424,18 @@ def _ground_numbers(extraction: DisruptionExtraction, raw_text: str) -> Disrupti
         logger.warning("Gemini returned %r, which the alert does not state; ignored", value)
         return None
 
+    # A Gemini route is kept only when the deterministic rules also find it blocked outside any
+    # supplier-name mention ("Hosur Precision Castings delayed" is a supplier, not a route).
+    blocked = _blocked_routes(raw_text or "", model) if model is not None else []
+    route = extraction.affected_route
+    if route and not any(_norm_text(route) and _norm_text(route) in _norm_text(b) for b in blocked):
+        logger.warning("Gemini returned route %r, which the alert does not name as blocked; ignored", route)
+        route = None
     return extraction.model_copy(update={
+        "affected_route": route,
+        "affected_routes": blocked,
+        # the weather flag is deterministic: the LLM cannot raise it without a cue in the text
+        "weather_alert": _has_weather(raw_text or ""),
         "delay_hours": grounded(extraction.delay_hours, days_ok=True),
         "shortfall_units": grounded(extraction.shortfall_units),
         "affected_lines": [
@@ -309,6 +444,26 @@ def _ground_numbers(extraction: DisruptionExtraction, raw_text: str) -> Disrupti
             for li in extraction.affected_lines
         ],
     })
+
+
+_call_stats = threading.local()   # latency/tokens of this thread's latest Gemini extraction call
+
+
+def usage_tokens(resp: Any) -> dict:
+    """input_tokens/output_tokens from a Gemini response's usage_metadata, when it reports them."""
+    um = getattr(resp, "usage_metadata", None)
+    out = {}
+    for key, attr in (("input_tokens", "prompt_token_count"), ("output_tokens", "candidates_token_count")):
+        v = getattr(um, attr, None) if um is not None else None
+        if isinstance(v, int) and not isinstance(v, bool):
+            out[key] = v
+    return out
+
+
+def last_extraction_stats() -> dict:
+    """Latency (ms) and token counts of this thread's latest Gemini extraction call ({} when the
+    regex path ran, or Gemini failed before answering)."""
+    return dict(getattr(_call_stats, "last", None) or {})
 
 
 def extract_disruption_entities(
@@ -325,7 +480,9 @@ def extract_disruption_entities(
     if not (raw_text or "").strip():
         return DisruptionExtraction(), "structured-overrides"
 
+    _call_stats.last = {}
     if settings.has_gemini:
+        started = time.perf_counter()
         try:
             from google import genai
 
@@ -341,9 +498,12 @@ def extract_disruption_entities(
                     "response_schema": DisruptionExtraction,
                 },
             )
+            _call_stats.last = {"latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                                **usage_tokens(response)}
+            logger.info("Gemini extraction: %s", _call_stats.last)
             if response.text:
                 data = json.loads(response.text)
-                extraction = _ground_numbers(DisruptionExtraction(**data), raw_text)
+                extraction = _ground_numbers(DisruptionExtraction(**data), raw_text, model)
                 return extraction, f"gemini:{settings.GEMINI_MODEL}"
         except Exception as exc:
             logger.warning("⚠ Gemini structured extraction failed (%s) — using deterministic fail-safe", exc)

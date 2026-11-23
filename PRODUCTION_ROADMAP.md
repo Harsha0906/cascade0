@@ -8,13 +8,13 @@
 
 ### Current Reality: StateGraph Multi-Agent Architecture
 - **Agents:**
-  1. `Blast-Radius Detective`: Unstructured NLP entity extraction + causal SQL blast-radius mapping.
-  2. `Operations Hawk`: Max SLA survival heuristic, air charter proponent, overtime maximizer.
-  3. `CFO Watchdog`: Margin preservation heuristic, capital optimizer, local SME vendor advocate.
-  4. `Mathematical Arbitrator`: PuLP mixed-integer program + Monte Carlo; plans ranked by risk-adjusted expected cost (the LLM never computes numbers).
+  1. `Disruption Detective (agent)`: Unstructured NLP entity extraction + causal SQL blast-radius mapping.
+  2. `Speed scenario` (planning scenario, not an agent): expedite-first MILP scored by Monte Carlo.
+  3. `Cost scenario` (planning scenario, not an agent): cheapest feasible MILP scored by Monte Carlo.
+  4. `Arbitrator` (solver ranking, not an agent): PuLP mixed-integer program + Monte Carlo; plans ranked by risk-adjusted expected cost (the LLM never computes numbers).
 - **Opposing Objective Functions:**
   $$\min_{\text{Operations}} \text{DelayHours} \quad \text{vs.} \quad \min_{\text{Finance}} \text{MitigationCostINR}$$
-- **Cyclic Rebuttal Edge:** When disparity exceeds tolerance, the graph loops back, forcing Operations to defend against CFO vetoes.
+- **Cyclic Rebuttal Edge:** When disparity exceeds tolerance, the graph loops back, re-solving the cost scenario against the risk check.
 
 ### Phase 2 Evolution: Event-Driven Swarm on Apache Kafka
 - **De-choreograph the State Machine:** Decouple agents into standalone microservices listening to an event bus (`supply-disruptions`, `machine-telemetry`).

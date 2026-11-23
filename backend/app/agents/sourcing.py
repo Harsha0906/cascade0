@@ -19,6 +19,10 @@ Loop for one analysis run:
   4. Stop when the best plan uses only confirmed vendors (or needs none), or after MAX_ROUNDS.
      The result is saved as a new run (`<run_id>-S<round>`) that goes through the normal
      human-approval / execution path.
+  5. Coordination with the Client Agent: a session that ends without full cover hands over to
+     `client.on_sourcing_failed` (it drafts a deadline-extension request, never sends it), and
+     the client's answer comes back through `restart_with_plan`, which starts a new round on the
+     re-planned target (longer deadline, or expedite allowed after a refusal).
 
 What the LLM does here: reads free-text vendor replies (English/Hinglish). Who to contact and
 whether to re-plan is decided by the optimiser, so decisions stay auditable.
@@ -33,6 +37,7 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -110,6 +115,7 @@ class SourcingSession:
     events: List[str] = field(default_factory=list)
     sourced_run_id: Optional[str] = None
     log_step: int = 20
+    restart_round: int = 0   # round at the last restart_with_plan; MAX_ROUNDS counts from here
     version: int = 0   # optimistic-concurrency counter; 0 = never saved
 
     def to_dict(self) -> Dict[str, Any]:
@@ -126,6 +132,7 @@ class SourcingSession:
             "events": list(self.events),
             "sourced_run_id": self.sourced_run_id,
             "log_step": self.log_step,
+            "restart_round": self.restart_round,
             "version": self.version,
         }
 
@@ -144,6 +151,7 @@ class SourcingSession:
             events=list(d.get("events", [])),
             sourced_run_id=d.get("sourced_run_id"),
             log_step=d.get("log_step", 20),
+            restart_round=d.get("restart_round", 0),
             version=d.get("version", 0),
         )
 
@@ -151,10 +159,20 @@ class SourcingSession:
 # ─── Reply parsing (perception) ──────────────────────────────────────────────
 
 _DECLINE = re.compile(
-    r"\b(no|nope|nahi|nahin|nai|not\s+available|unavailable|cannot|can't|cant|unable|sorry|"
-    r"out\s+of\s+stock|regret|not\s+possible|mushkil)\b", re.I)
-_ACCEPT = re.compile(r"\b(yes|yeah|ok|okay|haan|han|ha|ji|confirm(?:ed)?|done|sure|can\s+do|available|possible)\b", re.I)
-_PRICE = re.compile(r"(?:₹|rs\.?|inr|@|rate\s*(?:is|:)?)\s*([\d,]+)", re.I)
+    r"\b(no|nope|nahi|nahin|nai|not\s+available|unavailable|can\s*not|can['’]?t|unable|sorry|"
+    r"out\s+of\s+stock|regret|not\s+possible|mushkil|won['’]?t|will\s+not|not\s+able|"
+    r"no\s+way|denied|pass\s+on|not\s+(?:in|within|by)\s+\d[\d.]*)\b", re.I)
+# An explicit smaller counter-offer inside a decline: "only 100 units", "80 units only",
+# "can't do 150 but can do 60 units". Any other reply with a decline cue is a decline.
+_NOT_TIME = r"(?!\s*(?:h|hr|hrs|hour|hours|ghante|ghanta|day|days|din)\b)"
+_PARTIAL = re.compile(
+    r"\bonly\s+(\d(?:[\d,]*\d)?)\b" + _NOT_TIME
+    + r"|\b(\d(?:[\d,]*\d)?)\s*(?:units?|pcs|pieces|nos|casings|piece)?\s+only\b"
+    + r"|\bbut\s+(?:we\s+)?(?:can|could|will)\s+(?:do|supply|send|manage|give|provide)\s+(\d(?:[\d,]*\d)?)\b"
+    + _NOT_TIME, re.I)
+_ACCEPT = re.compile(
+    r"\b(yes|yeah|ok|okay|haan|han|ha|ji|confirm(?:ed)?|done|sure|can\s+do|available|possible|ho\s*jayega)\b", re.I)
+_PRICE = re.compile(r"(?:₹|(?<![a-z])rs\.?|(?<![a-z])inr|@|rate\s*(?:is|:)?)\s*(\d(?:[\d,]*\d)?)", re.I)
 _ETA_H = re.compile(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours|ghante|ghanta)\b", re.I)
 _ETA_D = re.compile(r"(\d+)\s*(?:day|days|din)\b", re.I)
 _UNITS = re.compile(r"(\d[\d,]*)\s*(?:units?|pcs|pieces|nos|casings|qty|piece)\b", re.I)
@@ -183,16 +201,59 @@ def _regex_parse(text: str, rfq: RFQ) -> VendorOffer:
             units = int(n.replace(",", ""))
             break
 
-    accepts = bool(_ACCEPT.search(t))
+    # A decline cue ("not available", "sorry") swallows the accept words inside it, so that
+    # "not available" can never read as "available"; an accept cue must stand outside any decline.
     declines = bool(_DECLINE.search(t))
-    if declines and not accepts and not units:
+    accepts = bool(_ACCEPT.search(_DECLINE.sub(" ", t)))
+    # Any decline cue beats any accept cue ("Yes but unable for 300 units"); only an explicit
+    # smaller quantity ("only 100 units") turns a decline into a partial offer. An explicit
+    # "only N" is the offered quantity even without a decline cue ("2000 chahiye? only 120 units").
+    partial = _PARTIAL.search(t)
+    if declines and not partial:
         return VendorOffer(declined=True, available_units=0, notes=t[:200])
-    if units is None and (accepts or price is not None or eta is not None):
-        units = rfq.units_requested
+    if partial:
+        units = int(next(g for g in partial.groups() if g).replace(",", ""))
+    if units is None and accepts:
+        units = rfq.units_requested   # only an explicit acceptance defaults to the quantity asked for
     if units is None:
-        # Could not understand the reply: treat as no offer rather than guess.
+        # Could not understand the reply (or a price/ETA with no acceptance): no offer, never a guess.
         return VendorOffer(declined=True, available_units=0, notes=f"Unparsed reply: {t[:180]}")
     return VendorOffer(declined=units == 0, available_units=units, unit_price_inr=price, eta_hours=eta, notes=t[:200])
+
+
+def _ground_offer(offer: VendorOffer, text: str, rfq: RFQ) -> VendorOffer:
+    """Keep only the numbers the vendor actually wrote (as for disruption alerts): Gemini sees our
+    enquiry's quantity, price and deadline and could copy them back as the vendor's offer.
+    A price or ETA not in the reply becomes None; a quantity not in the reply is kept only for a
+    plain acceptance of the requested quantity, otherwise the reply goes to operator review.
+    The regex decline cues are a veto: a decline is never read as an acceptance."""
+    t = (text or "").strip()
+    plain = re.sub(r"(?<=\d),(?=\d)", "", t)
+    stated = {float(x) for x in re.findall(r"\d+(?:\.\d+)?", plain)}
+
+    def said(value) -> bool:
+        return value is not None and float(value) in stated
+
+    if offer.declined or (_DECLINE.search(t) and not _PARTIAL.search(t)):
+        return VendorOffer(declined=True, available_units=0, notes=(offer.notes or t)[:200])
+    eta = offer.eta_hours
+    if eta is not None and not (said(eta) or (eta % 24 == 0 and said(eta / 24))
+                                or (eta == 24 and re.search(r"\b(tomorrow|kal)\b", t, re.I))):
+        logger.warning("Gemini returned eta %r, which the reply does not state; ignored", eta)
+        eta = None
+    price = offer.unit_price_inr if said(offer.unit_price_inr) else None
+    if offer.unit_price_inr is not None and price is None:
+        logger.warning("Gemini returned price %r, which the reply does not state; ignored", offer.unit_price_inr)
+    units = offer.available_units
+    accepts = bool(_ACCEPT.search(_DECLINE.sub(" ", t)))
+    if units is not None and not said(units) and not (units == rfq.units_requested and accepts):
+        logger.warning("Gemini returned %r units, which the reply does not state; operator review", units)
+        units = None
+    if not units:
+        return VendorOffer(declined=True, available_units=0,
+                           notes=f"Unparsed reply (operator review): {t[:160]}")
+    return VendorOffer(declined=False, available_units=units, unit_price_inr=price, eta_hours=eta,
+                       notes=(offer.notes or t)[:200])
 
 
 def parse_vendor_reply(text: str, rfq: RFQ, item: str = "units") -> Tuple[VendorOffer, str]:
@@ -211,13 +272,18 @@ def parse_vendor_reply(text: str, rfq: RFQ, item: str = "units") -> Tuple[Vendor
                 "If they refuse, declined = true and available_units = 0. Leave price/eta empty if not "
                 "stated. Do not invent numbers."
             )
+            started = time.perf_counter()
             resp = client.models.generate_content(
                 model=settings.GEMINI_MODEL,
                 contents=prompt,
                 config={"response_mime_type": "application/json", "response_schema": VendorOffer},
             )
+            from app.agents.tools import usage_tokens
+            logger.info("Gemini reply parsing: %s", {
+                "latency_ms": round((time.perf_counter() - started) * 1000, 1), **usage_tokens(resp)})
             if resp.text:
-                return VendorOffer(**json.loads(resp.text)), f"gemini:{settings.GEMINI_MODEL}"
+                offer = _ground_offer(VendorOffer(**json.loads(resp.text)), text, rfq)
+                return offer, f"gemini:{settings.GEMINI_MODEL}"
         except Exception as exc:
             logger.warning("Gemini reply parsing failed (%s) — using regex fallback", exc)
     return _regex_parse(text, rfq), "regex-fallback"
@@ -345,6 +411,8 @@ def _solve(session: SourcingSession):
         client=p["client"],
         vendor_overrides=session.overrides,
         confirmed_vendor_ids=session.confirmed,
+        renegotiation_acceptance=p.get("renegotiation_acceptance"),
+        renegotiation_used=bool(p.get("renegotiation_used")),
     )
 
 
@@ -368,6 +436,9 @@ def _finish(session: SourcingSession, result, status: str, reason: str) -> None:
         "solver_result": result.model_dump(),
         "sourcing_status": status,
     })
+    if isinstance(sourced.get("blast_radius"), dict):
+        # After a client-agreed extension the session plans against the new deadline.
+        sourced["blast_radius"] = {**sourced["blast_radius"], "hours_remaining": session.params["deadline_hours"]}
     run_store.save_run(sourced)
     session.sourced_run_id = sourced_id
     session.status = status
@@ -379,6 +450,34 @@ def _finish(session: SourcingSession, result, status: str, reason: str) -> None:
         f"P(on-time) {winner.confidence_pct}%. Ready for human approval as run {sourced_id}.",
         "finalise_sourced_plan()",
     )
+    if not _fully_covered(status, winner):
+        # Hand over to the Client Agent: it drafts an extension request (sends nothing) unless
+        # a request for this run is already open. Imported here: client imports this module.
+        from app.agents import client
+
+        try:
+            drafted = client.on_sourcing_failed(session.run_id, reason=reason)
+        except client.ClientAgentError as exc:
+            _log(session, f"Client Agent could not draft: {exc}",
+                 f"⚠ Not fully covered, and no extension request could be drafted: {exc}",
+                 "client.on_sourcing_failed()")
+        else:
+            if drafted is not None:
+                _log(session, f"Client Agent drafted a {drafted['extension_hours']}h extension request",
+                     f"📝 Not fully covered → Client Agent drafted a {drafted['extension_hours']}h deadline-"
+                     f"extension request for {drafted['order_id']} (awaiting human approval; nothing sent).",
+                     "client.on_sourcing_failed()")
+
+
+def _fully_covered(status: str, winner) -> bool:
+    """True when the finished plan covers the shortfall in time with confirmed supply (or needs none)."""
+    if status == "COMPLETE_UNCONFIRMED" or not winner.feasible or winner.uncovered_units:
+        return False
+    if winner.strategy_type == "SLA_RENEGOTIATION":
+        return False   # the plan is to ask the client to wait
+    if winner.strategy_type == "NO_ACTION" and winner.confidence_pct < 100.0:
+        return False   # accepting the breach is not cover
+    return True
 
 
 def _advance(session: SourcingSession) -> None:
@@ -403,9 +502,10 @@ def _advance(session: SourcingSession) -> None:
         )
         _finish(session, result, "COMPLETE", reason)
         return
-    if session.round >= settings.SOURCING_MAX_ROUNDS:
+    if session.round - session.restart_round >= settings.SOURCING_MAX_ROUNDS:
         _finish(session, result, "COMPLETE_UNCONFIRMED",
-                f"Stopped after {session.round} rounds; some suppliers in the plan are still unconfirmed.")
+                f"Stopped after {session.round - session.restart_round} rounds; "
+                       f"some suppliers in the plan are still unconfirmed.")
         return
 
     session.round += 1
@@ -524,7 +624,12 @@ def _apply_reply(session: SourcingSession, supplier_id: str, text: str, source: 
         rfq.status = "CONFIRMED" if units >= rfq.units_requested else "PARTIAL"
         rfq.offered_units = units
         rfq.offered_eta_hours = offer.eta_hours if offer.eta_hours is not None else vendor.lead_hours
-        override: Dict[str, Any] = {"max_units": units, "lead_hours": rfq.offered_eta_hours}
+        # The vendor's own ETA replaces the planning model's (possibly route-shifted) lead, and the
+        # minimum lead never floors it above what the vendor promised (else MILP and MC disagree).
+        override: Dict[str, Any] = {"max_units": units, "lead_hours": rfq.offered_eta_hours,
+                                    "min_lead_hours": min(vendor.min_lead_hours, rfq.offered_eta_hours)}
+        if offer.eta_hours is not None:
+            override["confirmed_eta_hours"] = offer.eta_hours   # the vendor's own promise (delivery outcomes)
         if _is_charter(vendor):
             rfq.offered_unit_price_inr = offer.unit_price_inr or vendor.flat_cost  # quoted as charter total
             override["flat_cost"] = rfq.offered_unit_price_inr
@@ -543,6 +648,67 @@ def _apply_reply(session: SourcingSession, supplier_id: str, text: str, source: 
          f"📩 {rfq.supplier_name.split(' (')[0]} replied \"{text[:80]}\" → {offer_txt}.",
          f"parse_vendor_reply({parsed_by})")
     _advance(session)
+
+
+def restart_with_plan(root_run_id: str, playbook: Dict[str, Any], reason: str, *,
+                      params_update: Optional[Dict[str, Any]] = None,
+                      allow_vendor_ids: Tuple[str, ...] = ()) -> Dict[str, Any]:
+    """Start a new sourcing round on `playbook` (re-planned by the Client Agent).
+
+    `params_update` changes the session's planning inputs (a longer `deadline_hours`, the
+    client's `renegotiation_acceptance`); `allow_vendor_ids` lifts earlier declines/timeouts for
+    those vendors so they are asked again. Confirmed offers are kept: RFQs go only to the plan's
+    vendors that have not confirmed. Enquiries still open from the previous round are superseded.
+    Known limitation (as for record_reply): a concurrent-update retry re-sends this round's RFQs.
+    """
+    with _lock:
+        for _ in range(_MAX_ATTEMPTS):
+            session = sourcing_store.load(root_run_id)
+            if session is None:
+                raise SourcingError("No sourcing session for this run.", 404)
+            _apply_restart(session, playbook, reason, params_update or {}, tuple(allow_vendor_ids))
+            try:
+                sourcing_store.save(session)
+            except sourcing_store.ConcurrentUpdateError:
+                continue
+            return view(root_run_id)
+        raise SourcingError("Sourcing session changed concurrently; retry", 409)
+
+
+def _apply_restart(session: SourcingSession, playbook: Dict[str, Any], reason: str,
+                   params_update: Dict[str, Any], allow_vendor_ids: Tuple[str, ...]) -> None:
+    known = {v.supplier_id for v in session.model.vendors}
+    unknown = sorted({a["supplier_id"] for a in playbook.get("vendor_allocations", [])} - known)
+    if unknown:
+        raise SourcingError(f"Plan uses vendors not in this run's factory model: {unknown}", 409)
+    for rfq in session.rfqs:
+        if rfq.status == "SENT":
+            rfq.status = "SUPERSEDED"
+            rfq.replied_at = _now().isoformat()
+            _persist(rfq)
+    session.params.update(params_update)
+    for sid in allow_vendor_ids:
+        if sid not in session.confirmed:
+            session.overrides.pop(sid, None)
+    session.status = "ACTIVE"
+    session.playbook_id = playbook["id"]
+    session.restart_round = session.round
+    session.round += 1   # a new round (and a new sourced run id) even when nothing is asked
+    needs = _unconfirmed_needs(playbook, session)
+    if not needs:
+        _log(session, f"Restart on {playbook['id']}: nothing new to ask",
+             f"🔁 {reason} Re-planned target {playbook['id']} needs no new enquiry.",
+             "restart_with_plan()")
+        _advance(session)   # re-solves with the new inputs; finishes or asks the winner's vendors
+        return
+    sent = [_send_rfq(session, sid, units) for sid, units in needs.items()]
+    names = ", ".join(f"{r.supplier_name.split(' (')[0]} ({r.units_requested}u)" for r in sent)
+    _log(session, f"Round {session.round} (restart on {playbook['id']}): asking {names}",
+         f"🔁 {reason} New target {playbook['id']}: enquiries sent to {names} "
+         f"(needed within {sent[0].needed_within_hours:g}h).",
+         "restart_with_plan() + send_rfq()")
+    if any(r.status == "SEND_FAILED" for r in sent):
+        _advance(session)
 
 
 def find_open_rfq_by_number(number: str) -> Optional[Tuple[str, str]]:
@@ -591,6 +757,7 @@ def view(run_id: str) -> Dict[str, Any]:
             "rfqs": [asdict(r) for r in session.rfqs],
             "events": list(session.events),
             "sourced_run_id": session.sourced_run_id,
+            "deadline_hours": session.params.get("deadline_hours"),
             "playbooks": sourced["playbooks"] if sourced else [],
             "recommended_plan_id": sourced["recommended_plan_id"] if sourced else None,
         }

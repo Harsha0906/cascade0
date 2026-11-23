@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { Edge, Node } from "@xyflow/react";
 import { subscribeToTable } from "@/lib/supabase";
 import { buildTwinGraph, type FactoryInfo, type Scenario, type ShortfallParams } from "@/lib/twinGraph";
+import { rootRunId, runViewState, type RunResponse } from "@/lib/runHydration";
 
 export type { FactoryInfo, Scenario };
 
@@ -163,6 +164,8 @@ export interface SourcingState {
   recommended_plan_id: string | null;
 }
 
+import type { ClientRecord } from "@/lib/clientStatus";
+
 export type FactoryStatusMode = "NORMAL" | "CRISIS" | "PROTECTED";
 
 interface FactoryState {
@@ -187,6 +190,9 @@ interface FactoryState {
   lastError: string | null;
   sourcing: SourcingState | null;
   isSourcingBusy: boolean;
+  clientRecord: ClientRecord | null;
+  isClientBusy: boolean;
+  clientError: string | null;
   executionReceipt: any | null;
   isReceiptModalOpen: boolean;
   selectedNodeData: any | null;
@@ -220,6 +226,10 @@ interface FactoryState {
   startSourcing: () => Promise<void>;
   refreshSourcing: () => Promise<void>;
   submitVendorReply: (supplierId: string, text: string) => Promise<void>;
+  loadClient: () => Promise<void>;
+  draftClientExtension: (extensionHours: number, reason: string) => Promise<void>;
+  approveClientExtension: (approvedBy: string) => Promise<void>;
+  answerClientExtension: (accepted: boolean, text: string, newDeadlineHours?: number) => Promise<void>;
   resetFactory: () => Promise<void>;
   setSelectedNodeData: (data: any) => void;
   closeInspectionDrawer: () => void;
@@ -247,6 +257,29 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
         selectedPlaybookId: data.recommended_plan_id,
       });
       get().updateNodesAndEdges();
+    }
+  };
+
+  /** POST to a Client Agent endpoint; API `detail` is surfaced verbatim. Returns true on success. */
+  const clientCall = async (path: string, body: Record<string, unknown>, fallback: string): Promise<boolean> => {
+    set({ isClientBusy: true, clientError: null });
+    try {
+      const res = await fetch(`${API_BASE}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `${fallback} (HTTP ${res.status})`);
+      set({ clientRecord: data });
+      return true;
+    } catch (err) {
+      set({ clientError: err instanceof Error ? err.message : fallback });
+      // The record may have changed server-side even when the call failed (e.g. a 502 on send).
+      await get().loadClient();
+      return false;
+    } finally {
+      set({ isClientBusy: false });
     }
   };
 
@@ -293,7 +326,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
 
   /** POST /simulate-crisis with the given body, then store the plans and refresh the twin. */
   const runSimulation = async (payload: Record<string, unknown>, scenarioId: number | null) => {
-    set({ isSimulating: true, activeScenarioId: scenarioId, lastError: null, sourcing: null });
+    set({ isSimulating: true, activeScenarioId: scenarioId, lastError: null, sourcing: null, clientRecord: null, clientError: null });
     try {
       const res = await fetch(`${API_BASE}/api/v1/simulate-crisis`, {
         method: "POST",
@@ -304,40 +337,37 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || `Simulation failed (HTTP ${res.status})`);
       }
-      const data = await res.json();
-      const sr = data.solver_result || {};
-      set({
-        statusMode: "CRISIS",
-        playbooks: data.playbooks || [],
-        selectedPlaybookId: data.recommended_plan_id || null,
-        activeRunId: data.run_id,
-        activeOrderId: data.extracted_parameters?.affected_order_id ?? null,
-        shortfallInfo: data.extracted_parameters?.shortfall_source
-          ? {
-              shortfall_units: data.extracted_parameters.shortfall_units ?? 0,
-              shortfall_source: data.extracted_parameters.shortfall_source,
-              shortfall_breakdown: data.extracted_parameters.shortfall_breakdown ?? null,
-              alert_stated_shortfall: data.extracted_parameters.alert_stated_shortfall ?? null,
-            }
-          : null,
-        solveDurationMs: sr.solve_duration_ms ?? 0,
-        rebuttalOccurred: !!data.rebuttal_occurred,
-        rebuttalNotes: data.rebuttal_notes || [],
-        aiMode: data.ai_mode || null,
-        solverMeta: {
-          lp_status: sr.lp_status || "",
-          ranking_rule: sr.ranking_rule || "",
-          deadline_hours: sr.deadline_hours ?? 0,
-          capacity_exhausted: !!sr.capacity_exhausted,
-          throughput_gap_units: sr.throughput_gap_units ?? 0,
-        },
-      });
+      const data = (await res.json()) as RunResponse<PlaybookOption>;
+      set({ ...runViewState(data), statusMode: "CRISIS", aiMode: (data.ai_mode as AiMode) || null });
       await get().fetchInitialState();
     } catch (err) {
       console.error("Simulation error", err);
       set({ lastError: err instanceof Error ? err.message : "Simulation failed" });
     } finally {
       set({ isSimulating: false });
+    }
+  };
+
+  /** On the first load, restore the latest stored run (plans, Sourcing session, Client record),
+   *  so the dashboard and its Sourcing and Client panels keep working after a page reload. */
+  let hydrated = false;
+  const hydrateLatestRun = async () => {
+    if (hydrated || get().activeRunId) return;
+    hydrated = true;
+    try {
+      const latest = await fetch(`${API_BASE}/api/v1/runs/latest`);
+      if (!latest.ok) return;
+      const { run_id } = (await latest.json()) as { run_id: string | null };
+      if (!run_id || get().activeRunId) return;
+      const res = await fetch(`${API_BASE}/api/v1/runs/${encodeURIComponent(run_id)}`);
+      if (!res.ok || get().activeRunId) return;
+      const data = (await res.json()) as RunResponse<PlaybookOption>;
+      set({ ...runViewState(data), aiMode: (data.ai_mode as AiMode) || null });
+      const sourcingRes = await fetch(`${API_BASE}/api/v1/sourcing/${encodeURIComponent(rootRunId(data))}`);
+      if (sourcingRes.ok) applySourcing((await sourcingRes.json()) as SourcingState);
+      await get().loadClient();
+    } catch (err) {
+      console.warn("Could not restore the latest run", err);
     }
   };
 
@@ -363,6 +393,9 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
   lastError: null,
   sourcing: null,
   isSourcingBusy: false,
+  clientRecord: null,
+  isClientBusy: false,
+  clientError: null,
   executionReceipt: null,
   isReceiptModalOpen: false,
   selectedNodeData: null,
@@ -397,6 +430,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     }
 
     await loadFactoryData();
+    await hydrateLatestRun();
     get().updateNodesAndEdges();
   },
 
@@ -547,6 +581,39 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     }
   },
 
+  loadClient: async () => {
+    const { activeRunId } = get();
+    if (!activeRunId) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/client/${encodeURIComponent(activeRunId)}`);
+      if (res.ok) set({ clientRecord: await res.json() });
+      else if (res.status === 404) set({ clientRecord: null });
+    } catch {
+      // keep last known state
+    }
+  },
+
+  draftClientExtension: async (extensionHours: number, reason: string) => {
+    const { activeRunId } = get();
+    if (!activeRunId) return;
+    await clientCall("/api/v1/client/draft", { run_id: activeRunId, extension_hours: extensionHours, reason }, "Could not draft the request");
+  },
+
+  approveClientExtension: async (approvedBy: string) => {
+    const { activeRunId } = get();
+    if (!activeRunId) return;
+    await clientCall("/api/v1/client/approve", { run_id: activeRunId, approved_by: approvedBy }, "Could not send the request");
+  },
+
+  answerClientExtension: async (accepted: boolean, text: string, newDeadlineHours?: number) => {
+    const { activeRunId } = get();
+    if (!activeRunId) return;
+    const body: Record<string, unknown> = { run_id: activeRunId, accepted, text };
+    if (newDeadlineHours !== undefined) body.new_deadline_hours = newDeadlineHours;
+    const ok = await clientCall("/api/v1/client/answer", body, "Could not record the answer");
+    if (ok && get().sourcing) await get().refreshSourcing();
+  },
+
   resetFactory: async () => {
     try {
       const res = await fetch(`${API_BASE}/api/v1/reset`, { method: "POST" });
@@ -554,6 +621,8 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
       set({
         lastError: null,
         sourcing: null,
+        clientRecord: null,
+        clientError: null,
         aiMode: null,
         solverMeta: null,
         rebuttalNotes: [],

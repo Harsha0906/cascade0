@@ -30,13 +30,13 @@ export function AgentPipelineStrip() {
             }`}
           >
             <span>🕵️‍♂️</span>
-            <span className="text-xs">Detective</span>
+            <span className="text-xs">Disruption Detective (agent)</span>
             {isCrisisOrProtected && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" />}
           </div>
 
           <ArrowRight className="w-3 h-3 text-charcoal-600 shrink-0" />
 
-          {/* 2 & 3. Ops Hawk vs CFO Watchdog Rebuttal Capsule */}
+          {/* 2 & 3. Speed vs Cost scenario rebuttal Capsule */}
           <div
             className={`flex items-center gap-2 px-3 py-1 rounded-full border transition-all ${
               rebuttalOccurred
@@ -46,11 +46,11 @@ export function AgentPipelineStrip() {
                 : "bg-white/30 border-white/40 text-charcoal-700"
             }`}
           >
-            <span className="text-xs">⚙️ Ops Hawk</span>
+            <span className="text-xs">⚙️ Speed scenario</span>
             <span className="text-[10px] font-bold px-1.5 py-0.2 rounded-full bg-charcoal-900/10 text-charcoal-900">
               vs
             </span>
-            <span className="text-xs">💰 CFO Watchdog</span>
+            <span className="text-xs">💰 Cost scenario</span>
 
             {rebuttalOccurred && (
               <span className="text-[10px] uppercase px-1.5 py-0.5 rounded-full bg-coral text-white font-bold ml-1">
@@ -70,7 +70,7 @@ export function AgentPipelineStrip() {
             }`}
           >
             <span>⚖️</span>
-            <span className="text-xs">Mathematical Arbitrator</span>
+            <span className="text-xs">Arbitrator (solver ranking)</span>
             {isCrisisOrProtected && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" />}
           </div>
         </div>

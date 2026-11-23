@@ -1,10 +1,10 @@
 # CASCADEZERO — COMPLETE AGENT ENGINEERING & MASTER PRODUCT BRIEF
 
-> ⚠️ **SUPERSEDED BUILD SPEC — not a description of current behaviour.** This was the original prompt used to generate the first version. Fixed figures (e.g. Plan B, 13.9x ROI, 94.2%), "dispatch" and "zero-hallucination" language below do not reflect the current code. See README.md ("What Is Real vs Simulated").
+> ⚠️ **SUPERSEDED BUILD SPEC — not a description of current behaviour.** This was the original prompt used to generate the first version. Fixed figures (e.g. Plan B, 13.9x ROI, 94.2%), "dispatch" and "zero-hallucination" language below do not reflect the current code. See README.md ("What Is Real vs Simulated"). Step names below were updated to the current labels: one agent (Disruption Detective), two solver-computed planning scenarios (speed, cost) and the solver ranking; there is no multi-agent debate.
 
 
 > **INSTRUCTIONS FOR THE AI CODING AGENT IN GOOGLE ANTIGRAVITY:**
-> This document is the single source of truth for building **CascadeZero**. Nothing has been implemented yet; you are starting from a clean slate. Read every section carefully and adhere strictly to the architecture, database schema, 4-Agent LangGraph design, PuLP + Monte Carlo math solver, hex color tokens, and the **Step-by-Step Build Order** in Section 8. **Never skip ahead to Step N+1 until the user has run, tested, and verified Step N.** Always provide complete, top-to-bottom file contents (never partial diffs or `// ... existing code ...` placeholders).
+> This document is the single source of truth for building **CascadeZero**. Nothing has been implemented yet; you are starting from a clean slate. Read every section carefully and adhere strictly to the architecture, database schema, Detective + scenarios LangGraph design, PuLP + Monte Carlo math solver, hex color tokens, and the **Step-by-Step Build Order** in Section 8. **Never skip ahead to Step N+1 until the user has run, tested, and verified Step N.** Always provide complete, top-to-bottom file contents (never partial diffs or `// ... existing code ...` placeholders).
 
 ---
 
@@ -26,7 +26,7 @@
   CascadeZero is an "AI Crisis Control Tower" and zero-hardware decision-and-execution layer that connects a factory's existing tools (Tally/Excel, PLC logs, Weather/Traffic APIs, and WhatsApp) onto one live **2.5D Interactive Node Flow Canvas**. When a compound disruption hits, CascadeZero resolves the 5-hour panic in under 10 seconds:
   1. **Multi-Channel Chaos Ingestion:** Ingests live unstructured alerts from a **real physical phone via Twilio WhatsApp Webhook**, live PLC machine telemetry streams, legacy Tally/CSV folder syncs, and external highway weather/traffic APIs.
   2. **Causal Blast-Radius Mapping on a 2.5D Digital Twin:** Dynamically maps how the upstream supply delay + shop-floor thermal slowdown collide to create an exact unit shortfall and rupee SLA penalty exposure on the 2.5D React Flow graph.
-  3. **God-Level 4-Agent Adversarial Boardroom (LangGraph) + Neuro-Symbolic Math Solver (PuLP + Monte Carlo):** Four autonomous, tool-calling AI agents (`Blast-Radius Detective`, `Operations Hawk`, `CFO Watchdog`, and `Neuro-Symbolic Arbitrator`) debate across a cyclic LangGraph workflow, querying live Supabase tables, checking historical vendor reliability memory, running a **Mixed-Integer Linear Programming (`PuLP`) cost optimizer**, and running a **1,000-iteration Monte Carlo risk simulation** so the AI never hallucinates financial arithmetic.
+  3. **Detective + Planning Scenarios Pipeline (LangGraph) + Neuro-Symbolic Math Solver (PuLP + Monte Carlo):** One agent (`Disruption Detective (agent)`) and two solver-computed planning scenarios (`Speed scenario (expedite-first)` and `Cost scenario (cheapest feasible)`), ranked by the `Arbitrator (solver ranking)`, run across a cyclic LangGraph workflow, querying live Supabase tables, checking historical vendor reliability memory, running a **Mixed-Integer Linear Programming (`PuLP`) cost optimizer**, and running a **1,000-iteration Monte Carlo risk simulation** so the AI never hallucinates financial arithmetic.
   4. **One-Click Human-in-the-Loop (HITL) ERP Execution:** Presents the manager with 3 mathematically verified recovery playbooks (`Plan A`, `Plan B`, `Plan C`). With one click on **`[APPROVE & EXECUTE]`**, CascadeZero commits the transaction to Supabase, generates a downloadable **Tally Prime XML & JSON Purchase Order**, dispatches a **WhatsApp Business shift overtime broadcast** to floor supervisors, and issues a **Client SLA Compliance Notice**.
 
 * **Target Audience:**
@@ -49,10 +49,10 @@
 * **Backend Engine (`backend/`):**
   * **Runtime & API Framework:** Python 3.11+ / 3.14 with **FastAPI** (`fastapi`, `uvicorn[standard]`, `pydantic`, `python-dotenv`, `python-multipart`).
   * **Multi-Agent Orchestration:** **LangGraph** (`langgraph`, `langchain-core`) implementing a cyclic, stateful `StateGraph` with autonomous tool-calling (`bind_tools` / structured tool nodes) and adversarial rebuttal loops.
-  * **LLM & Structured Extraction:** **Google Gemini SDK (`google-genai`)** using model **`gemini-2.5-flash`** with strict **Pydantic Structured Outputs (`response_schema`)** for zero-regex unstructured entity parsing and multi-agent debate generation.
+  * **LLM & Structured Extraction:** **Google Gemini SDK (`google-genai`)** using model **`gemini-2.5-flash`** with strict **Pydantic Structured Outputs (`response_schema`)** for zero-regex unstructured entity parsing and narration of computed results.
   * **Mathematical Optimization & Risk Simulation:**
     * **PuLP (`pulp`)** Mixed-Integer Linear Programming (MILP) solver for exact multi-vendor unit allocation and shift overtime optimization across capacity caps and lead times.
-    * **Monte Carlo Simulation Engine** (built with Python `random` / `numpy` inside `solver.py`) executing 1,000 stochastic timeline runs per playbook to compute exact **SLA Survival Probability %** (`Confidence %`).
+    * **Monte Carlo Simulation Engine** (built with Python `random` / `numpy` inside `solver.py`) executing 1,000 stochastic timeline runs per playbook to compute exact **P(on-time) %** (`Confidence %`).
   * **Physical Phone & Field Webhooks:**
     * **Twilio WhatsApp Sandbox Webhook** (`twilio`) exposed via `ngrok` or `cloudflared` tunnel (`POST /api/v1/webhooks/whatsapp`).
 * **Frontend Command Center (`frontend/`):**
@@ -89,7 +89,7 @@ cascadezero/
 │       └── agents/
 │           ├── __init__.py
 │           ├── tools.py             # Autonomous tools bound to the 4 agents (SQL queries, memory lookup, solver trigger)
-│           └── graph.py             # God-Level 4-Agent LangGraph Cyclic StateGraph (Detective, Ops Hawk, CFO, Arbitrator)
+│           └── graph.py             # LangGraph StateGraph (Detective agent, speed and cost scenarios, solver ranking)
 ├── frontend/
 │   ├── .env.local.example           # Template for NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, NEXT_PUBLIC_API_URL
 │   ├── package.json
@@ -103,7 +103,7 @@ cascadezero/
 │       ├── components/
 │       │   ├── TopKpiBar.tsx        # Executive status bar, Active Orders, Contract Risk, CSV upload, & Crisis Trigger
 │       │   ├── WebhookBar.tsx       # SME Multi-Channel Ingestion Bar (3 Scenario Pills + Live Editable Webhook Input + Highway Poll)
-│       │   ├── AgentPipelineStrip.tsx # Visual 4-Agent status strip showing active agent node & tool calls in real time
+│       │   ├── AgentPipelineStrip.tsx # Visual Detective + scenarios status strip showing active agent node & tool calls in real time
 │       │   ├── FlowCanvas.tsx       # @xyflow/react 2.5D Interactive Node Flow Canvas with 5 nodes & 4 animated SVG edges
 │       │   ├── CustomNodes.tsx      # High-density custom telemetry node cards + click-to-inspect SQL drawer
 │       │   ├── AgentStream.tsx      # Bottom Live Agent Debate Terminal streaming thoughts & tool calls via Supabase Realtime
@@ -186,30 +186,30 @@ cascadezero/
 
 ---
 
-### B. God-Level 4-Agent Adversarial LangGraph Architecture (`backend/app/agents/`)
-The core AI engine is a **4-Node Cyclic LangGraph `StateGraph`** (`CascadeGraphState`) with autonomous tool-calling, episodic memory lookup, and an adversarial rebuttal loop:
+### B. Detective + Planning Scenarios LangGraph Architecture (`backend/app/agents/`)
+The core engine is a **cyclic LangGraph `StateGraph`** (`CascadeGraphState`): one agent (the Disruption Detective), two solver-computed planning scenarios, a computed rebuttal check and the solver ranking:
 
-1. **Agent 1: `🕵️‍♂️ Blast-Radius Detective` (`detective_node` — Amber Badge)**
+1. **Agent 1: `🕵️‍♂️ Disruption Detective (agent)` (`detective_node` — Amber Badge)**
    * **Tools Bound:**
      * `extract_disruption_entities(raw_text)` — Calls `gemini-2.5-flash` with strict Pydantic `response_schema=DisruptionExtraction` to parse `delay_hours`, `line2_speed_pct`, `line2_temp_celsius`, `shortfall_units`, and `affected_order_id` from messy English/Hinglish text.
      * `query_blast_radius_sql()` — Joins `suppliers`, `production_lines`, and `orders` in Supabase to calculate exact inventory starvation and SLA exposure (`₹25,00,000` on Order `#EV-402`).
    * **Action:** Updates Supabase `suppliers`, `production_lines`, and `orders` to their `CRITICAL` / `BREACH_RISK` states (which immediately turns the 2.5D React Flow nodes crimson red via Supabase Realtime) and logs its causal trace to `agent_logs`.
 
-2. **Agent 2: `⚙️ Operations Hawk` (`ops_hawk_node` — Rose Badge)**
+2. **Agent 2: `⚙️ Speed scenario (expedite-first)` (`ops_hawk_node` — Rose Badge)**
    * **Objective Function:** 100% On-Time SLA Delivery & Zero Line Starvation, regardless of cost.
    * **Tools Bound:**
      * `check_air_charter_and_max_overtime()` — Queries `SUP-AIR-04` (`BlueDart Aviation Charter @ ₹6,00,000`) and maximum shift overtime capacity on Lines 1 & 3.
    * **Action (Round 1 Proposal):** Demands **Plan A (Emergency Air Cargo + Full Overtime)** to eliminate the `₹25.0L` penalty risk.
 
-3. **Agent 3: `💰 CFO Watchdog` (`cfo_watchdog_node` — Cyan Badge)**
+3. **Agent 3: `💰 Cost scenario (cheapest feasible)` (`cfo_watchdog_node` — Cyan Badge)**
    * **Objective Function:** Margin Protection & Working-Capital Optimization without breaching the SLA.
    * **Tools Bound:**
      * `query_regional_vendors_and_memory(shortfall_units)` — Queries `suppliers` (`SUP-PNY-02` Peenya @ `₹600/unit`, cap `200`; `SUP-HSR-03` Hosur @ `₹850/unit`, cap `180`) AND queries `vendor_history` (Episodic Memory: verifying Peenya's `93.3%` historical emergency reliability).
    * **Action (Round 2 Counter-Attack & Conditional Rebuttal Loop):**
-     * Directly critiques `Ops Hawk`'s `₹6.0L` air charter spend.
-     * **Conditional Edge (`should_rebuttal_continue`):** If `shortfall_units > 200` (exceeding Peenya's 200-unit stock cap, e.g., Scenario 3 with `350 units`), LangGraph routes back for a **Stress-Test Rebuttal Turn** where `Ops Hawk` flags the capacity overflow (`"Peenya caps at 200 units! Where do the remaining 150 casings come from?"`) and `CFO Watchdog` dynamically pulls in Tier-3 `Hosur Precision Castings` (`150 units @ ₹850`) or concedes to Air Charter!
+     * Directly critiques `Speed scenario`'s `₹6.0L` air charter spend.
+     * **Conditional Edge (`should_rebuttal_continue`):** If `shortfall_units > 200` (exceeding Peenya's 200-unit stock cap, e.g., Scenario 3 with `350 units`), LangGraph routes back for a **Stress-Test Rebuttal Turn** where `Speed scenario` flags the capacity overflow (`"Peenya caps at 200 units! Where do the remaining 150 casings come from?"`) and `Cost scenario (cheapest feasible)` dynamically pulls in Tier-3 `Hosur Precision Castings` (`150 units @ ₹850`) or concedes to Air Charter!
 
-4. **Agent 4: `⚖️ Neuro-Symbolic Arbitrator` (`arbitrator_node` — Emerald Badge)**
+4. **Agent 4: `⚖️ Arbitrator (solver ranking)` (`arbitrator_node` — Emerald Badge)**
    * **Objective Function:** Zero-Hallucination Mathematical Verification & Risk-Adjusted ROI Ranking.
    * **Tools Bound:**
      * `run_pulp_milp_and_monte_carlo(shortfall_units, delay_hours, line2_speed_pct)` — Calls `solver.py` to solve the Mixed-Integer Linear Program (`PuLP`) and run the **1,000-iteration Monte Carlo simulation**.
@@ -231,7 +231,7 @@ The Python solver must never fake or hardcode recommendations—it must dynamica
     * Supply constraint: $x_{\text{peenya}} + x_{\text{hosur}} + 500 x_{\text{air}} \ge \text{shortfall\_units}$ (when `delay_hours > 12`)
     * Shop-floor capacity constraint: $38 \times h_{\text{ot}} \ge \text{shortfall\_units}$
 * **1,000-Iteration Monte Carlo Risk Simulation:**
-  * Simulates 1,000 stochastic realizations of route traffic delay ($\mathcal{N}(\mu_{\text{lead}}, \sigma_{\text{traffic}}^2)$), weather delay risk, and Line 2 thermal variance against the `38-hour` SLA deadline window to compute the exact `confidence_pct` (`SLA Survival Probability %`, e.g., `94.2%` for Plan B, `98.4%` for Plan A, `97.1%` for Plan C minor overtime).
+  * Simulates 1,000 stochastic realizations of route traffic delay ($\mathcal{N}(\mu_{\text{lead}}, \sigma_{\text{traffic}}^2)$), weather delay risk, and Line 2 thermal variance against the `38-hour` SLA deadline window to compute the exact `confidence_pct` (`P(on-time) %`, e.g., `94.2%` for Plan B, `98.4%` for Plan A, `97.1%` for Plan C minor overtime).
 * **Dynamic Winner Across All 3 Benchmark Scenarios (Skeptic Judge Test):**
   1. **Scenario 1 (Standard Compound Crisis: `48h delay`, `50% Line 2 speed`, `150 units shortfall`):**
      * **Plan B Wins (`RECOMMENDED OPTIMAL ROI`):** `150 units` from Peenya (`₹90,000`) + `4h` Overtime on Lines 1 & 3 (`₹90,000`) = **₹1.8L** (`₹1,80,000`) cost | Saves **₹23.2L** (`13.9x ROI`) | Confidence: **~94.2%**.
@@ -261,9 +261,9 @@ The Python solver must never fake or hardcode recommendations—it must dynamica
 1. **Top Executive KPI Bar (`TopKpiBar.tsx`):**
    * Left: Glowing status indicator dot + `CASCADEZERO` brand + Dynamic Status Pill (`STATUS: NORMAL OPERATIONS` in emerald $\rightarrow$ `STATUS: CRISIS (COMPOUND DISRUPTION)` in crimson $\rightarrow$ `STATUS: SLA PROTECTED (PLAN X EXECUTED)` in emerald).
    * Right: `Active Orders: 5`, `Contract Risk: ₹0` (flips to `-₹25,00,000` in crimson, then `₹0 (Saved ₹23.2L)` in emerald), **`[🔴 Simulate Crisis]`** button, **`[📄 View Dispatched PO & Notices]`** button (appears after approval), **`[📤 Upload ERP CSV]`** button, `Reset` button, and live connection badge (`SUPABASE REALTIME + PULP LP LIVE`).
-2. **SME Multi-Channel Webhook Bar (`WebhookBar.tsx`) & 4-Agent Pipeline Strip (`AgentPipelineStrip.tsx`):**
+2. **SME Multi-Channel Webhook Bar (`WebhookBar.tsx`) & Detective + scenarios Pipeline Strip (`AgentPipelineStrip.tsx`):**
    * 3 one-click scenario pills (`1. Flood (48h / 150u)`, `2. Minor (6h / 25u)`, `3. Severe (72h / 350u)`), **`[🌦️ Poll NH48 Weather]`** button, and a **live editable text input box** so judges can type any custom delay hours or unit shortfall.
-   * Directly below: The **4-Agent Pipeline Strip** showing `🕵️‍♂️ 1. Detective` $\rightarrow$ `⚙️ 2. Ops Hawk ⚡vs⚡ 💰 3. CFO Watchdog` $\rightarrow$ `⚖️ 4. Arbitrator + PuLP LP`, highlighting each agent and its active tool call as it executes.
+   * Directly below: The **Pipeline Strip** showing `🕵️‍♂️ 1. Detective` $\rightarrow$ `⚙️ 2. Speed scenario ⚡vs⚡ 💰 3. Cost scenario (cheapest feasible)` $\rightarrow$ `⚖️ 4. Arbitrator + PuLP LP`, highlighting each agent and its active tool call as it executes.
 3. **Center 2.5D React Flow Canvas (`FlowCanvas.tsx` & `CustomNodes.tsx`):**
    * 5 Custom Draggable/Inspectable Telemetry Nodes arranged Left-to-Right with 4 animated SVG connecting pipes:
      * **Node 1 (Top-Left):** `🚚 NH48 CHENNAI SUPPLY` (`SUP-CHN-01`) — Tier-1 badge, status headline, delay hours, inbound batch (`500 Casings`).
@@ -290,7 +290,7 @@ The Python solver must never fake or hardcode recommendations—it must dynamica
 
 1. **Pure 2.5D Interactive Node Flow (`@xyflow/react`) Over 3D Isometric (`Three.js`):** Chosen for instant executive readability from 6 feet away, Palantir/Linear visual authority, and zero WebGL performance overhead.
 2. **Production Multi-Tier Architecture Over Toy Single-File HTML:** Scrapped the early single-file prototype completely in favor of **Supabase PostgreSQL + Realtime + FastAPI + LangGraph + PuLP + Next.js/React Flow**.
-3. **God-Level 4-Agent Cyclic LangGraph Over Single Prompt:** Implemented autonomous tool-calling, episodic vendor reliability memory (`vendor_history`), and a conditional rebuttal loop between `Ops Hawk` and `CFO Watchdog`.
+3. **Cyclic LangGraph Pipeline Over Single Prompt:** Implemented autonomous tool-calling, episodic vendor reliability memory (`vendor_history`), and a conditional rebuttal loop between `Speed scenario` and `Cost scenario (cheapest feasible)`.
 4. **Neuro-Symbolic Math Guardrail (`PuLP` MILP + 1,000-Run Monte Carlo):** Guaranteed zero LLM arithmetic hallucination and dynamic multi-vendor allocation when a judge tests numbers exceeding a single vendor's capacity cap.
 5. **Dual Live Phone Triggers (Option 1 Twilio WhatsApp Webhook + Option 2 `/mobile` Web Controller):** Gives the presenter the ultimate live WhatsApp flex on stage while providing a 100% auditorium-Wi-Fi-proof mobile web trigger backup.
 6. **Zero-Crash Resilient Architecture:** Both `db.py` and the frontend store include an automatic in-memory/local mirror so even if venue internet or an external API key drops mid-pitch, the PuLP solver, agent debate, and 2.5D canvas never crash or hang.
@@ -348,10 +348,10 @@ The Python solver must never fake or hardcode recommendations—it must dynamica
   2. `backend/app/solver.py` (The `PuLP` MILP multi-vendor + overtime solver and the 1,000-iteration Monte Carlo confidence simulator).
 * **Verification:** User runs `python -m app.solver` in the terminal to verify the exact mathematical output and confidence scores across all 3 scenarios (Scenario 1: 150u -> Plan B ₹1.8L wins; Scenario 2: 25u -> Plan C ₹0.45L OT-only wins; Scenario 3: 350u -> Multi-tier Peenya+Hosur / Plan A wins).
 
-### Step 3: God-Level 4-Agent LangGraph Engine & FastAPI Webhook Server
+### Step 3: God-Level Detective + scenarios LangGraph Engine & FastAPI Webhook Server
 * **Deliverables:**
   1. `backend/app/agents/tools.py` (Autonomous agent tools: SQL blast-radius query, vendor + episodic memory lookup, air charter lookup, and PuLP + Monte Carlo invocation).
-  2. `backend/app/agents/graph.py` (The 4-Node cyclic LangGraph `StateGraph` with `Detective`, `Ops Hawk`, `CFO Watchdog`, conditional rebuttal edge, and `Arbitrator`, using `gemini-2.5-flash`).
+  2. `backend/app/agents/graph.py` (The cyclic LangGraph `StateGraph` with `Detective`, `Speed scenario`, `Cost scenario (cheapest feasible)`, conditional rebuttal edge, and `Arbitrator`, using `gemini-2.5-flash`).
   3. `backend/app/main.py` (FastAPI server exposing `/api/v1/state`, `/api/v1/simulate-crisis`, `/api/v1/webhooks/whatsapp`, `/api/v1/ingest/plc-telemetry`, `/api/v1/ingest/erp-csv`, `/api/v1/ingest/live-highway-check`, `/api/v1/execute-plan`, and `/api/v1/reset`).
 * **Verification:** User runs `python -m app.main` (`http://localhost:8000/docs`), tests `/api/v1/simulate-crisis`, and sees the 4-agent tool calls, rebuttal loop, and playbooks execute and persist to Supabase.
 
@@ -368,7 +368,7 @@ The Python solver must never fake or hardcode recommendations—it must dynamica
   2. `src/components/PlaybookSidebar.tsx` (Right sidebar with the 3 PuLP + Monte Carlo verified playbook cards and `[APPROVE & EXECUTE]` button).
   3. `src/components/ExecutionModal.tsx` (HITL receipt modal with working `.JSON` and `.XML` Tally Purchase Order downloads, WhatsApp shift broadcast, and SLA compliance notice).
   4. Complete `src/app/page.tsx` assembling the full Command Center War-Room.
-* **Verification:** User clicks `[Simulate Crisis]`, tests Scenarios 1, 2, and 3, watches the 4 agents debate and update the 2.5D canvas, clicks `[APPROVE & EXECUTE]`, and downloads the Tally Purchase Order.
+* **Verification:** User clicks `[Simulate Crisis]`, tests Scenarios 1, 2, and 3, watches the Detective and the planning scenarios update the 2.5D canvas, clicks `[APPROVE & EXECUTE]`, and downloads the Tally Purchase Order.
 
 ### Step 6: Live Phone Trigger (`Twilio WhatsApp + /mobile`), PLC Emulator & ERP Folder Sync
 * **Deliverables:**

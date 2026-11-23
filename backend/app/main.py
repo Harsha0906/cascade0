@@ -13,9 +13,15 @@ CascadeZero — FastAPI server
   POST /api/v1/ingest/sales-order-lines    sales order lines CSV                 [API key]
   POST /api/v1/ingest/live-highway-check   weather check (labelled when offline)
   POST /api/v1/execute-plan                execute a server-computed playbook    [API key]
+  POST /api/v1/deliveries                  record a vendor delivery (learns reliability) [API key]
+  GET  /api/v1/deliveries                  delivery outcomes (?status=PENDING|DELIVERED)
   POST /api/v1/sourcing/start              Sourcing Agent: send vendor enquiries [API key]
   GET  /api/v1/sourcing/{run_id}           enquiry status + confirmed plan
   POST /api/v1/sourcing/{run_id}/vendor-reply  record a vendor reply           [API key]
+  POST /api/v1/client/draft                Client Agent: draft an extension request [API key]
+  POST /api/v1/client/approve              human sign-off: send it to the client [API key]
+  POST /api/v1/client/answer               record the client's answer (re-plans) [API key]
+  GET  /api/v1/client/{run_id}             the run's extension request / answer
   POST /api/v1/reset                       reset demo data                       [API key]
 
 Security model: mutating endpoints require the shared operator key in `X-API-Key`
@@ -44,7 +50,8 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import importers, run_store
+from app import importers, reliability, run_store
+from app.agents import client as client_agent
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
 from app import db
@@ -61,12 +68,16 @@ from app.db import (
 )
 from app.meta_whatsapp import send_whatsapp_interactive_buttons, send_whatsapp_text
 from app.schemas import (
+    DeliveryRecordRequest,
     ErpCsvSyncRequest,
     ExecutePlanRequest,
     ExecutionReceiptResponse,
     LiveHighwayCheckRequest,
     PlcTelemetryRequest,
     SimulateCrisisRequest,
+    ClientAnswerRequest,
+    ClientApproveRequest,
+    ClientDraftRequest,
     SourcingReplyRequest,
     SourcingStartRequest,
 )
@@ -111,6 +122,7 @@ def _run_pipeline(
     shortfall=None,
     line_speeds=None,
     order_id=None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     result = run_cascade_pipeline(
         raw_message=message,
@@ -120,6 +132,7 @@ def _run_pipeline(
         override_line_speeds=line_speeds,
         order_id=order_id,
     )
+    result.update(extra or {})   # request context kept with the run (GET /api/v1/runs/{run_id})
     run_store.save_run(result)
     insert_row("disruption_events", {
         "source_channel": source_channel,
@@ -214,7 +227,8 @@ def get_factory():
         "name": m.name,
         "vendors": [
             {k: getattr(v, k) for k in ("supplier_id", "name", "sourcing_role", "max_units",
-                                        "unit_cost", "flat_cost", "lead_hours", "reliability_pct")}
+                                        "unit_cost", "flat_cost", "lead_hours", "reliability_pct",
+                                        "prior_total", "outcomes_total")}
             for v in m.vendors
         ],
         "lines": [
@@ -244,6 +258,23 @@ def get_latest_run():
     }
 
 
+@app.get("/api/v1/runs/{run_id}")
+def get_run_by_id(run_id: str):
+    """A stored run in the simulate-crisis response shape, so the dashboard can restore the latest
+    run after a reload; plus its root run id (for the Sourcing and Client panels) and whether it
+    was executed."""
+    run = run_store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Unknown run {run_id}")
+    root_id = run.get("parent_run_id") or run_id
+    return {
+        **_run_response(run),
+        "root_run_id": root_id,
+        "parent_run_id": run.get("parent_run_id"),
+        "executed": db.get_receipt(root_id) is not None,
+    }
+
+
 # ─── 2. Crisis simulation ────────────────────────────────────────────────────
 
 @app.get("/api/v1/scenarios")
@@ -256,6 +287,52 @@ def list_scenarios():
         )}
         for row in db.get_scenarios(settings.DEFAULT_FACTORY_ID)
     ]
+
+
+def _run_response(result: Dict[str, Any]) -> Dict[str, Any]:
+    """The simulate-crisis response for a pipeline result or a stored run (same shape)."""
+    line_names = {l.line_id: l.name for l in result["factory_model"].lines}
+    return {
+        "success": True,
+        "run_id": result["run_id"],
+        "scenario_id": result.get("scenario_id"),
+        "headline": result.get("crisis_headline", ""),
+        "extracted_parameters": {
+            "delay_hours": result["delay_hours"],
+            "line_impacts": [
+                {
+                    "line_id": li["line_id"],
+                    "name": line_names[li["line_id"]],
+                    "speed_pct": li["speed_pct"],
+                    "temp_celsius": li["temp_celsius"],
+                }
+                for li in result["line_impacts"]
+            ],
+            "affected_supplier_id": result["affected_supplier_id"],
+            "shortfall_units": result["shortfall_units"],
+            "shortfall_source": result["shortfall_source"],
+            "shortfall_breakdown": result["shortfall_breakdown"],
+            "alert_stated_shortfall": result["alert_stated_shortfall"],
+            "affected_order_id": result["order_id"],
+            "order_selection": result["order_selection"],
+            "other_order_shortfalls": result["other_order_shortfalls"],
+            "blocked_route": result.get("blocked_route"),
+            "blocked_routes": result.get("blocked_routes", []),
+            "weather_alert": result.get("weather_alert", False),
+            "route_note": result.get("route_note"),
+            "source": result.get("extraction_source", "unknown"),
+            "overridden_by_preset_or_slider": bool(result.get("overridden_by_preset_or_slider")),
+        },
+        "blast_radius": result.get("blast_radius", {}),
+        "ops_proposal": result.get("ops_proposal", {}),
+        "cfo_proposal": result.get("cfo_proposal", {}),
+        "rebuttal_occurred": result.get("rebuttal_count", 0) > 0,
+        "rebuttal_notes": result.get("rebuttal_notes", []),
+        "playbooks": result["playbooks"],
+        "recommended_plan_id": result["recommended_plan_id"],
+        "solver_result": result["solver_result"],
+        "ai_mode": result.get("ai_mode", {}),
+    }
 
 
 @app.post("/api/v1/simulate-crisis", dependencies=[Depends(require_api_key)])
@@ -291,50 +368,15 @@ def simulate_crisis(req: SimulateCrisisRequest):
 
     logger.info("Simulating crisis via %s: %s", req.source_channel, message[:80])
     try:
-        result = _run_pipeline(message, req.source_channel, delay, shortfall, line_speeds, order_id)
+        overridden = any(v is not None for v in (delay, shortfall, line_speeds))
+        result = _run_pipeline(message, req.source_channel, delay, shortfall, line_speeds, order_id,
+                               extra={"scenario_id": req.scenario_id, "overridden_by_preset_or_slider": overridden})
     except SolverInputError as exc:
         raise HTTPException(status_code=422, detail=f"Cannot plan for these inputs: {exc}")
     except FactoryDataError as exc:
         raise _factory_503(exc)
 
-    line_names = {l.line_id: l.name for l in result["factory_model"].lines}
-    return {
-        "success": True,
-        "run_id": result["run_id"],
-        "scenario_id": req.scenario_id,
-        "headline": result.get("crisis_headline", ""),
-        "extracted_parameters": {
-            "delay_hours": result["delay_hours"],
-            "line_impacts": [
-                {
-                    "line_id": li["line_id"],
-                    "name": line_names[li["line_id"]],
-                    "speed_pct": li["speed_pct"],
-                    "temp_celsius": li["temp_celsius"],
-                }
-                for li in result["line_impacts"]
-            ],
-            "affected_supplier_id": result["affected_supplier_id"],
-            "shortfall_units": result["shortfall_units"],
-            "shortfall_source": result["shortfall_source"],
-            "shortfall_breakdown": result["shortfall_breakdown"],
-            "alert_stated_shortfall": result["alert_stated_shortfall"],
-            "affected_order_id": result["order_id"],
-            "order_selection": result["order_selection"],
-            "other_order_shortfalls": result["other_order_shortfalls"],
-            "source": result.get("extraction_source", "unknown"),
-            "overridden_by_preset_or_slider": any(v is not None for v in (delay, shortfall, line_speeds)),
-        },
-        "blast_radius": result.get("blast_radius", {}),
-        "ops_proposal": result.get("ops_proposal", {}),
-        "cfo_proposal": result.get("cfo_proposal", {}),
-        "rebuttal_occurred": result.get("rebuttal_count", 0) > 0,
-        "rebuttal_notes": result.get("rebuttal_notes", []),
-        "playbooks": result["playbooks"],
-        "recommended_plan_id": result["recommended_plan_id"],
-        "solver_result": result["solver_result"],
-        "ai_mode": result.get("ai_mode", {}),
-    }
+    return _run_response(result)
 
 
 # ─── 3. WhatsApp webhook ─────────────────────────────────────────────────────
@@ -884,6 +926,22 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         for a in playbook["vendor_allocations"]
     ]
     overtime_line_ids = [lid for lid, hrs in (playbook.get("overtime_line_hours") or {}).items() if hrs > 0]
+    # One PENDING delivery outcome per vendor allocation, promised at execution time + what the
+    # vendor itself promised: the ETA it confirmed to the Sourcing Agent, else its own (unshifted)
+    # lead time from the live factory model; never the run's risk-shifted planning lead.
+    # Recorded deliveries later move the vendor's learned reliability (POST /api/v1/deliveries).
+    outcome_factory = run.get("factory_id") or settings.DEFAULT_FACTORY_ID
+    promised_lead = _promised_leads(root_id, outcome_factory)
+    executed_at = datetime.fromisoformat(now)
+    outcomes = [
+        {
+            "factory_id": outcome_factory, "supplier_id": a["supplier_id"], "po_number": po_number,
+            "units": a["units_allocated"],
+            "promised_at": (executed_at + timedelta(
+                hours=promised_lead.get(a["supplier_id"], a["lead_time_hours"]))).isoformat(),
+        }
+        for a in playbook["vendor_allocations"] if a["units_allocated"] > 0
+    ]
     agent_log = {
         "run_id": req.run_id, "step_order": 10,
         "agent_name": "Human Approver", "agent_role": "HITL Execution", "badge_color": "emerald",
@@ -924,7 +982,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         db.execute_plan_tx(
             po=po_row, order_id=order_id, order_status=new_order_status,
             supplier_updates=supplier_updates, overtime_line_ids=overtime_line_ids,
-            agent_log=agent_log, root_run_id=root_id, receipt=receipt.model_dump(),
+            agent_log=agent_log, root_run_id=root_id, receipt=receipt.model_dump(), outcomes=outcomes,
         )
     except db.AlreadyExecutedError:
         existing = db.get_receipt(root_id)
@@ -934,10 +992,77 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
     return receipt
 
 
+def _promised_leads(root_id: str, factory_id: str) -> Dict[str, float]:
+    """Hours each vendor promised: a confirmed ETA from the run's sourcing session wins over the
+    vendor's live (unshifted) lead time. Vendors in neither fall back to the allocation's lead."""
+    leads: Dict[str, float] = {}
+    try:
+        leads.update({v.supplier_id: v.lead_hours for v in load_factory_model(factory_id).vendors})
+    except FactoryDataError as exc:
+        logger.warning("Live factory model unavailable for delivery promises (%s); using the plan's leads", exc)
+    session = sourcing.sourcing_store.load(root_id)
+    if session is not None:
+        for sid in session.confirmed:
+            eta = session.overrides.get(sid, {}).get("confirmed_eta_hours")
+            if eta is not None:
+                leads[sid] = float(eta)
+    return leads
+
+
 @app.post("/api/v1/execute-plan", dependencies=[Depends(require_api_key)])
 def execute_plan(req: ExecutePlanRequest):
     logger.info("Executing %s from run %s (approved_by=%s)", req.playbook_id, req.run_id, req.approved_by)
     return _execute(req)
+
+
+# ─── 7b. Delivery outcomes (vendor reliability is learned from these) ────────
+
+@app.post("/api/v1/deliveries", dependencies=[Depends(require_api_key)])
+def record_delivery(req: DeliveryRecordRequest):
+    """Record that a purchase-order line was delivered. Moves the vendor's learned reliability."""
+    matches = [o for o in db.get_delivery_outcomes(supplier_id=req.supplier_id)
+               if o["po_number"] == req.po_number]
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"No delivery outcome for PO {req.po_number} / supplier {req.supplier_id}")
+    outcome = matches[0]
+    if outcome["status"] == "DELIVERED":
+        raise HTTPException(status_code=409, detail="This delivery was already recorded.")
+    if reliability.in_the_future(req.delivered_at):
+        raise HTTPException(
+            status_code=422,
+            detail=f"delivered_at is in the future (more than {reliability.MAX_FUTURE_HOURS}h after now).",
+        )
+    if reliability.implausibly_early(outcome["promised_at"], req.delivered_at):
+        raise HTTPException(
+            status_code=422,
+            detail=f"delivered_at is more than {reliability.MAX_EARLY_DAYS} days before the promised time ({outcome['promised_at']}).",
+        )
+    updated = db.update_rows_where(
+        "delivery_outcomes",
+        {"po_number": req.po_number, "supplier_id": req.supplier_id, "status": "PENDING"},
+        {"status": "DELIVERED", "delivered_at": reliability.parse_timestamp(req.delivered_at).isoformat()},
+    )
+    if not updated:  # lost a race with another recording
+        raise HTTPException(status_code=409, detail="This delivery was already recorded.")
+    row = updated[0]
+    try:
+        vendor = next((v for v in load_factory_model(outcome.get("factory_id")).vendors
+                       if v.supplier_id == req.supplier_id), None)
+    except FactoryDataError as exc:
+        raise _factory_503(exc)
+    return {
+        "outcome": row,
+        "on_time": reliability.on_time(row["promised_at"], row["delivered_at"]),
+        "reliability_pct": vendor.reliability_pct if vendor else None,
+    }
+
+
+@app.get("/api/v1/deliveries")
+def list_deliveries(status: Optional[str] = None):
+    """Delivery outcomes, newest facts first by id order; filter with ?status=PENDING or DELIVERED."""
+    if status is not None and status not in ("PENDING", "DELIVERED"):
+        raise HTTPException(status_code=422, detail="status must be PENDING or DELIVERED")
+    return {"outcomes": db.get_delivery_outcomes(status=status)}
 
 
 # ─── 8. Sourcing Agent (confirm vendor offers before approval) ───────────────
@@ -967,6 +1092,46 @@ def get_sourcing(run_id: str):
 def post_vendor_reply(run_id: str, req: SourcingReplyRequest):
     """Record a vendor's reply typed by an operator (phone call) or, in simulated mode, a simulated vendor."""
     return _sourcing_call(sourcing.record_reply, run_id, req.supplier_id, req.text, f"operator:{req.entered_by}")
+
+
+# ─── 8b. Client Agent (deadline extension; human sign-off before sending) ──
+
+def _client_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except client_agent.ClientAgentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except sourcing.SourcingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except SolverInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except FactoryDataError as exc:
+        raise _factory_503(exc)
+
+
+@app.post("/api/v1/client/draft", dependencies=[Depends(require_api_key)])
+def client_draft(req: ClientDraftRequest):
+    """Draft a deadline-extension request for the run's order. Nothing is sent."""
+    return _client_call(client_agent.draft_extension, req.run_id, req.extension_hours, req.reason)
+
+
+@app.post("/api/v1/client/approve", dependencies=[Depends(require_api_key)])
+def client_approve(req: ClientApproveRequest):
+    """A named person approves the draft; only then is it sent (SOURCING_MODE channel)."""
+    return _client_call(client_agent.approve_extension, req.run_id, req.approved_by)
+
+
+@app.post("/api/v1/client/answer", dependencies=[Depends(require_api_key)])
+def client_answer(req: ClientAnswerRequest):
+    """Record the client's answer: extends the deadline (accepted), re-plans and restarts sourcing."""
+    return _client_call(client_agent.record_client_answer, req.run_id, req.accepted, req.text,
+                        req.new_deadline_hours, f"operator:{req.entered_by}")
+
+
+@app.get("/api/v1/client/{run_id}")
+def get_client(run_id: str):
+    """The run's extension request: draft, sent message, answer and re-plan."""
+    return _client_call(client_agent.view, run_id)
 
 
 # ─── 9. Reset ────────────────────────────────────────────────────────────────

@@ -37,6 +37,13 @@ class RfqWordingTests(unittest.TestCase):
 
 
 class ReplyParsingTests(unittest.TestCase):
+    def test_hrs_followed_by_a_comma_is_not_a_price(self):
+        # "rs" inside "hrs" used to match the price cue and crash on int("")
+        o = _regex_parse("I can give 150 units in 12 hrs, price ₹630 each", _rfq())
+        self.assertEqual((o.available_units, o.unit_price_inr, o.eta_hours), (150, 630, 12.0))
+        o = _regex_parse("150 units in 12 hrs, ok", _rfq())
+        self.assertEqual((o.available_units, o.unit_price_inr, o.eta_hours), (150, None, 12.0))
+
     def test_english_and_hinglish_replies(self):
         cases = {
             "YES 150 pcs @600 in 4h": (False, 150, 600, 4.0),

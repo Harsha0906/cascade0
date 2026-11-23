@@ -1,18 +1,18 @@
 """
-CascadeZero — 4-node LangGraph StateGraph (Detective → Ops ⇄ CFO → Arbitrator)
+CascadeZero — 4-node LangGraph StateGraph (Detective → speed ⇄ cost scenarios → Arbitrator solver)
 
 What each node actually does:
   - Detective:   structured extraction (Gemini, or regex fallback), blast-radius DB update.
-  - Ops Hawk:    its proposal is the MILP solved with the expedite vendor forced on
+  - Speed scenario: its proposal is the MILP solved with the expedite vendor forced on
                  (maximum-speed position), scored by Monte Carlo.
-  - CFO Watchdog: its proposal is the unconstrained cost-minimal MILP, scored by Monte Carlo.
+  - Cost scenario: its proposal is the unconstrained cost-minimal MILP, scored by Monte Carlo.
   - Rebuttal:    triggered by *computed* risk, not a fixed threshold — when the CFO plan
                  depends on a vendor below RELIABILITY_FLOOR_PCT, is infeasible, or has a
                  materially lower on-time probability than the Ops plan. Ops challenges;
                  the CFO re-solves with low-reliability vendors excluded and keeps whichever
                  version has the lower risk-adjusted expected cost (concede or hold).
                  At most one rebuttal round.
-  - Arbitrator:  generates and ranks all playbooks by
+  - Arbitrator (solver): generates and ranks all playbooks by
                  E[cost] = mitigation_cost + (1 − P_on_time) × SLA_penalty.
 
 The LLM's role is limited and stated plainly: it extracts parameters from free text and
@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -35,13 +37,17 @@ from langgraph.graph import END, StateGraph
 from app.config import settings
 from app.agents.tools import (
     extract_disruption_entities,
+    last_extraction_stats,
+    usage_tokens,
     query_blast_radius_sql,
     run_pulp_milp_and_monte_carlo,
 )
 from app.db import (
     get_all_orders, get_inbound_shipments, get_order, get_order_lines, get_stock_levels, log_agent_step,
 )
-from app.disruption import DisruptionOverrides, DisruptionResolutionError, resolve_disruption
+from app.disruption import (
+    DisruptionOverrides, DisruptionResolutionError, resolve_disruption, risk_adjusted_model,
+)
 from app.factory_model import FactoryDataError, FactoryModel, load_factory_model
 from app.inventory import FINISHED_STATUSES, compute_shortfall, deadline_hours, order_rank
 from app.solver import (
@@ -62,7 +68,102 @@ NARRATION_COOLDOWN_S = 60.0           # after a failure, use templates for this 
 _narration_down_until = 0.0
 
 
+# ─── Narration guard: no number that is not in the computed facts ─────────────
+
+_SCALES = {"l": 1e5, "lakh": 1e5, "lakhs": 1e5, "lac": 1e5, "lacs": 1e5,
+           "cr": 1e7, "crore": 1e7, "crores": 1e7}
+_NUM_TOKEN_RE = re.compile(
+    r"(?<![\w.])(\d[\d,]*(?:\.\d+)?)"                      # 1,80,000 / 1.8 / 94.2
+    r"(?:\s*(?P<scale>lakhs?|lacs?|crores?|Cr|L)(?![A-Za-z]))?"
+    r"(?P<pct>\s*%)?"
+    r"(?:\s*(?P<day>days?)(?![A-Za-z]))?", re.I)
+_LIST_MARKER_RE = re.compile(r"(?m)^\s*\d+[.)]\s+")
+_SMALL_INT_MAX = 10
+# Digits inside an identifier (SUP-HSR-03, EV-402, #A12, Unit-2) are not quantities; "Rs250" is.
+_ID_TOKEN_RE = re.compile(r"(?<![\w#\-])(?!(?:rs|inr)\.?\d)[#A-Za-z][\w#\-]*\d[\w#\-]*", re.I)
+# ISO dates and timestamps in the facts (2026-11-25, 2026-11-25T10:00:00+00:00).
+_ISO_DATE_RE = re.compile(
+    r"(?<!\d)\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
+# Spelled-out numbers cannot be checked against the facts: any of them sends narration to the template.
+_NUMBER_WORD_RE = re.compile(
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|"
+    r"sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+    r"hundreds?|thousands?|millions?|billions?|half|halves|double|twice|triple|dozens?)\b", re.I)
+# Scale and percent words are fine after a digit ("1.8 lakh", "20 percent"), not on their own.
+_SCALE_WORD_RE = re.compile(r"\b(?:lakhs?|lacs?|crores?|percent|per\s+cent)\b", re.I)
+_ENDS_IN_DIGIT_RE = re.compile(r"\d\s*$")
+
+
+def _has_number_words(text: str) -> bool:
+    text = text or ""
+    if _NUMBER_WORD_RE.search(text):
+        return True
+    return any(not _ENDS_IN_DIGIT_RE.search(text[:m.start()]) for m in _SCALE_WORD_RE.finditer(text))
+
+
+def _numbers_in(text: str) -> list:
+    """(value, tolerance, kind) for every number written in `text`: lakh/crore scaled, with the
+    tolerance of the printed precision. kind is "pct", "day", "small" (a bare integer 1-10) or "".
+    Digits inside identifiers are skipped."""
+    out = []
+    for m in _NUM_TOKEN_RE.finditer(_ID_TOKEN_RE.sub(" ", _LIST_MARKER_RE.sub("", text or ""))):
+        digits = m.group(1).replace(",", "")
+        try:
+            value = float(digits)
+        except ValueError:
+            continue
+        places = len(digits.split(".")[1]) if "." in digits else 0
+        scale = _SCALES.get((m.group("scale") or "").lower(), 1.0)
+        tol = 0.5 * 10 ** -places * scale
+        kind = "pct" if m.group("pct") else "day" if m.group("day") else ""
+        if not kind and scale == 1.0 and places == 0 and 1 <= value <= _SMALL_INT_MAX:
+            kind = "small"
+        out.append((value * scale, tol, kind))
+    return out
+
+
+def _fact_numbers(facts: Any) -> list:
+    """Every number in the facts, flattened. Numbers written inside strings (rupee amounts,
+    headlines) count; digits inside ids (EV-402, SUP-HSR-03) and ISO dates/timestamps do not,
+    so they cannot ground an invented small number ("11 trucks" from a November date)."""
+    out: list = []
+    if isinstance(facts, bool) or facts is None:
+        return out
+    if isinstance(facts, (int, float)):
+        return [float(facts)]
+    if isinstance(facts, str):
+        return [v for v, _, _ in _numbers_in(_ISO_DATE_RE.sub(" ", facts))]
+    if isinstance(facts, dict):
+        for v in facts.values():
+            out += _fact_numbers(v)
+    elif isinstance(facts, (list, tuple, set)):
+        for v in facts:
+            out += _fact_numbers(v)
+    return out
+
+
+def narration_is_grounded(text: str, facts: Dict[str, Any]) -> bool:
+    """True when every number in `text` equals a number in `facts`, allowing rupee formats
+    (1.8L, 1,80,000, 1.8 lakh, 0.18 Cr), rounding at the printed precision, a percentage written
+    against a fraction, and days for hours. A bare integer 1-10 must match a fact exactly.
+    Spelled-out numbers ("two lakh", "twenty percent", "half") are never grounded."""
+    if _has_number_words(text):
+        return False
+    known = _fact_numbers(facts)
+    for value, tol, kind in _numbers_in(text):
+        candidates = [value] + ([value * 24] if kind == "day" else [])
+        limit = 1e-9 if kind == "small" else tol
+        ok = any(abs(c - t) <= limit
+                 for c in candidates for f in known for t in ([f] + ([f * 100] if kind == "pct" else [])))
+        if not ok:
+            return False
+    return True
+
+
 # ─── LLM narration (optional) ────────────────────────────────────────────────
+
+_call_stats = threading.local()   # the latest narration call of this thread, read once by _trace
+
 
 def _get_genai_client():
     global _genai_client
@@ -82,34 +183,56 @@ def _llm_agent_reason(
 ) -> Tuple[str, str]:
     """
     Ask Gemini to narrate a decision that has already been computed.
-    Returns (text, mode) where mode is "gemini" or "template".
+    Returns (text, mode): "gemini", "template", or "template-guarded" when Gemini wrote a number
+    that is not in the computed facts (the template is used instead). The call's latency and token
+    counts are kept for the next `_trace`.
     """
     global _gemini_failure_logged, _narration_down_until
+    _call_stats.last = None
     if not settings.has_gemini or time.monotonic() < _narration_down_until:
         return fallback_message, "template"
+    started = time.perf_counter()
     try:
         prompt = (
             f"You are {agent_name} ({agent_role}) in a factory crisis-response workflow.\n"
             f"OBJECTIVE: {objective}\n"
             f"COMPUTED FACTS (from a MILP solver and Monte Carlo simulation — do not change any number): "
             f"{json.dumps(context, default=str)}\n\n"
-            f"Write 2 sentences in the first person stating your position. Quote only numbers "
+            f"Write 2 sentences describing what this result shows. Quote only numbers "
             f"present in COMPUTED FACTS. Do not invent figures."
         )
         resp = _get_genai_client().models.generate_content(model=settings.GEMINI_MODEL, contents=prompt)
+        _call_stats.last = {"latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                            **usage_tokens(resp)}
         if resp.text and len(resp.text.strip()) > 15:
-            return resp.text.strip(), "gemini"
+            text = resp.text.strip()
+            if not narration_is_grounded(text, context):
+                logger.warning("Gemini narration for %s quoted a number not in the computed facts; "
+                               "using the template", agent_name)
+                return fallback_message, "template-guarded"
+            return text, "gemini"
     except Exception as exc:
         # One slow or failed call should not make every remaining step wait for its own timeout.
         _narration_down_until = time.monotonic() + NARRATION_COOLDOWN_S
+        _call_stats.last = {"latency_ms": round((time.perf_counter() - started) * 1000, 1)}
         if not _gemini_failure_logged:
             logger.warning("Gemini narration unavailable (%s) — using templated narration", exc)
             _gemini_failure_logged = True
     return fallback_message, "template"
 
 
-def _trace(state: Dict[str, Any], node: str, mode: str) -> List[Dict[str, str]]:
-    return list(state.get("llm_trace", [])) + [{"node": node, "mode": mode}]
+def _trace(state: Dict[str, Any], node: str, mode: str,
+           stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Append a trace entry. latency_ms (and token counts when Gemini reported usage) come from the
+    narration call just made by this thread, or from `stats`; a step that made no call has 0 ms."""
+    if stats is None:
+        stats = getattr(_call_stats, "last", None) or {}
+        _call_stats.last = None
+    entry: Dict[str, Any] = {"node": node, "mode": mode, "latency_ms": float(stats.get("latency_ms", 0.0))}
+    for key in ("input_tokens", "output_tokens"):
+        if key in stats:
+            entry[key] = stats[key]
+    return list(state.get("llm_trace", [])) + [entry]
 
 
 # ─── Proposal helpers (numbers come from the solver) ─────────────────────────
@@ -160,6 +283,10 @@ class CascadeGraphState(TypedDict, total=False):
     alert_stated_shortfall: Optional[int]
     order_selection: str
     other_order_shortfalls: List[Dict[str, Any]]
+    blocked_route: Optional[str]
+    blocked_routes: List[str]
+    weather_alert: bool
+    route_note: Optional[str]
     now: datetime
     order_id: str
     crisis_headline: str
@@ -178,7 +305,7 @@ class CascadeGraphState(TypedDict, total=False):
     playbooks: List[Dict[str, Any]]
     recommended_plan_id: str
 
-    llm_trace: List[Dict[str, str]]
+    llm_trace: List[Dict[str, Any]]
 
 
 
@@ -250,7 +377,9 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
     model = load_factory_model(state.get("factory_id"))   # FactoryDataError propagates (-> 503 in main)
     order_ids = [o["order_id"] for o in get_all_orders() if o.get("factory_id") == model.factory_id]
+    t0 = time.perf_counter()
     extraction, source = extract_disruption_entities(state["raw_message"], model, order_ids)
+    extraction_stats = {**last_extraction_stats(), "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
     # Explicit overrides (scenario presets / sliders) win over extraction, and we say so.
     # None means "not overridden"; an explicit 0 is a real value and must win.
@@ -300,14 +429,27 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
                          f"order that is short (checked from inventory"
                          + (f"; also {others}" if others else "") + ")")
 
+    # Every later node (Ops, CFO, arbitrator, Monte Carlo) plans on the risk-adjusted model: vendors
+    # on the blocked route are slower, and a weather alert raises every vendor's shock probability.
+    planning_model = risk_adjusted_model(model, disruption)
+    risk_bits = []
+    for route in (disruption.all_blocked_routes if disruption.delay_hours > 0 else ()):
+        slowed = [v.name.split(" (")[0] for v in model.vendors if v.route == route]
+        risk_bits.append(f"route '{route}' blocked +{disruption.delay_hours}h"
+                         + (f": {', '.join(slowed)} slower" if slowed else " (no vendor on it)"))
+    if disruption.weather_alert:
+        risk_bits.append("weather alert: delay-shock probability doubled (cap 90%)")
+    if disruption.route_note:
+        risk_bits.append(disruption.route_note)
     log_agent_step(
         run_id=run_id, step_order=1,
-        agent_name="Blast-Radius Detective", agent_role="Disruption Entity Extractor", badge_color="amber",
+        agent_name="Disruption Detective (agent)", agent_role="Disruption Entity Extractor", badge_color="amber",
         tool_called=f"extract_disruption_entities({source})",
         tool_output_summary=(
             f"{supplier_txt} | {lines_txt} | Shortfall {disruption.shortfall_units} units on #{disruption.order_id}"
             f" ({shortfall_txt})"
             + selection_txt
+            + (f" | risk: {'; '.join(risk_bits)}" if risk_bits else "")
             + (" | parameters set by scenario/slider override" if overridden else "")
         ),
         message=(
@@ -323,7 +465,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         f"{blast['hours_remaining']:g}h to deadline. {supplier_txt}; {lines_txt}."
     )
     msg, mode = _llm_agent_reason(
-        "Blast-Radius Detective", "Causal Dependency Mapper",
+        "Disruption Detective (agent)", "Causal Dependency Mapper",
         "Summarise the compound disruption and what is at stake.",
         {"delay_hours": disruption.delay_hours, "supplier": supplier_txt, "line_impacts": lines_txt,
          "shortfall_units": disruption.shortfall_units, "order_id": disruption.order_id,
@@ -332,15 +474,20 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     )
     log_agent_step(
         run_id=run_id, step_order=2,
-        agent_name="Blast-Radius Detective", agent_role="Causal Dependency Mapper", badge_color="amber",
+        agent_name="Disruption Detective (agent)", agent_role="Causal Dependency Mapper", badge_color="amber",
         tool_called="query_blast_radius_sql()", tool_output_summary=summary, message=msg,
     )
 
-    trace = [{"node": "detective_extraction", "mode": "gemini" if source.startswith("gemini") else "regex-fallback"}]
-    trace.append({"node": "detective", "mode": mode})
+    trace = _trace({}, "detective_extraction", "gemini" if source.startswith("gemini") else "regex-fallback",
+                   stats=extraction_stats)
+    trace = _trace({"llm_trace": trace}, "detective", mode)
     return {
         "factory_id": model.factory_id,
-        "factory_model": model,
+        "factory_model": planning_model,
+        "blocked_route": disruption.blocked_route,
+        "blocked_routes": list(disruption.all_blocked_routes),
+        "weather_alert": disruption.weather_alert,
+        "route_note": disruption.route_note,
         "line_speeds": disruption.line_speeds,
         "line_impacts": disruption.to_dict()["line_impacts"],
         "affected_supplier_id": disruption.supplier_id,
@@ -362,7 +509,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     }
 
 
-# ─── Node 2: Operations Hawk ─────────────────────────────────────────────────
+# ─── Node 2: Speed scenario ─────────────────────────────────────────────────
 
 def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
@@ -375,10 +522,10 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
         if expedite_id is None:
             log_agent_step(
                 run_id=run_id, step_order=3,
-                agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
+                agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
                 tool_called="factory_model.expedite_vendor_id",
                 tool_output_summary=f"{model.name} has no expedite vendor available",
-                message=(f"🔥 {model.name} has no expedite option (no vendor with role EXPEDITE), "
+                message=(f"Speed scenario: {model.name} has no expedite option (no vendor with role EXPEDITE), "
                          f"so I have no maximum-speed proposal to make."),
             )
             return {"ops_proposal": None, "llm_trace": _trace(state, "ops_hawk", "template")}
@@ -396,15 +543,15 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
             "feasible": prop["feasible"],
         }
         msg, mode = _llm_agent_reason(
-            "Operations Hawk", "Chief of Manufacturing Operations",
-            "Argue for the fastest, most reliable recovery (expedite option).", facts,
-            f"🔥 My position: {facts['plan']} + {prop['overtime_hours']}h overtime. "
+            "Speed scenario (expedite-first)", "Planning scenario: maximum speed",
+            "Explain this planning scenario's computed result: the fastest, most reliable recovery (expedite option).", facts,
+            f"Speed scenario: {facts['plan']} + {prop['overtime_hours']}h overtime. "
             f"Cost ₹{prop['total_cost_inr']:,}, modelled P(on-time) {prop['confidence_pct']}%."
             + ("" if prop["feasible"] else " Even this leaves units uncovered."),
         )
         log_agent_step(
             run_id=run_id, step_order=3,
-            agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
+            agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
             tool_called=f"solve_pulp_milp(force_vendor_id={expedite_id}) + simulate_monte_carlo()",
             tool_output_summary=(
                 f"Expedite {facts['expedite_vendor']}; OT lines {ot_lines} | {facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
@@ -423,27 +570,27 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
     if not cfo["feasible"]:
         reasons.append("leaves units uncovered")
     if ops is not None and ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT:
-        reasons.append(f"P(on-time) {cfo['confidence_pct']}% vs my {ops['confidence_pct']}%")
-    challenge = "CFO plan " + "; ".join(reasons) + "."
+        reasons.append(f"P(on-time) {cfo['confidence_pct']}% vs the speed plan's {ops['confidence_pct']}%")
+    challenge = "Cost scenario plan " + "; ".join(reasons) + "."
     msg, mode = _llm_agent_reason(
-        "Operations Hawk", "Chief of Manufacturing Operations",
-        "Challenge the CFO plan using only the computed risk evidence.",
+        "Speed scenario (expedite-first)", "Planning scenario: maximum speed",
+        "Explain this planning scenario's computed risk check of the cost scenario plan.",
         {"challenge": challenge, "cfo_plan": _fmt_units(model, cfo["units_by_vendor"])},
         f"⚡ REBUTTAL: {challenge} Re-plan without the weak link.",
     )
     log_agent_step(
         run_id=run_id, step_order=5,
-        agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
+        agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
         tool_called="audit_proposal_risk()", tool_output_summary=challenge, message=msg,
     )
     return {
         "rebuttal_pending": False,
-        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"Ops: {challenge}"],
+        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"Speed scenario: {challenge}"],
         "llm_trace": _trace(state, "ops_hawk_rebuttal", mode),
     }
 
 
-# ─── Node 3: CFO Watchdog ────────────────────────────────────────────────────
+# ─── Node 3: Cost scenario ────────────────────────────────────────────────────
 
 def _needs_rebuttal(model: FactoryModel, cfo: Dict[str, Any], ops: Optional[Dict[str, Any]]) -> bool:
     gap = ops is not None and ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT
@@ -472,14 +619,14 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
         }
         saving_txt = f" (₹{saving:,} less than Ops)" if saving is not None else ""
         msg, mode = _llm_agent_reason(
-            "CFO Watchdog", "VP of Finance",
-            "Argue for the lowest-cost plan that still protects the order.", facts,
-            f"💰 Cost-minimal plan: {facts['plan']} + {prop['overtime_hours']}h overtime = "
+            "Cost scenario (cheapest feasible)", "Planning scenario: lowest cost",
+            "Explain this planning scenario's computed result: the lowest-cost plan that still protects the order.", facts,
+            f"Cost scenario: {facts['plan']} + {prop['overtime_hours']}h overtime = "
             f"₹{prop['total_cost_inr']:,}{saving_txt}, P(on-time) {prop['confidence_pct']}%.",
         )
         log_agent_step(
             run_id=run_id, step_order=4,
-            agent_name="CFO Watchdog", agent_role="VP of Finance", badge_color="cyan",
+            agent_name="Cost scenario (cheapest feasible)", agent_role="Planning scenario: lowest cost", badge_color="cyan",
             tool_called="solve_pulp_milp(min cost) + simulate_monte_carlo()",
             tool_output_summary=(
                 f"Vendors: {'; '.join(regional) or 'none'} | {facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
@@ -503,19 +650,19 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
     concede = revised["expected_cost_inr"] < original["expected_cost_inr"]
     chosen = revised if concede else original
     verdict = (
-        f"Conceded: revised plan {_fmt_units(model, revised['units_by_vendor'])} has lower E[cost] "
+        f"Revised plan adopted: {_fmt_units(model, revised['units_by_vendor'])} has lower E[cost] "
         f"(₹{revised['expected_cost_inr']:,} vs ₹{original['expected_cost_inr']:,})."
         if concede else
-        f"Held position: excluding weak vendors raises E[cost] to ₹{revised['expected_cost_inr']:,} "
+        f"Original plan kept: excluding weak vendors raises E[cost] to ₹{revised['expected_cost_inr']:,} "
         f"vs ₹{original['expected_cost_inr']:,}; the reliability risk does not threaten the deadline."
     )
     msg, mode = _llm_agent_reason(
-        "CFO Watchdog", "VP of Finance", "Respond to the Ops rebuttal using the re-solved numbers.",
-        {"verdict": verdict}, f"🤝 {verdict}",
+        "Cost scenario (cheapest feasible)", "Planning scenario: lowest cost", "Explain this planning scenario's computed re-solve after the risk check.",
+        {"verdict": verdict}, f"Cost scenario re-solve: {verdict}",
     )
     log_agent_step(
         run_id=run_id, step_order=6,
-        agent_name="CFO Watchdog", agent_role="VP of Finance", badge_color="cyan",
+        agent_name="Cost scenario (cheapest feasible)", agent_role="Planning scenario: lowest cost", badge_color="cyan",
         tool_called=f"solve_pulp_milp(min_reliability={RELIABILITY_FLOOR_PCT:g}%)",
         tool_output_summary=verdict, message=msg,
     )
@@ -524,7 +671,7 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
         "cfo_reliability_floor_pct": RELIABILITY_FLOOR_PCT if concede else 0.0,
         "rebuttal_count": rounds,  # rounds completed (set to 1 when the rebuttal started)
         "rebuttal_pending": False,
-        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"CFO: {verdict}"],
+        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"Cost scenario: {verdict}"],
         "llm_trace": _trace(state, "cfo_watchdog_response", mode),
     }
 
@@ -562,7 +709,7 @@ def arbitrator_node(state: CascadeGraphState) -> Dict[str, Any]:
         f"Ranked by {solver_dict['ranking_rule']}: {ranking}. Winner {winner_id}."
     )
     msg, mode = _llm_agent_reason(
-        "Arbitrator", "Solver & Risk Ranking", "Explain why the winning plan has the lowest risk-adjusted cost.",
+        "Arbitrator (solver ranking)", "Solver & Risk Ranking", "Explain why the winning plan has the lowest risk-adjusted cost.",
         {"winner": winner_id, "cost_inr": w["total_mitigation_cost_inr"], "p_on_time_pct": w["confidence_pct"],
          "expected_cost_inr": w["expected_cost_inr"], "ranking": ranking},
         f"⚖️ {w['name']} wins: ₹{w['total_mitigation_cost_inr']:,} spend, P(on-time) {w['confidence_pct']}% "
@@ -571,7 +718,7 @@ def arbitrator_node(state: CascadeGraphState) -> Dict[str, Any]:
     )
     log_agent_step(
         run_id=run_id, step_order=7 if state.get("rebuttal_count", 0) > 0 else 5,
-        agent_name="Arbitrator", agent_role="Solver & Risk Ranking", badge_color="emerald",
+        agent_name="Arbitrator (solver ranking)", agent_role="Solver & Risk Ranking", badge_color="emerald",
         tool_called="generate_playbooks(MILP + 1000-run Monte Carlo)", tool_output_summary=summary, message=msg,
     )
     return {
@@ -603,8 +750,10 @@ def build_cascade_graph():
 cascade_graph = build_cascade_graph()
 
 
-def summarize_ai_mode(trace: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Collapse the per-node trace into what the UI should disclose."""
+def summarize_ai_mode(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collapse the per-node trace into what the UI should disclose. Only "gemini" entries are
+    LLM output: "template", "template-guarded" (Gemini quoted a number not in the facts, so the
+    template was used) and "regex-fallback" are not."""
     modes = {t["mode"] for t in trace}
     llm_modes = {"gemini"}
     if modes and modes <= llm_modes:
@@ -617,6 +766,9 @@ def summarize_ai_mode(trace: List[Dict[str, str]]) -> Dict[str, Any]:
         "overall": overall,
         "model": settings.GEMINI_MODEL if overall != "fallback" else None,
         "trace": trace,
+        "total_latency_ms": round(sum(t.get("latency_ms", 0.0) for t in trace), 1),
+        "input_tokens": sum(t.get("input_tokens", 0) for t in trace),
+        "output_tokens": sum(t.get("output_tokens", 0) for t in trace),
         "note": (
             "All numbers come from the MILP solver and Monte Carlo simulation. "
             + ("Narration and extraction used Gemini." if overall == "llm" else

@@ -1,0 +1,36 @@
+{"text": "Yes, can supply 150 units at ₹620 per unit, delivery in 6 hours", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 620, "eta_hours": 6}}
+{"text": "Haan ji, 150 pcs @ 600, 8 hrs", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 600, "eta_hours": 8}}
+{"text": "Sorry, not available", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Nahi, stock khatam", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Can do 100 units, rate 640, tomorrow", "rfq_units": 150, "expected": {"accepted": true, "units": 100, "unit_price_inr": 640, "eta_hours": 24}}
+{"text": "ok confirmed", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": null, "eta_hours": null}}
+{"text": "We can send 80 casings by 2 days at Rs 590", "rfq_units": 150, "expected": {"accepted": true, "units": 80, "unit_price_inr": 590, "eta_hours": 48}}
+{"text": "Out of stock currently. Maybe next week", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Yes 150 units available, price 610/unit, will reach in 5 hours", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 610, "eta_hours": 5}}
+{"text": "kal tak bhej denge 150 pcs, rate 605", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 605, "eta_hours": 24}}
+{"text": "Sir 2000 units chahiye? we have only 120 units, ₹650, 10 hours", "rfq_units": 150, "expected": {"accepted": true, "units": 120, "unit_price_inr": 650, "eta_hours": 10}}
+{"text": "Rs 1,20,000 flat for the charter, 4 hours", "rfq_units": 300, "expected": {"accepted": true, "units": 300, "unit_price_inr": 120000, "eta_hours": 4}}
+{"text": "Not possible this week, mushkil hai", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Yes", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": null, "eta_hours": null}}
+{"text": "I can give 150 units in 12 hrs, price ₹630 each. Please confirm PO", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 630, "eta_hours": 12}}
+{"text": "No stock. Sorry", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "ji 100 units mil jayenge, 700 rupees per piece, 3 ghante", "rfq_units": 150, "expected": {"accepted": true, "units": 100, "unit_price_inr": 700, "eta_hours": 3}}
+{"text": "Can do 150 @ 610. ETA 1 day", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 610, "eta_hours": 24}}
+{"text": "Unable to supply, plant shutdown", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "okk 150 units 4 hrs ₹615", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 615, "eta_hours": 4}}
+{"text": "Can't do 150 but can do 60 units at ₹650 in 6 hours", "rfq_units": 150, "expected": {"accepted": true, "units": 60, "unit_price_inr": 650, "eta_hours": 6}}
+{"text": "Sorry sir, no", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Confirmed. 150 units. Rs.600. Delivery 90 minutes", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 600, "eta_hours": 1.5}}
+{"text": "will let you know later", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "150 units ready, ₹600, 6 hrs", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": 600, "eta_hours": 6}}
+{"text": "sorry, only 100 units available", "rfq_units": 150, "expected": {"accepted": true, "units": 100, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Sorry, can not do", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "possible nahi hai", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Haan ho jayega", "rfq_units": 150, "expected": {"accepted": true, "units": 150, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Cannot supply this week", "rfq_units": 150, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "won't be able to do 300 units", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "will not manage 300 units", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "We won't make it, 300 units", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "Yes but unable for 300 units", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "can do 300 units but not in 34 hrs", "rfq_units": 300, "expected": {"accepted": false, "units": null, "unit_price_inr": null, "eta_hours": null}}
+{"text": "won't manage 300, only 120 units", "rfq_units": 300, "expected": {"accepted": true, "units": 120, "unit_price_inr": null, "eta_hours": null}}

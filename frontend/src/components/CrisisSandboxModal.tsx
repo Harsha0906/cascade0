@@ -207,7 +207,7 @@ export function CrisisSandboxModal() {
               <div className="p-3 rounded-xl bg-forest/5 border border-forest/15 text-[11px] text-charcoal-700 leading-relaxed flex items-start gap-2">
                 <Sparkles className="w-4 h-4 text-forest shrink-0 mt-0.5" />
                 <span>
-                  The <strong>Blast-Radius Detective</strong> uses AI or rule-based extraction to parse your text, extract numbers/suppliers, and pass them directly to the PuLP solver.
+                  The <strong>Disruption Detective</strong> uses AI or rule-based extraction to parse your text, extract numbers/suppliers, and pass them directly to the PuLP solver.
                 </span>
               </div>
               <button
