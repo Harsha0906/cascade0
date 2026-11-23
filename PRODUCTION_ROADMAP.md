@@ -8,7 +8,7 @@
 
 ### Current Reality: StateGraph Multi-Agent Architecture
 - **Agents:**
-  1. `Blast-Radius Detective`: Unstructured NLP entity extraction + causal SQL blast-radius mapping.
+  1. `Disruption Detective (agent)`: Unstructured NLP entity extraction + causal SQL blast-radius mapping.
   2. `Speed scenario` (planning scenario, not an agent): expedite-first MILP scored by Monte Carlo.
   3. `Cost scenario` (planning scenario, not an agent): cheapest feasible MILP scored by Monte Carlo.
   4. `Arbitrator` (solver ranking, not an agent): PuLP mixed-integer program + Monte Carlo; plans ranked by risk-adjusted expected cost (the LLM never computes numbers).

@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS suppliers (
 
 -- ============================================================================
 -- TABLE 2: vendor_history (Episodic Memory for Agents)
--- Historical reliability & quality records used by CFO Watchdog agent
+-- Historical reliability & quality records (the prior for learned vendor reliability)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS vendor_history (
     id                      SERIAL PRIMARY KEY,

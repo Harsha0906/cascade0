@@ -191,6 +191,7 @@ Unknown or ambiguous references, a missing shortfall, a line without a speed, a 
   Neither `scenario_id` nor `raw_message` is a 422. `extracted_parameters` in the response has `delay_hours`, `line_impacts` (`line_id`, `name`, `speed_pct`, `temp_celsius`),
   `affected_supplier_id`, `shortfall_units`, `affected_order_id`, `order_selection`, `other_order_shortfalls`, `source` and `overridden_by_preset_or_slider`.
 - `GET /api/v1/scenarios` lists the preset scenarios from the `scenarios` table (migration `005_generic_disruptions.sql`).
+- `GET /api/v1/runs/{run_id}` returns a stored run in the same shape as `simulate-crisis`, plus `root_run_id` and `executed` (404 for an unknown run). On load the dashboard restores `GET /api/v1/runs/latest` this way, with its Sourcing session and Client record, so both panels keep working after a page reload.
 - The WhatsApp status reply lists every non-normal line and every at-risk order. Vendor enquiries to flat-fee vendors ask for "a dedicated delivery ... for a flat fee".
 - MILP variables are named by index, so ids such as `L-B` and `L_B` cannot collide.
 
@@ -251,14 +252,14 @@ reliability = alpha / (alpha + beta)
 
 - **Prior:** the vendor's `vendor_history` (`past_orders_count`, `on_time_deliveries`) counts as past deliveries, so 48 on-time of 50 gives 49 / 52 = 94.2 %.
 - **Evidence:** each `DELIVERED` outcome adds one observation. A delivery is on time when it arrives no later than the promised time plus a **2 h grace**.
-- **PENDING outcomes:** executing a plan writes one `PENDING` outcome per vendor allocation (promised at execution time + the vendor's lead time), in the same transaction as the PO. Pending rows do not count until a delivery is recorded.
-- `POST /api/v1/deliveries` `{po_number, supplier_id, delivered_at}` records a delivery (API key; 404 unknown PO line, 409 already recorded, 422 when `delivered_at` is more than 30 days before the promised time). `GET /api/v1/deliveries?status=PENDING|DELIVERED` lists outcomes.
+- **PENDING outcomes:** executing a plan writes one `PENDING` outcome per vendor allocation, in the same transaction as the PO. The promise is what the vendor itself promised: execution time + the ETA it confirmed to the Sourcing Agent, or, when it stated none, its own lead time from the live factory model (never the run's route-shifted planning lead). Pending rows do not count until a delivery is recorded.
+- `POST /api/v1/deliveries` `{po_number, supplier_id, delivered_at}` records a delivery (API key; 404 unknown PO line, 409 already recorded, 422 when `delivered_at` is more than 30 days before the promised time or more than 1 h in the future). `GET /api/v1/deliveries?status=PENDING|DELIVERED` lists outcomes.
 
 ## 🛣️ Route and Weather Risk
 
 The disruption changes the model the planners use (`risk_adjusted_model` in `backend/app/disruption.py`).
 
-- **Blocked routes:** a route is blocked only when the alert gives a block cue for it ("blocked", "closed", "flooded", "diverted"...); a clear or negated cue ("NH48 is clear", "not blocked") does not block. Vendors on a blocked route get the alert's delay added to their lead time and minimum lead time. A route that matches none or several known routes is ignored with a note, never guessed onto a vendor. With no named route, a delayed supplier's own route is blocked.
+- **Blocked routes:** a route is blocked only when the alert gives a block cue for it ("blocked", "closed", "flooded", "diverted"...); a clear or negated cue ("NH48 is clear", "not blocked") does not block. Vendors on a blocked route get the alert's delay added to their lead time and minimum lead time. When such a vendor then confirms an ETA to the Sourcing Agent, its promise wins: lead time = the ETA and minimum lead time = min(minimum lead time, ETA). A route that matches none or several known routes is ignored with a note, never guessed onto a vendor. With no named route, a delayed supplier's own route is blocked.
 - **Weather alert:** a weather cue (flood, cyclone, heavy rain, storm, landslide, waterlogging) that is neither negated ("no flooding") nor figurative ("flood of orders") doubles every vendor's delay-shock probability, capped at **90 %**.
 - With neither effect the model is unchanged. `extracted_parameters` reports `blocked_routes`, `weather_alert` and `route_note`.
 
@@ -272,7 +273,8 @@ States: `DRAFTED` → `SENT` → `ANSWERING` (resumable) → `ACCEPTED` | `REFUS
 2. **Human sign-off:** nothing reaches the client until `POST /api/v1/client/approve {run_id, approved_by}` names a person.
 3. **Send:** uses the `SOURCING_MODE` channel. Simulated mode records the message; `whatsapp` sends it to the order's `client_whatsapp_number` and returns **409** when the order has no client contact, so for now a real WhatsApp send needs a contact on the order.
 4. **Answer:** `POST /api/v1/client/answer {run_id, accepted, text?, new_deadline_hours?, entered_by}` is typed in by an operator (answers are not read from WhatsApp yet). **Accepted:** the order's `due_at` is extended, the run is re-planned on the longer deadline and sourcing restarts on the new target. **Refused:** the expedite vendor is allowed again and sourcing restarts on the best feasible plan that uses it. Recording the same answer again resumes an interrupted one; a different answer is a 409.
-5. `GET /api/v1/client/{run_id}` returns the draft, sent message, answer and re-plan. One negotiation per root run.
+5. `GET /api/v1/client/{run_id}` returns the draft, sent message, answer and re-plan (`request_number`, earlier requests in `history`). One open request per root run: a sourcing failure never drafts a second request while one is drafted, sent or being answered.
+6. **After an accepted extension** the deadline already is the extended one, so re-plans no longer offer the renegotiation plan (Plan C). If sourcing then fails again, the Client Agent drafts a follow-up request from the extended deadline (it needs the same human approval). After a refusal nothing more is drafted; the failure is logged for the operator.
 
 Known limit: a fresh analysis does not yet read the client's answer; the extension acts through the extended `due_at` on the order.
 
@@ -284,7 +286,7 @@ python -m app.evals                 # offline: regex fallback only, no network
 python -m app.evals --live          # also scores Gemini (calls the live API; needs GEMINI_API_KEY)
 ```
 
-`backend/evals/disruptions.jsonl` holds 62 labelled English/Hinglish/noisy alerts (scored after resolution against the demo factory) and `backend/evals/vendor_replies.jsonl` 30 vendor replies. Current offline regex numbers:
+`backend/evals/disruptions.jsonl` holds 62 labelled English/Hinglish/noisy alerts (scored after resolution against the demo factory) and `backend/evals/vendor_replies.jsonl` 36 vendor replies. Current offline regex numbers:
 
 | Disruption field | Precision | Recall |
 |---|---|---|
@@ -295,9 +297,9 @@ python -m app.evals --live          # also scores Gemini (calls the live API; ne
 | shortfall_units | 0.94 | 0.83 |
 | error category | 0.73 | 0.91 |
 
-53 of 62 rows are fully correct. Vendor replies (25 of 30 fully correct), precision / recall: accepted 0.97 / 0.97, units 0.94 / 0.90, unit_price_inr 1.00 / 0.80, eta_hours 1.00 / 0.87. A decline is never read as an acceptance. A recall drop is caught by a regression test. The regex path prefers missing a value to guessing one. Gemini numbers appear only when run with `--live`.
+53 of 62 rows are fully correct. Vendor replies (32 of 36 fully correct), precision / recall: accepted 0.97 / 0.97, units 1.00 / 0.95, unit_price_inr 1.00 / 0.80, eta_hours 1.00 / 0.87. A reply with a decline cue ("won't", "will not", "unable", "not able", "can't manage", "not in 34 hrs", "sorry", "nahi"...) is never read as an acceptance, even with an accept word in it; only an explicit smaller quantity ("only 100 units", "80 units only", "can't do 150 but can do 60") makes it a partial offer. On the Gemini path the same cues veto an acceptance, and a quantity, price or ETA that the reply does not state is dropped (a quantity goes to operator review). A recall drop is caught by a regression test. The regex path prefers missing a value to guessing one. Gemini numbers appear only when run with `--live`.
 
-**Narration guard:** the LLM only narrates computed results. If Gemini writes a number that is not in the computed facts, the message is replaced by the template and labelled `template-guarded` (otherwise `gemini` or `template`). The analysis trace records per-node latency and input/output tokens, with totals.
+**Narration guard:** the LLM only narrates computed results. If Gemini writes a number that is not in the computed facts, or any spelled-out number ("two lakh", "twenty percent", "half"), the message is replaced by the template. Digits inside ids (`EV-402`, `SUP-HSR-03`) and ISO timestamps are not facts, so they cannot ground an invented number and labelled `template-guarded` (otherwise `gemini` or `template`). The analysis trace records per-node latency and input/output tokens, with totals.
 
 ## ✅ What Is Real vs Simulated
 
@@ -342,7 +344,7 @@ The planner's vendor numbers are assumptions; the Sourcing Agent replaces them w
 1. After an analysis, click **Confirm with suppliers first** (dashboard) or `POST /api/v1/sourcing/start {run_id}`.
 2. The agent sends an enquiry to each vendor in the chosen plan — explicitly *not* a purchase order.
 3. Replies arrive over WhatsApp (`SOURCING_MODE=whatsapp`, vendor numbers in `suppliers.whatsapp_number`) or are typed on the dashboard (simulated mode, or a reply received by phone).
-4. Each reply becomes a structured offer. Declines and timeouts remove that vendor; partial or re-priced offers update capacity, price and lead time for this run only.
+4. Each reply becomes a structured offer. Declines and timeouts remove that vendor; partial or re-priced offers update capacity, price and lead time for this run only (a confirmed ETA also caps the vendor's minimum lead time, see Route and Weather Risk).
 5. When no enquiry is outstanding it re-solves. If the best plan needs an unconfirmed vendor, it asks that vendor (next round); otherwise it hands a **confirmed plan** back for human approval (`<run_id>-S<round>`).
 
 Only one PO can ever be created per analysis — the original run and its sourced re-plan share an idempotency key.
