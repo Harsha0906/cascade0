@@ -59,6 +59,14 @@ class DisruptionExtraction(BaseModel):
         default=None,
         description="Stated unit shortfall; null if not stated"
     )
+    affected_route: Optional[str] = Field(
+        default=None,
+        description="Road/route named as blocked or delayed, as written (e.g. 'NH48', 'Hosur corridor'); null if not named"
+    )
+    weather_alert: bool = Field(
+        default=False,
+        description="True if the alert reports flood, cyclone, heavy rain, storm, landslide or waterlogging"
+    )
     delay_mentioned: bool = Field(
         default=False,
         description="True if the alert says a shipment is delayed/late/blocked, even without a duration"

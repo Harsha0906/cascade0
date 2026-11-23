@@ -111,6 +111,54 @@ _WINDOW_CHARS = 80
 _SUPPLIER_CUE_CHARS = 60
 
 
+_WEATHER_RE = re.compile(
+    r"\b(?:flood(?:s|ed|ing)?|cyclone|heavy\s+rain(?:s|fall)?|storm|landslides?|waterlogg(?:ed|ing))\b", re.I)
+_ROUTE_NOUNS = r"corridor|highway|road|route|area|industrial|bypass|expressway|flyover|belt|zone|junction"
+_UNKNOWN_NOUNS = "corridor|highway|road|route|bypass|expressway|flyover"
+_ROUTE_STOP = {"area", "industrial", "corridor", "highway", "cargo", "road", "route", "air"}
+# A road named in the alert that is not a known route ("Mysore Road", "NH44"): kept as written so the
+# resolver can say it matched nothing. Generic openers ("The highway", "National Highway") are not names.
+_UNKNOWN_ROUTE_RE = re.compile(
+    rf"\b([A-Z][A-Za-z-]+(?:\s+[A-Z][A-Za-z-]+)?\s+(?i:{_UNKNOWN_NOUNS}))\b"
+    r"|(?-i:\b((?:NH|SH|MDR|ORR)[\s-]?\d{1,3})\b)")
+_GENERIC_ROUTE_WORDS = {"the", "a", "an", "this", "that", "our", "main", "key", "national", "state", "local"}
+
+
+def _supplier_spans(text: str, model: FactoryModel) -> list:
+    """Every span of the text that names a supplier (id or leading words of the name)."""
+    spans = []
+    for sid, name in list(model.primary_suppliers) + [(v.supplier_id, v.name) for v in model.vendors]:
+        pats = [_mention_pattern(sid)]
+        words = name.split(" (")[0].split()
+        pats += [_name_pattern(" ".join(words[:n])) for n in range(len(words), 1, -1)]
+        spans += [(m.start(), m.end()) for pat in pats for m in re.finditer(pat, text, re.I)]
+    return spans
+
+
+def _extract_route(text: str, model: FactoryModel) -> Optional[str]:
+    """A route named in the alert, as written: a known route's identifying word (NH48, Hosur
+    corridor) first, else a road-shaped name that matches no route (resolution then notes it).
+    A word that is part of a supplier's name ("Hosur Precision Castings") is not a route."""
+    spans = _supplier_spans(text, model)
+    routes = {v.route for v in model.vendors} | {r for _, r in model.primary_routes}
+    found = []
+    for route in routes:
+        for tok in re.findall(r"[A-Za-z0-9]+", route.split(" (")[0]):
+            if len(tok) < 3 or tok.lower() in _ROUTE_STOP:
+                continue
+            tail = "" if any(c.isdigit() for c in tok) else rf"(?=\s+(?:{_ROUTE_NOUNS})\b)"
+            for m in re.finditer(rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9]){tail}", text, re.I):
+                if not any(a <= m.start() and m.end() <= b for a, b in spans):
+                    found.append((m.start(), m.group(0)))
+    if found:
+        return min(found)[1]
+    for m in _UNKNOWN_ROUTE_RE.finditer(text):
+        name = m.group(1) or m.group(2)
+        if name.split()[0].lower() not in _GENERIC_ROUTE_WORDS:
+            return name
+    return None
+
+
 def _to_int(s: str) -> int:
     return int(s.replace(",", ""))
 
@@ -262,6 +310,8 @@ def _regex_extract(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         affected_supplier=supplier,
         affected_order=order,
         shortfall_units=shortfall,
+        affected_route=_extract_route(text, model),
+        weather_alert=bool(_WEATHER_RE.search(text)),
         delay_mentioned=delay_mentioned,
         raw_summary=raw_text[:200],
     )
@@ -282,8 +332,15 @@ def _gemini_prompt(raw_text: str, model: FactoryModel, order_ids: Sequence[str])
         f"Refer to every line, supplier and order using exactly one of the ids listed above. "
         f"Leave a field null (or the list empty) when the alert does not state it; "
         f"never invent numbers. Report each affected line with its speed_pct and temp_celsius "
-        f"only if stated, delay_hours, and shortfall_units of {model.stock_item_name}."
+        f"only if stated, delay_hours, and shortfall_units of {model.stock_item_name}. "
+        f"Set affected_route to the road or route named as blocked or delayed, as written "
+        f"(e.g. 'NH48', 'Hosur corridor'), and weather_alert to true only if the alert reports "
+        f"a flood, cyclone, heavy rain, storm, landslide or waterlogging."
     )
+
+
+def _norm_text(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
 def _ground_numbers(extraction: DisruptionExtraction, raw_text: str) -> DisruptionExtraction:
@@ -300,7 +357,14 @@ def _ground_numbers(extraction: DisruptionExtraction, raw_text: str) -> Disrupti
         logger.warning("Gemini returned %r, which the alert does not state; ignored", value)
         return None
 
+    route = extraction.affected_route
+    if route and _norm_text(route) not in _norm_text(raw_text):
+        logger.warning("Gemini returned route %r, which the alert does not state; ignored", route)
+        route = None
     return extraction.model_copy(update={
+        "affected_route": route,
+        # the weather flag is deterministic: the LLM cannot raise it without a cue in the text
+        "weather_alert": bool(_WEATHER_RE.search(raw_text or "")),
         "delay_hours": grounded(extraction.delay_hours, days_ok=True),
         "shortfall_units": grounded(extraction.shortfall_units),
         "affected_lines": [

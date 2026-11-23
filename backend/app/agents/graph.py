@@ -41,7 +41,9 @@ from app.agents.tools import (
 from app.db import (
     get_all_orders, get_inbound_shipments, get_order, get_order_lines, get_stock_levels, log_agent_step,
 )
-from app.disruption import DisruptionOverrides, DisruptionResolutionError, resolve_disruption
+from app.disruption import (
+    DisruptionOverrides, DisruptionResolutionError, resolve_disruption, risk_adjusted_model,
+)
 from app.factory_model import FactoryDataError, FactoryModel, load_factory_model
 from app.inventory import FINISHED_STATUSES, compute_shortfall, deadline_hours, order_rank
 from app.solver import (
@@ -160,6 +162,9 @@ class CascadeGraphState(TypedDict, total=False):
     alert_stated_shortfall: Optional[int]
     order_selection: str
     other_order_shortfalls: List[Dict[str, Any]]
+    blocked_route: Optional[str]
+    weather_alert: bool
+    route_note: Optional[str]
     now: datetime
     order_id: str
     crisis_headline: str
@@ -300,6 +305,18 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
                          f"order that is short (checked from inventory"
                          + (f"; also {others}" if others else "") + ")")
 
+    # Every later node (Ops, CFO, arbitrator, Monte Carlo) plans on the risk-adjusted model: vendors
+    # on the blocked route are slower, and a weather alert raises every vendor's shock probability.
+    planning_model = risk_adjusted_model(model, disruption)
+    risk_bits = []
+    if disruption.blocked_route and disruption.delay_hours > 0:
+        slowed = [v.name.split(" (")[0] for v in model.vendors if v.route == disruption.blocked_route]
+        risk_bits.append(f"route '{disruption.blocked_route}' blocked +{disruption.delay_hours}h"
+                         + (f": {', '.join(slowed)} slower" if slowed else " (no vendor on it)"))
+    if disruption.weather_alert:
+        risk_bits.append("weather alert: delay-shock probability doubled (cap 90%)")
+    if disruption.route_note:
+        risk_bits.append(disruption.route_note)
     log_agent_step(
         run_id=run_id, step_order=1,
         agent_name="Blast-Radius Detective", agent_role="Disruption Entity Extractor", badge_color="amber",
@@ -308,6 +325,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
             f"{supplier_txt} | {lines_txt} | Shortfall {disruption.shortfall_units} units on #{disruption.order_id}"
             f" ({shortfall_txt})"
             + selection_txt
+            + (f" | risk: {'; '.join(risk_bits)}" if risk_bits else "")
             + (" | parameters set by scenario/slider override" if overridden else "")
         ),
         message=(
@@ -340,7 +358,10 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     trace.append({"node": "detective", "mode": mode})
     return {
         "factory_id": model.factory_id,
-        "factory_model": model,
+        "factory_model": planning_model,
+        "blocked_route": disruption.blocked_route,
+        "weather_alert": disruption.weather_alert,
+        "route_note": disruption.route_note,
         "line_speeds": disruption.line_speeds,
         "line_impacts": disruption.to_dict()["line_impacts"],
         "affected_supplier_id": disruption.supplier_id,

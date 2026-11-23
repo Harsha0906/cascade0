@@ -63,6 +63,9 @@ class FactoryModel:
     lines: tuple[ProductionLine, ...]
     # (supplier_id, name) of PRIMARY suppliers: the disrupted inbound source, not in `vendors`.
     primary_suppliers: tuple[tuple[str, str], ...] = ()
+    # (supplier_id, route) of PRIMARY suppliers, so a delayed primary's route can block vendors
+    # that share it. Payloads saved before Round A lack it (from_dict tolerates that).
+    primary_routes: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe representation (tuples become lists)."""
@@ -82,6 +85,7 @@ class FactoryModel:
         d["vendors"] = tuple(vendor(v) for v in d["vendors"])
         d["lines"] = tuple(ProductionLine(**l) for l in d["lines"])
         d["primary_suppliers"] = tuple(tuple(x) for x in d.get("primary_suppliers", ()))
+        d["primary_routes"] = tuple(tuple(x) for x in d.get("primary_routes", ()))
         return cls(**d)
 
     def vendor(self, supplier_id: str) -> Vendor:
@@ -116,7 +120,8 @@ class FactoryModel:
     def with_vendor_overrides(
         self, overrides: Optional[Mapping[str, Mapping[str, Any]]]
     ) -> "FactoryModel":
-        """Apply per-run vendor overrides (keys: max_units, unit_cost, flat_cost, lead_hours).
+        """Apply per-run vendor overrides (keys: max_units, unit_cost, flat_cost, lead_hours,
+        min_lead_hours, delay_shock_pct).
         max_units <= 0 drops the vendor. Unknown supplier ids raise FactoryDataError."""
         if not overrides:
             return self
@@ -139,6 +144,8 @@ class FactoryModel:
                 unit_cost=int(o.get("unit_cost", v.unit_cost)),
                 flat_cost=int(o.get("flat_cost", v.flat_cost)),
                 lead_hours=float(o.get("lead_hours", v.lead_hours)),
+                min_lead_hours=float(o.get("min_lead_hours", v.min_lead_hours)),
+                delay_shock_pct=float(o.get("delay_shock_pct", v.delay_shock_pct)),
             ))
         return replace(self, vendors=tuple(out))
 
@@ -318,6 +325,7 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
 
     vendors: list[Vendor] = []
     primaries: list[tuple[str, str]] = []
+    primary_routes: list[tuple[str, str]] = []
     for row in get_all_suppliers():
         if row.get("factory_id") is None:
             p.missing("suppliers", "factory_id")
@@ -334,6 +342,8 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
             continue
         if role == "PRIMARY":
             primaries.append((row["id"], row.get("name") or row["id"]))
+            if row.get("route"):
+                primary_routes.append((row["id"], row["route"]))
             continue
         v = _load_vendor(row, history.get(row.get("id")), p, delivered_by_supplier.get(row.get("id"), ()))
         if v is not None:
@@ -361,4 +371,5 @@ def load_factory_model(factory_id: Optional[str] = None) -> FactoryModel:
         vendors=tuple(sorted(vendors, key=lambda v: v.supplier_id)),
         lines=tuple(sorted(lines, key=lambda l: l.line_id)),
         primary_suppliers=tuple(sorted(primaries)),
+        primary_routes=tuple(sorted(primary_routes)),
     )

@@ -123,6 +123,11 @@ class ResolvedDisruption:
     order_selection: str = "stated"
     # With order_selection "inventory": the other candidate orders' computed shortfalls.
     other_order_shortfalls: tuple = ()
+    # Route whose vendors' lead times shift by `delay_hours` (see resolve_route), the alert's
+    # weather flag, and why a named route was ignored (None when nothing was wrong).
+    blocked_route: Optional[str] = None
+    weather_alert: bool = False
+    route_note: Optional[str] = None
 
     @property
     def line_speeds(self) -> dict:
@@ -146,7 +151,65 @@ class ResolvedDisruption:
             "alert_stated_shortfall": self.alert_stated_shortfall,
             "order_selection": self.order_selection,
             "other_order_shortfalls": [dict(x) for x in self.other_order_shortfalls],
+            "blocked_route": self.blocked_route,
+            "weather_alert": self.weather_alert,
+            "route_note": self.route_note,
         }
+
+
+def _all_routes(model: FactoryModel) -> dict:
+    """route -> ids of the suppliers (vendors and primaries) on it."""
+    routes: dict = {}
+    for v in model.vendors:
+        routes.setdefault(v.route, set()).add(v.supplier_id)
+    for sid, route in model.primary_routes:
+        routes.setdefault(route, set()).add(sid)
+    return routes
+
+
+def resolve_route(named: Optional[str], supplier_id: Optional[str],
+                  model: FactoryModel) -> tuple:
+    """(blocked_route, route_note). The delay number of the alert is the blocked route's delay.
+
+    A route named in the alert that matches exactly one known route (vendor or primary supplier)
+    is the blocked route. One that matches none, or several, is ignored with a note: it is never
+    guessed onto a vendor. With no usable named route, a delayed supplier's own route is blocked
+    (a vendor sharing the delayed primary's road is held up with it). When an alert names both a
+    delayed supplier and a different route with one number, that number applies to both."""
+    routes = _all_routes(model)
+    note = None
+    if named:
+        t = _norm(named)
+        hits = [r for r in routes if t and (t in _norm(r) or _norm(r.split(" (")[0]) in t)]
+        if len(hits) == 1:
+            return hits[0], None
+        if hits:
+            note = (f"route '{named}' matches several routes ({', '.join(sorted(hits))}); "
+                    f"ignored, not a planning input")
+        else:
+            note = f"route '{named}' matches no vendor or supplier route; ignored, not a planning input"
+    if supplier_id:
+        for r, ids in routes.items():
+            if supplier_id in ids:
+                return r, note
+    return None, note
+
+
+def risk_adjusted_model(model: FactoryModel, disruption: "ResolvedDisruption") -> FactoryModel:
+    """The model the planners should use: vendors on the blocked route are `delay_hours` slower
+    (lead and minimum lead), and a weather alert doubles every vendor's delay-shock probability
+    (capped at 90%). With neither effect the model is returned unchanged."""
+    overrides: dict = {}
+    for v in model.vendors:
+        o: dict = {}
+        if disruption.blocked_route and disruption.delay_hours > 0 and v.route == disruption.blocked_route:
+            o["lead_hours"] = v.lead_hours + disruption.delay_hours
+            o["min_lead_hours"] = v.min_lead_hours + disruption.delay_hours
+        if disruption.weather_alert:
+            o["delay_shock_pct"] = min(90.0, 2 * v.delay_shock_pct)
+        if o:
+            overrides[v.supplier_id] = o
+    return model.with_vendor_overrides(overrides)
 
 
 def _check_speed(line_id: str, speed: Any) -> int:
@@ -272,5 +335,7 @@ def resolve_disruption(
         parts.append(f"{shortfall} short on #{order_id}")
         headline = "; ".join(parts)
 
+    blocked_route, route_note = resolve_route(extraction.affected_route, supplier_id, model)
     return ResolvedDisruption(delay, tuple(impacts), supplier_id, order_id, shortfall, headline,
-                              source, breakdown, alert_stated, selection, others)
+                              source, breakdown, alert_stated, selection, others,
+                              blocked_route, bool(extraction.weather_alert), route_note)
