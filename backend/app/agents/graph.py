@@ -500,7 +500,7 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
                 agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
                 tool_called="factory_model.expedite_vendor_id",
                 tool_output_summary=f"{model.name} has no expedite vendor available",
-                message=(f"🔥 {model.name} has no expedite option (no vendor with role EXPEDITE), "
+                message=(f"Speed scenario: {model.name} has no expedite option (no vendor with role EXPEDITE), "
                          f"so I have no maximum-speed proposal to make."),
             )
             return {"ops_proposal": None, "llm_trace": _trace(state, "ops_hawk", "template")}
@@ -520,7 +520,7 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
         msg, mode = _llm_agent_reason(
             "Speed scenario (expedite-first)", "Planning scenario: maximum speed",
             "Explain this planning scenario's computed result: the fastest, most reliable recovery (expedite option).", facts,
-            f"🔥 My position: {facts['plan']} + {prop['overtime_hours']}h overtime. "
+            f"Speed scenario: {facts['plan']} + {prop['overtime_hours']}h overtime. "
             f"Cost ₹{prop['total_cost_inr']:,}, modelled P(on-time) {prop['confidence_pct']}%."
             + ("" if prop["feasible"] else " Even this leaves units uncovered."),
         )
@@ -596,7 +596,7 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
         msg, mode = _llm_agent_reason(
             "Cost scenario (cheapest feasible)", "Planning scenario: lowest cost",
             "Explain this planning scenario's computed result: the lowest-cost plan that still protects the order.", facts,
-            f"💰 Cost-minimal plan: {facts['plan']} + {prop['overtime_hours']}h overtime = "
+            f"Cost scenario: {facts['plan']} + {prop['overtime_hours']}h overtime = "
             f"₹{prop['total_cost_inr']:,}{saving_txt}, P(on-time) {prop['confidence_pct']}%.",
         )
         log_agent_step(
@@ -625,15 +625,15 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
     concede = revised["expected_cost_inr"] < original["expected_cost_inr"]
     chosen = revised if concede else original
     verdict = (
-        f"Conceded: revised plan {_fmt_units(model, revised['units_by_vendor'])} has lower E[cost] "
+        f"Revised plan adopted: {_fmt_units(model, revised['units_by_vendor'])} has lower E[cost] "
         f"(₹{revised['expected_cost_inr']:,} vs ₹{original['expected_cost_inr']:,})."
         if concede else
-        f"Held position: excluding weak vendors raises E[cost] to ₹{revised['expected_cost_inr']:,} "
+        f"Original plan kept: excluding weak vendors raises E[cost] to ₹{revised['expected_cost_inr']:,} "
         f"vs ₹{original['expected_cost_inr']:,}; the reliability risk does not threaten the deadline."
     )
     msg, mode = _llm_agent_reason(
         "Cost scenario (cheapest feasible)", "Planning scenario: lowest cost", "Explain this planning scenario's computed re-solve after the risk check.",
-        {"verdict": verdict}, f"🤝 {verdict}",
+        {"verdict": verdict}, f"Cost scenario re-solve: {verdict}",
     )
     log_agent_step(
         run_id=run_id, step_order=6,
