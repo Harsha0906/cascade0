@@ -1,8 +1,21 @@
 -- ============================================================================
 -- CascadeZero — Phase 1: data-driven factory model
--- Apply after 002_sourcing_agent.sql. Safe to re-run: no step fails on a second run;
+-- Apply after 002_sourcing_agent.sql. Safe to re-run below level 8 (refuses to run once 008 is applied): no step fails on a second run;
 -- re-running restores the demo factory's seed values (factory row, supplier and line columns).
 -- ============================================================================
+
+-- Level-8 guard: once 008 (member-only RLS) is applied, re-running this file would reopen
+-- anon / USING (true) read policies, so it refuses to run at level 8 or above.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'schema_migrations') THEN
+        IF EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 8) THEN
+            RAISE EXCEPTION 'database is at level 8+; re-running 003 would reopen anon/USING(true) policies — not allowed';
+        END IF;
+    END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS factories (
     id                          TEXT PRIMARY KEY,

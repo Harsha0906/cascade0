@@ -159,7 +159,6 @@ class Migration008RlsTests(unittest.TestCase):
         self.assertRegex(fn, r"v_factory\s+TEXT := COALESCE\(p_po->>'factory_id', p_receipt->>'factory_id'\);")
         self.assertRegex(fn, r"shift_broadcast_msg, client_sla_notice, status, approved_by, run_id, factory_id\s*\)")
         self.assertRegex(fn, r"tool_called, tool_output_summary, message, created_at, factory_id\s*\)")
-        self.assertRegex(fn, r"COALESCE\(log_rec\.factory_id, v_factory\)")
         # The order, supplier and line updates only touch the executing factory's rows.
         self.assertRegex(fn, r"WHERE order_id = p_order_id AND factory_id = v_factory;")
         self.assertRegex(fn, r"WHERE id = upd->>'supplier_id' AND factory_id = v_factory;")
@@ -174,6 +173,83 @@ class Migration008RlsTests(unittest.TestCase):
                          "INSERT INTO schema_migrations (version) VALUES (8) ON CONFLICT DO NOTHING;")
         self.assertLess(self.sql.index("CREATE POLICY suppliers_member_read"), self.sql.index("APPEND their parts HERE"))
         self.assertEqual(sorted(p.name for p in MIGRATIONS.glob("*.sql"))[-1], "008_identity.sql")
+
+
+    def test_log_rows_and_outcomes_always_get_the_executing_factory(self):
+        fn = self.sql[self.sql.index("CREATE OR REPLACE FUNCTION execute_plan_tx("):]
+        fn = _strip_comments(fn[:fn.index("$$;")])
+        self.assertNotIn("log_rec.factory_id", fn)
+        self.assertNotIn("outcome->>'factory_id'", fn)
+        self.assertRegex(fn, r"COALESCE\(log_rec\.created_at, NOW\(\)\), v_factory\s*\)")
+        self.assertRegex(fn, r"VALUES \(\s*v_factory, outcome->>'supplier_id'")
+
+    def test_owner_inference_precedes_guarded_fallback(self):
+        part = _part2(self.sql)
+        fallback = part.index("UPDATE suppliers SET factory_id = 'apex-volt-blr2'")
+        guard = part.index("IF (SELECT count(*) FROM factories) > 1 THEN")
+        for pattern in (
+            r"UPDATE purchase_orders po SET factory_id = r\.factory_id\s+FROM analysis_runs r WHERE po\.factory_id IS NULL AND r\.run_id = po\.run_id;",
+            r"UPDATE purchase_orders po SET factory_id = o\.factory_id\s+FROM orders o",
+            r"UPDATE sourcing_rfqs sr SET factory_id = s\.factory_id\s+FROM suppliers s",
+            r"UPDATE agent_logs al SET factory_id = r\.factory_id\s+FROM analysis_runs r",
+            r"UPDATE execution_receipts er SET factory_id = r\.factory_id\s+FROM analysis_runs r WHERE er\.factory_id IS NULL AND r\.run_id = er\.run_id;",
+            r"UPDATE delivery_outcomes d SET factory_id = s\.factory_id\s+FROM suppliers s",
+        ):
+            with self.subTest(pattern=pattern):
+                m = re.search(pattern, part)
+                self.assertIsNotNone(m)
+                self.assertLess(m.start(), guard)
+        self.assertLess(guard, fallback)
+        block = part[guard:fallback]
+        self.assertIn("RAISE EXCEPTION 'table % has rows with no factory_id", block)
+        for table in NOT_NULL_FACTORY_TABLES:
+            if table != "factories":
+                self.assertIn(f"'{table}'", block)
+
+    def test_tighter_grants_and_qualified_sweep(self):
+        for table in TENANT_TABLES + ("factories", "factory_members"):
+            with self.subTest(table=table):
+                self.assertRegex(self.sql, rf"REVOKE TRUNCATE, REFERENCES, TRIGGER ON {table} FROM anon, authenticated;")
+        self.assertIn("current_setting('server_version_num')::INT >= 170000", self.sql)
+        self.assertIn("REVOKE MAINTAIN ON public.%I FROM anon, authenticated", self.sql)
+        self.assertIn("format('DROP POLICY IF EXISTS %I ON %I.%I', pol.policyname, pol.schemaname, pol.tablename)",
+                      self.sql)
+
+    def test_fk_check_is_bound_to_the_table(self):
+        self.assertEqual(self.sql.count("WHERE conrelid = 'public.factory_members'::regclass"), 2)
+
+    def test_final_rls_check_just_before_version_insert(self):
+        body = self.sql
+        check = body.index("RAISE EXCEPTION 'RLS check failed: open policies remain")
+        self.assertLess(body.index("APPEND their parts HERE"), check)
+        self.assertLess(check, body.index("INSERT INTO schema_migrations (version) VALUES (8)"))
+        self.assertIn("qual = 'true' OR with_check = 'true' OR 'anon' = ANY (roles) OR 'public' = ANY (roles)", body)
+        self.assertIn("NOT c.relrowsecurity", body)
+        for table in TENANT_TABLES + SERVICE_ONLY_TABLES + ("factories", "factory_members"):
+            self.assertIn(f"'{table}'", body[check:])
+        self.assertIn("New tables: ENABLE ROW LEVEL SECURITY", body)
+
+
+
+class OldMigrationGuardTests(unittest.TestCase):
+    """001-007 refuse to run at level 8+: re-running them would reopen anon/USING(true) policies."""
+
+    def test_each_old_migration_refuses_level_8(self):
+        paths = sorted(MIGRATIONS.glob("00[1-7]_*.sql"))
+        self.assertEqual(len(paths), 7)
+        for path in paths:
+            n = path.name[:3]
+            sql = _read(path)
+            with self.subTest(migration=n):
+                guard = sql.index("SELECT 1 FROM schema_migrations WHERE version >= 8")
+                self.assertIn(f"RAISE EXCEPTION 'database is at level 8+; re-running {n} would reopen "
+                              f"anon/USING(true) policies", sql)
+                # The guard is the file's first statement.
+                first_stmt = re.search(r"^(?!--)(?!\s*$)", sql, re.M)
+                self.assertTrue(sql[first_stmt.start():].startswith("DO $$"))
+                self.assertLess(guard, sql.index("END\n$$;", first_stmt.start()))
+                header = sql[:first_stmt.start()]
+                self.assertRegex(header, r"(below level 8|Refuses to run once 008)")
 
 
 class SchemaSqlTests(unittest.TestCase):

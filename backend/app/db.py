@@ -923,9 +923,9 @@ def execute_plan_tx(
                                   {"status": "OVERTIME_SCHEDULED", "updated_at": now})
             entries = agent_log if isinstance(agent_log, list) else [agent_log] if agent_log else []
             for entry in entries:
-                insert_row("agent_logs", {"created_at": now, **entry, "factory_id": entry.get("factory_id") or factory})
-            for o in outcomes:
-                _insert_pending_outcome(o, now)
+                insert_row("agent_logs", {"created_at": now, **entry, "factory_id": factory or entry.get("factory_id")})
+            for o in outcomes:   # like the SQL function: always the executing factory's
+                _insert_pending_outcome({**o, "factory_id": factory} if factory else o, now)
         except BaseException:
             for t, rows in snapshot.items():
                 setattr(mirror, t, rows)

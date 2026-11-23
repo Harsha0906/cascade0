@@ -49,11 +49,15 @@ ALTER TABLE delivery_outcomes ADD COLUMN IF NOT EXISTS recorded_by TEXT;
 -- Memberships point at real factories and real Auth users; deleting either removes the membership.
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'factory_members_factory_id_fkey') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'public.factory_members'::regclass
+                      AND conname = 'factory_members_factory_id_fkey') THEN
         ALTER TABLE factory_members ADD CONSTRAINT factory_members_factory_id_fkey
             FOREIGN KEY (factory_id) REFERENCES factories (id) ON DELETE CASCADE;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'factory_members_user_id_fkey') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'public.factory_members'::regclass
+                      AND conname = 'factory_members_user_id_fkey') THEN
         ALTER TABLE factory_members ADD CONSTRAINT factory_members_user_id_fkey
             FOREIGN KEY (user_id) REFERENCES auth.users (id) ON DELETE CASCADE;
     END IF;
@@ -71,22 +75,51 @@ ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS factory_id TEXT;
 -- Inbound webhook ids are recorded before the tenant is known: stays nullable, service-only.
 ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS factory_id TEXT;
 
--- 2b. Backfill. Rows owned through another table take that owner's factory first; anything
---     still unowned predates tenancy and belongs to the demo factory.
+-- 2b. Backfill, step 1: infer each row's owner from the row it belongs to (run, order, supplier).
 UPDATE vendor_history vh SET factory_id = s.factory_id
   FROM suppliers s WHERE vh.factory_id IS NULL AND s.id = vh.supplier_id AND s.factory_id IS NOT NULL;
 UPDATE order_lines ol SET factory_id = o.factory_id
   FROM orders o WHERE ol.factory_id IS NULL AND o.order_id = ol.order_id AND o.factory_id IS NOT NULL;
+UPDATE disruption_events de SET factory_id = o.factory_id
+  FROM orders o WHERE de.factory_id IS NULL AND o.order_id = de.order_id AND o.factory_id IS NOT NULL;
+UPDATE purchase_orders po SET factory_id = r.factory_id
+  FROM analysis_runs r WHERE po.factory_id IS NULL AND r.run_id = po.run_id;
 UPDATE purchase_orders po SET factory_id = o.factory_id
   FROM orders o WHERE po.factory_id IS NULL AND o.order_id = po.order_id AND o.factory_id IS NOT NULL;
 UPDATE agent_logs al SET factory_id = r.factory_id
   FROM analysis_runs r WHERE al.factory_id IS NULL AND r.run_id = al.run_id;
 UPDATE execution_receipts er SET factory_id = r.factory_id
   FROM analysis_runs r WHERE er.factory_id IS NULL AND r.run_id = er.root_run_id;
+UPDATE execution_receipts er SET factory_id = r.factory_id
+  FROM analysis_runs r WHERE er.factory_id IS NULL AND r.run_id = er.run_id;
 UPDATE sourcing_rfqs sr SET factory_id = r.factory_id
   FROM analysis_runs r WHERE sr.factory_id IS NULL AND r.run_id = sr.run_id;
+UPDATE sourcing_rfqs sr SET factory_id = s.factory_id
+  FROM suppliers s WHERE sr.factory_id IS NULL AND s.id = sr.supplier_id AND s.factory_id IS NOT NULL;
 UPDATE sourcing_sessions ss SET factory_id = r.factory_id
   FROM analysis_runs r WHERE ss.factory_id IS NULL AND r.run_id = ss.run_id;
+UPDATE delivery_outcomes d SET factory_id = s.factory_id
+  FROM suppliers s WHERE d.factory_id IS NULL AND s.id = d.supplier_id AND s.factory_id IS NOT NULL;
+
+-- 2b, step 2: rows still unowned predate tenancy. With exactly one factory they are the demo
+--     factory's; with several factories nobody can tell, so stop and let the operator assign them.
+DO $$
+DECLARE
+    t TEXT;
+    unowned BOOLEAN;
+BEGIN
+    IF (SELECT count(*) FROM factories) > 1 THEN
+        FOREACH t IN ARRAY ARRAY['suppliers', 'vendor_history', 'production_lines', 'orders', 'disruption_events', 'agent_logs', 'purchase_orders', 'sourcing_rfqs', 'scenarios', 'items', 'stock_levels', 'inbound_shipments', 'order_lines', 'delivery_outcomes', 'analysis_runs', 'sourcing_sessions', 'execution_receipts', 'order_coordination']
+        LOOP
+            EXECUTE format('SELECT EXISTS (SELECT 1 FROM public.%I WHERE factory_id IS NULL)', t) INTO unowned;
+            IF unowned THEN
+                RAISE EXCEPTION 'table % has rows with no factory_id and more than one factory exists: assign them (UPDATE % SET factory_id = ...) before applying 008', t, t;
+            END IF;
+        END LOOP;
+    END IF;
+END
+$$;
+
 
 UPDATE suppliers SET factory_id = 'apex-volt-blr2' WHERE factory_id IS NULL;
 UPDATE vendor_history SET factory_id = 'apex-volt-blr2' WHERE factory_id IS NULL;
@@ -189,10 +222,10 @@ DROP POLICY IF EXISTS delivery_outcomes_read ON delivery_outcomes;
 DO $$
 DECLARE pol RECORD;
 BEGIN
-    FOR pol IN SELECT policyname, tablename FROM pg_policies
+    FOR pol IN SELECT policyname, schemaname, tablename FROM pg_policies
                 WHERE schemaname = 'public' AND ('anon' = ANY (roles) OR 'public' = ANY (roles))
     LOOP
-        EXECUTE format('DROP POLICY IF EXISTS %I ON %I', pol.policyname, pol.tablename);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', pol.policyname, pol.schemaname, pol.tablename);
     END LOOP;
 END
 $$;
@@ -302,6 +335,36 @@ REVOKE ALL ON webhook_events FROM anon, authenticated;
 REVOKE ALL ON schema_migrations FROM anon, authenticated;
 REVOKE ALL ON order_coordination FROM anon, authenticated;
 
+-- Privileges that bypass or sidestep RLS (TRUNCATE ignores it; REFERENCES/TRIGGER/MAINTAIN are
+-- never needed by the browser) are revoked from both browser roles on every tenant table.
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON factories FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON factory_members FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON suppliers FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON vendor_history FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON production_lines FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON orders FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON disruption_events FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON agent_logs FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON purchase_orders FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON sourcing_rfqs FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON scenarios FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON items FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON stock_levels FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON inbound_shipments FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON order_lines FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON delivery_outcomes FROM anon, authenticated;
+DO $$
+DECLARE t TEXT;
+BEGIN
+    IF current_setting('server_version_num')::INT >= 170000 THEN   -- MAINTAIN exists from PostgreSQL 17
+        FOREACH t IN ARRAY ARRAY['factories', 'factory_members', 'suppliers', 'vendor_history', 'production_lines', 'orders', 'disruption_events', 'agent_logs', 'purchase_orders', 'sourcing_rfqs', 'scenarios', 'items', 'stock_levels', 'inbound_shipments', 'order_lines', 'delivery_outcomes']
+        LOOP
+            EXECUTE format('REVOKE MAINTAIN ON public.%I FROM anon, authenticated', t);
+        END LOOP;
+    END IF;
+END
+$$;
+
 -- 2h. execute_plan_tx stores factory_id (same 9-argument signature as 007). The factory comes
 --     from p_po (falling back to p_receipt); the order, supplier and line updates only touch that
 --     factory's rows, so a plan can never move another tenant's data. The receipt insert is still
@@ -375,7 +438,7 @@ BEGIN
      WHERE line_id = ANY (COALESCE(p_overtime_line_ids, ARRAY[]::TEXT[]))
        AND factory_id = v_factory;
 
-    -- 6. Agent log rows (id is SERIAL: omitted so its default applies).
+    -- 6. Agent log rows (id is SERIAL: omitted so its default applies); always the executing factory's.
     FOR log_item IN SELECT * FROM jsonb_array_elements(
         CASE jsonb_typeof(p_agent_log)
             WHEN 'object' THEN jsonb_build_array(p_agent_log)
@@ -390,16 +453,16 @@ BEGIN
         ) VALUES (
             log_rec.run_id, log_rec.step_order, log_rec.agent_name, log_rec.agent_role,
             log_rec.badge_color, log_rec.tool_called, log_rec.tool_output_summary,
-            log_rec.message, COALESCE(log_rec.created_at, NOW()), COALESCE(log_rec.factory_id, v_factory)
+            log_rec.message, COALESCE(log_rec.created_at, NOW()), v_factory   -- payload factory_id ignored
         );
     END LOOP;
 
-    -- 7. Pending delivery outcomes: [{factory_id, supplier_id, po_number, units, promised_at}].
+    -- 7. Pending delivery outcomes: [{supplier_id, po_number, units, promised_at}] of the executing factory.
     FOR outcome IN SELECT * FROM jsonb_array_elements(COALESCE(p_outcomes, '[]'::jsonb))
     LOOP
         INSERT INTO delivery_outcomes (factory_id, supplier_id, po_number, units, promised_at, status)
         VALUES (
-            COALESCE(outcome->>'factory_id', v_factory), outcome->>'supplier_id', outcome->>'po_number',
+            v_factory, outcome->>'supplier_id', outcome->>'po_number',   -- payload factory_id ignored
             (outcome->>'units')::INTEGER, (outcome->>'promised_at')::TIMESTAMPTZ, 'PENDING'
         );
     END LOOP;
@@ -415,7 +478,35 @@ GRANT EXECUTE ON FUNCTION execute_plan_tx(JSONB, TEXT, TEXT, JSONB, TEXT[], JSON
 
 -- ----------------------------------------------------------------------------
 -- >>> Later Round B tasks (Task 3 onward) APPEND their parts HERE, above the version insert. <<<
+-- New tables: ENABLE ROW LEVEL SECURITY, give them a factory_id (NOT NULL) and either a
+-- `<t>_member_read` policy (TO authenticated, never anon, never USING (true)) or no policy at all
+-- (service-only), and REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER from anon and
+-- authenticated (REVOKE ALL for service-only tables). Add the table to the RLS check below.
 -- ----------------------------------------------------------------------------
+
+-- Final RLS check (keep it just above the version insert): refuse to record level 8 if any
+-- public-schema policy is USING (true) / WITH CHECK (true) or applies to anon or PUBLIC, or if
+-- any known table has RLS disabled. Any failure rolls the whole migration back.
+DO $$
+DECLARE
+    bad TEXT;
+BEGIN
+    SELECT string_agg(format('%I.%I', tablename, policyname), ', ') INTO bad
+      FROM pg_policies
+     WHERE schemaname = 'public'
+       AND (qual = 'true' OR with_check = 'true' OR 'anon' = ANY (roles) OR 'public' = ANY (roles));
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'RLS check failed: open policies remain: %', bad;
+    END IF;
+    SELECT string_agg(c.relname, ', ') INTO bad
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relkind = 'r' AND NOT c.relrowsecurity
+       AND c.relname = ANY (ARRAY['factories', 'factory_members', 'suppliers', 'vendor_history', 'production_lines', 'orders', 'disruption_events', 'agent_logs', 'purchase_orders', 'sourcing_rfqs', 'scenarios', 'items', 'stock_levels', 'inbound_shipments', 'order_lines', 'delivery_outcomes', 'analysis_runs', 'sourcing_sessions', 'execution_receipts', 'webhook_events', 'schema_migrations', 'order_coordination']);
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'RLS check failed: row level security disabled on: %', bad;
+    END IF;
+END
+$$;
 
 -- Keep this the LAST statement of the file: version 8 is recorded only once every part above
 -- has been applied.
