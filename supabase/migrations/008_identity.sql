@@ -31,8 +31,12 @@ ALTER TABLE factory_members ENABLE ROW LEVEL SECURITY;
 -- A signed-in member reads only their own rows. No anon access; no write policies.
 DROP POLICY IF EXISTS factory_members_self_read ON factory_members;
 CREATE POLICY factory_members_self_read ON factory_members
-    FOR SELECT TO authenticated USING (user_id = auth.uid());
+    FOR SELECT TO authenticated USING (user_id = (SELECT auth.uid()));
 REVOKE ALL ON factory_members FROM anon;
+REVOKE INSERT, UPDATE, DELETE ON factory_members FROM authenticated;
+
+-- Who recorded a delivery (the verified actor's email); it moves learned vendor reliability.
+ALTER TABLE delivery_outcomes ADD COLUMN IF NOT EXISTS recorded_by TEXT;
 
 -- ----------------------------------------------------------------------------
 -- >>> Later Round B tasks (Task 3 onward) APPEND their parts HERE, above the version insert. <<<

@@ -18,7 +18,9 @@ existence leak); a member without the needed role gets 403.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import logging
 import secrets
 import threading
@@ -43,6 +45,7 @@ TOKEN_CACHE_SECONDS = 60.0
 _TOKEN_CACHE_MAX = 1024
 
 _clock: Callable[[], float] = time.monotonic   # patched in tests
+_wall_clock: Callable[[], float] = time.time    # converts a token's `exp` onto _clock (patched in tests)
 _token_cache: dict[str, tuple[float, str, Optional[str]]] = {}   # sha256(token) -> (expires, user_id, email)
 _cache_lock = threading.Lock()
 
@@ -50,6 +53,11 @@ _cache_lock = threading.Lock()
 def _unauthorized(detail: str = "Authentication required") -> HTTPException:
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail,
                          headers={"WWW-Authenticate": "Bearer"})
+
+
+def _auth_unavailable() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                         detail="Authentication service unavailable", headers={"Retry-After": "5"})
 
 
 def _not_found() -> HTTPException:
@@ -104,9 +112,39 @@ def clear_token_cache() -> None:
         _token_cache.clear()
 
 
+def _is_auth_rejection(exc: Exception) -> bool:
+    """True when Supabase Auth judged the token itself (invalid, expired, other project, no such
+    user); False for outages, rate limits and anything unrecognised (those are 503, never 401,
+    so an outage or a library change cannot look like a mass logout)."""
+    try:
+        from supabase_auth.errors import AuthApiError, AuthInvalidJwtError, AuthSessionMissingError
+    except ImportError:   # pragma: no cover - supabase is a dependency
+        return False
+    if isinstance(exc, (AuthInvalidJwtError, AuthSessionMissingError)):
+        return True
+    if isinstance(exc, AuthApiError):
+        code = getattr(exc, "status", None)
+        return isinstance(code, int) and 400 <= code < 500 and code not in (408, 429)
+    return False
+
+
+def _token_exp(token: str) -> Optional[float]:
+    """The `exp` claim (epoch seconds) read from the JWT payload WITHOUT verifying it. Used only
+    to shorten a cache entry after Supabase has verified the token; never trusted for auth."""
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        exp = claims.get("exp") if isinstance(claims, dict) else None
+        return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None
+    except Exception:
+        return None
+
+
 def _verify_token(token: str) -> tuple[str, Optional[str]]:
-    """(user_id, email) of a valid access token; 401 otherwise. Valid results are cached for
-    TOKEN_CACHE_SECONDS, so a revoked token is accepted for at most that long."""
+    """(user_id, email) of a valid access token. An auth rejection is a 401; an unreachable or
+    failing Supabase Auth is a 503 with Retry-After. Only successes are cached, for at most
+    TOKEN_CACHE_SECONDS and never past the token's own `exp`, so a revoked token is accepted
+    for at most 60 s and an expired one not at all."""
     key = hashlib.sha256(token.encode("utf-8")).hexdigest()
     now = _clock()
     with _cache_lock:
@@ -121,19 +159,29 @@ def _verify_token(token: str) -> tuple[str, Optional[str]]:
         raise _unauthorized("Token authentication is not available (Supabase not configured)")
     try:
         response = client.auth.get_user(token)
-    except Exception as exc:   # invalid, expired, other project, or Supabase unreachable: fail closed
-        logger.info("Access token rejected: %s", type(exc).__name__)
-        raise _unauthorized("Invalid or expired token") from None
+    except Exception as exc:
+        if _is_auth_rejection(exc):
+            logger.info("Access token rejected: %s", type(exc).__name__)
+            raise _unauthorized("Invalid or expired token") from None
+        # Outage, timeout, 5xx, rate limit or unknown error: fail closed, but not as a logout.
+        logger.warning("Supabase Auth unavailable while verifying a token: %s", type(exc).__name__)
+        raise _auth_unavailable() from None
     user = getattr(response, "user", None)
     user_id = getattr(user, "id", None)
     if not user_id:
         raise _unauthorized("Invalid or expired token")
     email = getattr(user, "email", None)
+    expires = now + TOKEN_CACHE_SECONDS
+    exp = _token_exp(token)
+    if exp is not None:
+        expires = min(expires, now + (exp - _wall_clock()))
+    if expires <= now:
+        return str(user_id), email   # verified but at (or past) its exp: do not cache
     with _cache_lock:
         if len(_token_cache) >= _TOKEN_CACHE_MAX:
             for k in [k for k, v in _token_cache.items() if v[0] <= now] or list(_token_cache)[:_TOKEN_CACHE_MAX // 2]:
                 _token_cache.pop(k, None)
-        _token_cache[key] = (now + TOKEN_CACHE_SECONDS, str(user_id), email)
+        _token_cache[key] = (expires, str(user_id), email)
     return str(user_id), email
 
 

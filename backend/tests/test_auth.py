@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app import auth, db, main
 from app.config import Settings
+from supabase_auth.errors import AuthApiError
 
 KEY = {"X-API-Key": "test-operator-key"}
 OWNER_ID = "00000000-0000-4000-8000-000000000001"
@@ -64,7 +65,7 @@ class AuthApiTests(unittest.TestCase):
 
     def test_bad_bearer_is_401(self):
         def boom(token):
-            raise RuntimeError("invalid JWT: signature mismatch")
+            raise AuthApiError("invalid JWT: signature mismatch", 401, "bad_jwt")
         with mock.patch.object(auth, "_auth_client", lambda: _fake_supabase(boom)):
             r = self.anon.get("/api/v1/state", headers={"Authorization": "Bearer not-a-token"})
         self.assertEqual(r.status_code, 401)
@@ -209,7 +210,7 @@ class AuthApiTests(unittest.TestCase):
 
         def get_user(token):
             if not state["ok"]:
-                raise RuntimeError("expired")
+                raise AuthApiError("token is expired", 401, "bad_jwt")
             return _user_response(OWNER_ID, DEV_OWNER)
         with mock.patch.object(auth, "_auth_client", lambda: _fake_supabase(get_user)):
             with self.assertRaises(HTTPException):

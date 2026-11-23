@@ -111,7 +111,12 @@ class Settings:
         """Configuration gaps that must be fixed before running in production."""
         problems = []
         if not self.META_APP_SECRET:
-            problems.append("META_APP_SECRET is not set: WhatsApp webhook signatures are not verified")
+            if self.storage_mode == "offline":
+                problems.append("META_APP_SECRET is not set: unsigned WhatsApp webhooks are accepted "
+                                "(offline storage only)")
+            else:
+                problems.append("META_APP_SECRET is not set: WhatsApp webhooks are refused (unsigned "
+                                "payloads are refused with live storage)")
         if not self.META_WA_VERIFY_TOKEN:
             problems.append("META_WA_VERIFY_TOKEN is not set: Meta webhook verification handshake will fail")
         if "*" in self.ALLOWED_ORIGINS:

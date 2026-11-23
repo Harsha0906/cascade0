@@ -95,10 +95,16 @@ from app.schemas import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("cascadezero.server")
 
+def _docs_kwargs(cfg) -> Dict[str, Any]:
+    """In production the interactive docs and the OpenAPI schema are not served."""
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None} if cfg.is_production else {}
+
+
 app = FastAPI(
     title="CascadeZero API",
     description="Disruption-response copilot: LLM extraction + MILP/Monte Carlo planning with human approval",
     version="2.1.0",
+    **_docs_kwargs(settings),
 )
 
 # ─── Startup security posture ────────────────────────────────────────────────
@@ -398,7 +404,9 @@ def simulate_crisis(req: SimulateCrisisRequest):
 
 def _verify_meta_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
     if not settings.META_APP_SECRET:
-        return not settings.is_production  # dev mode without a secret: accept (warned at startup)
+        # Unsigned payloads only against offline (in-memory) storage in development; with a live
+        # database they are refused, since an approval here would execute without a verified actor.
+        return settings.storage_mode == "offline" and not settings.is_production
     if not signature_header or not signature_header.startswith("sha256="):
         return False
     expected = hmac.new(settings.META_APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
@@ -597,9 +605,10 @@ async def whatsapp_webhook(request: Request):
             return {"status": "ignored"}
         return await _handle_meta_payload(payload)
 
-    # Twilio sandbox (form-encoded). Read-only: it can run analysis but never approve execution.
-    if settings.is_production:
-        raise HTTPException(status_code=403, detail="Twilio sandbox webhook disabled in production")
+    # Twilio sandbox (form-encoded, unsigned). Offline development only: it runs analysis
+    # anonymously (never approves), so it is not served with a live database or in production.
+    if settings.is_production or settings.storage_mode != "offline":
+        raise HTTPException(status_code=404, detail="Not Found")
     form = await request.form()
     body_text = str(form.get("Body", "")).strip()
     sender = str(form.get("From", "")).strip()
@@ -1034,8 +1043,8 @@ def execute_plan(req: ExecutePlanRequest, actor: Actor = Depends(write_access)):
 
 # ─── 7b. Delivery outcomes (vendor reliability is learned from these) ────────
 
-@app.post("/api/v1/deliveries", dependencies=[Depends(write_access)])
-def record_delivery(req: DeliveryRecordRequest):
+@app.post("/api/v1/deliveries")
+def record_delivery(req: DeliveryRecordRequest, actor: Actor = Depends(write_access)):
     """Record that a purchase-order line was delivered. Moves the vendor's learned reliability."""
     matches = [o for o in db.get_delivery_outcomes(supplier_id=req.supplier_id)
                if o["po_number"] == req.po_number]
@@ -1057,7 +1066,8 @@ def record_delivery(req: DeliveryRecordRequest):
     updated = db.update_rows_where(
         "delivery_outcomes",
         {"po_number": req.po_number, "supplier_id": req.supplier_id, "status": "PENDING"},
-        {"status": "DELIVERED", "delivered_at": reliability.parse_timestamp(req.delivered_at).isoformat()},
+        {"status": "DELIVERED", "delivered_at": reliability.parse_timestamp(req.delivered_at).isoformat(),
+         "recorded_by": actor.approver_name},
     )
     if not updated:  # lost a race with another recording
         raise HTTPException(status_code=409, detail="This delivery was already recorded.")

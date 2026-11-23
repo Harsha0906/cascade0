@@ -358,9 +358,10 @@ Sourcing sessions use optimistic concurrency (`version` column; 409 after 3 conf
 - Every API route except `/`, `/healthz` and the signed WhatsApp webhook needs a verified actor: a Supabase Auth user (`Authorization: Bearer <access token>`, verified server-side) with a role in the factory (`factory_members`: owner, approver or viewer; add one with `python -m app.admin add-member --email E --factory F --role R` after the user signs up). Reads need any role, changes need owner or approver, `/reset` needs owner. `approved_by` is always the signed-in user's email, never a request field.
 - `CASCADE_API_KEY` (`X-API-Key`) is a machine key for automation on `/api/v1/ingest/*` and `/api/v1/simulate-crisis` only; it acts as an approver of `CASCADE_API_KEY_FACTORY` and cannot approve plans. The browser never sends it.
 - `AUTH_MODE=dev` (offline storage only; refused in production) trusts an `X-Dev-User: <email>` header for seeded dev users; the tests use it.
-- `META_APP_SECRET` verifies WhatsApp webhook signatures; `WA_APPROVER_NUMBERS` lists who may approve.
+- `META_APP_SECRET` verifies WhatsApp webhook signatures; `WA_APPROVER_NUMBERS` lists who may approve. Without it, unsigned webhooks are accepted only with offline (in-memory) storage in development; with Supabase configured they are refused (401). The unsigned Twilio sandbox branch is served only with offline storage (otherwise 404).
 - `ALLOWED_ORIGINS` replaces the old `*` CORS policy.
-- `CASCADE_ENV=production` refuses to start if a required secret is missing, and disables `/reset` and the Twilio sandbox.
+- `CASCADE_ENV=production` refuses to start if a required secret is missing, and disables `/reset` and the Twilio sandbox. It also hides `/docs`, `/redoc` and `/openapi.json`.
+- A Supabase Auth outage (unreachable, timeout, 5xx, rate limit) is a `503` with `Retry-After: 5`, not a `401`, so clients keep the session; only an auth rejection of the token is a `401`. Verified tokens are cached for at most 60 s and never past their `exp`.
 - Execution uses the plan the server computed for a `run_id`, once per run. Costs are never accepted from the client.
 
 ## 🏗️ Repository Architecture

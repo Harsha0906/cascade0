@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from app import db
 from app.auth import ROLES
+from app.config import settings
 
 _PAGE_SIZE = 200
 _MAX_PAGES = 500
@@ -26,10 +27,13 @@ class AdminError(RuntimeError):
 
 
 def _client():
+    # The admin API needs the service-role key; never fall back to the anon key.
+    if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_ROLE_KEY:
+        raise AdminError("The admin CLI needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in backend/.env "
+                         "(the anon key cannot look up users)")
     client = db._get_supabase()
     if client is None:
-        raise AdminError("Supabase is not configured (offline mode): set SUPABASE_URL and "
-                         "SUPABASE_SERVICE_ROLE_KEY in backend/.env")
+        raise AdminError("Supabase is not configured (offline mode)")
     return client
 
 
@@ -59,6 +63,8 @@ def add_member(email: str, factory_id: str, role: str) -> dict[str, Any]:
         raise AdminError(f"role must be one of {', '.join(ROLES)}")
     if not email or not factory_id:
         raise AdminError("--email and --factory are required")
+    if db.get_factory_row(factory_id) is None:
+        raise AdminError(f"Unknown factory {factory_id!r}")
     user = find_user(email)
     if user is None:
         raise AdminError(f"No Supabase user with email {email}: sign up on the dashboard first, then re-run")
@@ -76,12 +82,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "add-member":
-            if db.get_factory_row(args.factory.strip()) is None:
-                raise AdminError(f"Unknown factory {args.factory!r}")
             add_member(args.email, args.factory, args.role)
             print(f"{args.email.strip().lower()} is now {args.role} of {args.factory.strip()}")
     except (AdminError, db.DatabaseError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:   # Supabase Auth errors (e.g. not an admin key), network failures
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     return 0
 
