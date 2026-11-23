@@ -60,7 +60,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import importers, inbound, reliability, run_store
+from app import importers, inbound, reliability, run_store, setup_api
 from app.auth import (
     ANY_ROLE,
     OWNER_ONLY,
@@ -140,9 +140,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+app.include_router(setup_api.router)
 
 # Endpoints that touch no factory resource (configuration checks, weather): a role in the
 # caller's own factory. Everything factory-scoped authorises per resource (helpers below).

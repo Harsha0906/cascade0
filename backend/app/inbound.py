@@ -53,10 +53,11 @@ from app.solver import SolverInputError
 logger = logging.getLogger("cascadezero.inbound")
 
 LINK_CODE_TTL = timedelta(minutes=15)
+CONTACT_INVITE_TTL = timedelta(days=7)   # Telegram deep-link invites for suppliers and clients
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # no 0/O, 1/I: codes are typed by hand
 _CODE_LENGTH = 10                                       # ~50 bits; single use, 15 minutes
 
-_LINK_RE = re.compile(r"^(?:/?link|/start)(?:@\w+)?\s+([A-Za-z0-9-]{4,64})\s*$", re.IGNORECASE)
+_LINK_RE = re.compile(r"^(?:/?link|/start)(?:@\w+)?\s+([A-Za-z0-9_-]{4,64})\s*$", re.IGNORECASE)
 _HELP_WORDS = {"/start", "/help", "help", "/link", "link"}
 _STATUS_WORDS = {"status", "plant", "check", "/status"}
 
@@ -87,6 +88,20 @@ def create_link_code(user_id: str, factory_id: str) -> Dict[str, str]:
     expires_at = (datetime.now(timezone.utc) + LINK_CODE_TTL).isoformat()
     db.create_link_code(_hash_code(code), user_id, factory_id, expires_at)
     return {"code": code, "expires_at": expires_at}
+
+
+def _hash_invite(token: str) -> str:
+    """Invite tokens are case-sensitive; only their SHA-256 is stored."""
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def create_contact_invite(factory_id: str, kind: str, target_id: str) -> Dict[str, str]:
+    """A single-use Telegram deep-link token (24 URL-safe chars, 7 days) that connects a supplier's
+    (kind 'supplier') or an order's client's (kind 'client') chat: {token, expires_at (ISO UTC)}."""
+    token = secrets.token_urlsafe(18)
+    expires_at = (datetime.now(timezone.utc) + CONTACT_INVITE_TTL).isoformat()
+    db.create_contact_invite(_hash_invite(token), factory_id, kind, target_id, expires_at)
+    return {"token": token, "expires_at": expires_at}
 
 
 # ─── Message text ────────────────────────────────────────────────────────────
@@ -256,8 +271,47 @@ async def _process(channel: Channel, msg: InboundMessage) -> Dict[str, Any]:
     return await _alert(channel, sender, text, identity)
 
 
+_INVITE_REFUSED = "⛔ That invite link is invalid, used or expired. Ask the plant for a new one."
+
+
+async def _connect_contact(channel: Channel, sender: str, token: str) -> Optional[Dict[str, Any]]:
+    """`/start <token>` from a supplier's or client's Telegram: store this chat on the invited
+    supplier / order, scoped to the invite's factory. None when the token is not a valid invite."""
+    invite = await run_in_threadpool(db.consume_contact_invite, _hash_invite(token))
+    if invite is None:
+        return None
+    factory_id, target_id = invite["factory_id"], invite["target_id"]
+    address = _address(channel, sender)
+    factory = await run_in_threadpool(db.get_factory_row, factory_id)
+    if invite["kind"] == "supplier":
+        target = await run_in_threadpool(db.get_supplier, target_id)
+        if target is None or target.get("factory_id") != factory_id:
+            return None
+        await run_in_threadpool(db.update_rows_where, "suppliers", {"id": target_id, "factory_id": factory_id},
+                                {"telegram_chat_id": address})
+        role = target.get("name") or target_id
+    else:
+        target = await run_in_threadpool(db.get_order, target_id)
+        if target is None or target.get("factory_id") != factory_id:
+            return None
+        await run_in_threadpool(db.update_rows_where, "orders", {"order_id": target_id, "factory_id": factory_id},
+                                {"client_contact": f"telegram:{address}"})
+        role = f"client of order {target_id}"
+    logger.info("telegram chat %s connected to %s (%s %s)", address, factory_id, invite["kind"], target_id)
+    await _reply(channel, sender, f"✅ You're connected to {(factory or {}).get('name') or factory_id} as {role}.")
+    return {"status": "success", "action": "contact_connected", "kind": invite["kind"]}
+
+
 async def _link(channel: Channel, sender: str, code: str) -> Dict[str, Any]:
     row = await run_in_threadpool(db.consume_link_code, _hash_code(code))
+    if row is None and channel.name == "telegram":
+        connected = await _connect_contact(channel, sender, code)
+        if connected is not None:
+            return connected
+        if len(code) >= 20:   # shaped like an invite token, not a typed link code
+            logger.warning("Refused a telegram contact invite from %s", _address(channel, sender))
+            await _reply(channel, sender, _INVITE_REFUSED)
+            return {"status": "forbidden", "action": "invite_refused"}
     member = None
     if row is not None:
         member = await run_in_threadpool(db.get_member, row["user_id"], row["factory_id"])

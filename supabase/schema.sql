@@ -1,7 +1,7 @@
 -- ============================================================================
 -- CASCADEZERO — Complete PostgreSQL Schema, Realtime Setup & Seed Data
 -- Target: Supabase Cloud PostgreSQL (ap-south-1)
--- Fresh install: run this file, then migrations 001, 002, 003, 004, 005, 006, 007, 008 in order.
+-- Fresh install: run this file, then migrations 001, 002, 003, 004, 005, 006, 007, 008, 009 in order.
 -- Row-Level Security (end state, see the section before Realtime): anon reads nothing; a signed-in
 -- member reads only their factories' rows; every write goes through the backend's service role.
 -- Factory: Apex Volt EV Battery Plant (Bengaluru Unit-2)
@@ -58,6 +58,20 @@ CREATE TABLE IF NOT EXISTS link_codes (
 );
 CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes (expires_at);
 
+-- Telegram contact invites (migration 009; service-only): single-use deep-link tokens that connect a
+-- supplier's or a client's chat. Only the SHA-256 of the token is stored.
+CREATE TABLE IF NOT EXISTS contact_invites (
+    token_hash  TEXT PRIMARY KEY,
+    factory_id  TEXT NOT NULL REFERENCES factories (id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL CHECK (kind IN ('supplier', 'client')),
+    target_id   TEXT NOT NULL,              -- suppliers.id (supplier) / orders.order_id (client)
+    expires_at  TIMESTAMPTZ NOT NULL,
+    used_at     TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_contact_invites_factory ON contact_invites (factory_id);
+CREATE INDEX IF NOT EXISTS idx_contact_invites_expires ON contact_invites (expires_at);
+
 -- ============================================================================
 -- TABLE 1: suppliers
 -- Tracks inbound logistics suppliers across tiers and emergency channels
@@ -86,7 +100,8 @@ CREATE TABLE IF NOT EXISTS suppliers (
     delay_shock_max_hours FLOAT,
     unreliable_delay_min_hours FLOAT,
     unreliable_delay_max_hours FLOAT,
-    min_lead_hours  FLOAT
+    min_lead_hours  FLOAT,
+    risk_profile    TEXT CHECK (risk_profile IS NULL OR risk_profile IN ('low', 'medium', 'high'))  -- migration 009
 );
 
 -- ============================================================================
@@ -350,7 +365,7 @@ VALUES
 ON CONFLICT (factory_id, scenario_id) DO NOTHING;
 
 -- ============================================================================
--- ROW-LEVEL SECURITY (end state; migrations 001-008 converge to the same)
+-- ROW-LEVEL SECURITY (end state; migrations 001-009 converge to the same)
 -- anon: no policy and no privileges. authenticated: SELECT only, filtered to the factories the
 -- user is a member of (RLS also filters Realtime). No INSERT/UPDATE/DELETE policies: the backend
 -- writes with the service role. order_coordination, user_channels and link_codes are
@@ -375,6 +390,7 @@ ALTER TABLE delivery_outcomes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE order_coordination ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_channels ENABLE ROW LEVEL SECURITY;
 ALTER TABLE link_codes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contact_invites ENABLE ROW LEVEL SECURITY;
 
 -- A signed-in member reads only their own memberships.
 DROP POLICY IF EXISTS factory_members_self_read ON factory_members;
@@ -470,6 +486,7 @@ REVOKE INSERT, UPDATE, DELETE ON factory_members FROM authenticated;
 REVOKE ALL ON order_coordination FROM anon, authenticated;
 REVOKE ALL ON user_channels FROM anon, authenticated;
 REVOKE ALL ON link_codes FROM anon, authenticated;
+REVOKE ALL ON contact_invites FROM anon, authenticated;
 
 -- ============================================================================
 -- SUPABASE REALTIME: Enable postgres_changes on all 7 tables
