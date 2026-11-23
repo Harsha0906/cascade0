@@ -246,7 +246,7 @@ Tally header aliases, quantity formats (`1,20,000`, `500 Nos`, `500.00`) and IST
 | Plan ranking | Real: argmin of `cost + (1 − P_on_time) × SLA penalty` |
 | Monte Carlo on-time probability | Real, seeded; distributions are **assumptions** for the demo plant |
 | **Sourcing Agent** | Real agent loop: sends enquiries (not orders) to the vendors in a plan, reads replies (Gemini or regex, English/Hinglish), and re-plans with confirmed capacity/price/ETA, asking the next vendor when one declines, offers less, or times out (max 3 rounds). WhatsApp or simulated channel |
-| Ops ⇄ CFO debate | Proposals are solver outputs; the rebuttal fires on computed risk (weak vendor, infeasibility, confidence gap) and the CFO re-solves |
+| Speed vs Cost scenarios | Planning scenarios, not agents: each proposal is a solver output (speed = expedite-first, cost = cheapest feasible); the risk check fires on computed risk (weak vendor, infeasibility, confidence gap) and the cost scenario re-solves |
 | Disruption extraction | Gemini (given the factory's line, supplier and order ids) or a regex fallback that only takes cue-bound numbers and never guesses; `backend/app/disruption.py` resolves references to ids. Missing or unresolvable input is rejected, never defaulted. The UI shows which path ran |
 | Digital twin | Built from the factory model (`/api/v1/factory`) and live state (`/api/v1/state`): one node per supplier, line and order. Layout is generic, not geographic |
 | LLM | Extracts parameters from free text and narrates. The UI shows when it fell back to regex/templates |
@@ -256,6 +256,19 @@ Tally header aliases, quantity formats (`1,20,000`, `500 Nos`, `500.00`) and IST
 | WhatsApp | Meta Cloud API with HMAC verification; approvals only from allow-listed numbers |
 | Analysis runs, sourcing sessions, execution receipts | Stored in Postgres (`analysis_runs`, `sourcing_sessions`, `execution_receipts`); in offline mode in process memory. Approving a run twice returns the original receipt with `already_executed: true`; a different plan for an executed run is a 409 |
 | Execution | Generates **drafts** (Tally XML, notices). Nothing is sent to suppliers automatically |
+
+## Which components are agents
+
+| Component | Kind | What it does |
+|---|---|---|
+| Disruption Detective | **Agent** | Perceives the alert (Gemini or regex extraction), decides the resolution of entities to factory ids, and acts on state (blast-radius update) |
+| Sourcing Agent | **Agent** | Sends enquiries to vendors, reads replies, re-plans with confirmed capacity |
+| Client Agent | **Agent** | Drafts a deadline-extension request to the client; a named human approves before it is sent; the client's answer triggers a re-plan and restarts sourcing |
+| Speed scenario (expedite-first) | Planning scenario | MILP with the expedite vendor forced on, scored by Monte Carlo. Not an agent |
+| Cost scenario (cheapest feasible) | Planning scenario | Unconstrained cost-minimal MILP, scored by Monte Carlo. Not an agent |
+| Arbitrator (solver ranking) | Solver step | Ranks all playbooks by `cost + (1 − P_on_time) × SLA penalty`. Not an agent |
+
+The LLM only narrates the scenario and solver steps ("explain this computed result"); it makes no decisions there.
 
 ## 🤝 Sourcing Agent
 

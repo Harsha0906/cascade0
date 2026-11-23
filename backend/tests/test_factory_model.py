@@ -122,9 +122,21 @@ class FactoryModelTests(unittest.TestCase):
         self.assertNotIn("PLAN_A", [p["id"] for p in r["playbooks"]])
         self.assertIn(r["recommended_plan_id"], {"PLAN_B", "PLAN_C", "PLAN_D"})
         ops = [l for l in get_agent_logs(r["run_id"])
-               if l["agent_name"] == "Operations Hawk" and l["tool_called"] == "factory_model.expedite_vendor_id"]
+               if l["agent_name"] == "Speed scenario (expedite-first)" and l["tool_called"] == "factory_model.expedite_vendor_id"]
         self.assertEqual(len(ops), 1)
         self.assertIn("no vendor with role EXPEDITE", ops[0]["message"])
+
+    def test_agent_log_names_are_honest(self):
+        """Scenario steps are labelled as scenarios, the solver as a solver, only the Detective as an agent."""
+        r = run_cascade_pipeline("x", override_shortfall_units=150, override_delay_hours=48,
+                                 override_line_speeds={"LINE-2": 50}, order_id="EV-402")
+        names = {l["agent_name"] for l in get_agent_logs(r["run_id"])}
+        self.assertTrue(names <= {"Disruption Detective (agent)", "Speed scenario (expedite-first)",
+                                  "Cost scenario (cheapest feasible)", "Arbitrator (solver ranking)"}, names)
+        self.assertIn("Disruption Detective (agent)", names)
+        self.assertIn("Arbitrator (solver ranking)", names)
+        for old in ("Operations Hawk", "CFO Watchdog", "Blast-Radius Detective", "Arbitrator"):
+            self.assertNotIn(old, names)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import { useFactoryStore } from "@/store/useFactoryStore";
 import { focusOrder, ordersSummary, shortfallText, throttledLinesText } from "@/lib/twinGraph";
 import { AiModeBadge } from "@/components/AiModeBadge";
 import { SourcingPanel } from "@/components/SourcingPanel";
+import { ClientPanel } from "@/components/ClientPanel";
 import {
   AlertTriangle,
   ArrowRight,
@@ -173,19 +174,19 @@ export function ExecutiveStoryView() {
               <div className="flex items-center justify-between text-xs font-mono mb-4">
                 <span className="font-extrabold text-charcoal-900 uppercase tracking-wider flex items-center gap-2">
                   <Users className="w-4 h-4 text-forest" />
-                  <span>1. Multi-Agent Debate</span>
+                  <span>1. Planning Scenarios</span>
                 </span>
                 <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-forest/10 text-forest-deep">
-                  Opposing Agents
+                  Solver-computed
                 </span>
               </div>
 
               <div className="space-y-3">
-                {/* Ops Hawk Argument */}
+                {/* Speed scenario */}
                 <div className="p-3.5 rounded-2xl bg-rose-50/80 border border-rose-200/60">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-rose-900 flex items-center gap-1.5">
-                      🦅 Operations Hawk
+                      🦅 Speed scenario (expedite-first)
                     </span>
                     <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-rose-200 text-rose-900">
                       SLA Survival
@@ -198,11 +199,11 @@ export function ExecutiveStoryView() {
                   </p>
                 </div>
 
-                {/* CFO Watchdog Argument */}
+                {/* Cost scenario */}
                 <div className="p-3.5 rounded-2xl bg-cyan-50/80 border border-cyan-200/60">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-cyan-900 flex items-center gap-1.5">
-                      🛡️ CFO Watchdog
+                      🛡️ Cost scenario (cheapest feasible)
                     </span>
                     <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-cyan-200 text-cyan-900">
                       Capital Preservation
@@ -351,6 +352,7 @@ export function ExecutiveStoryView() {
                   </li>
                 </ul>
                 <SourcingPanel />
+                <ClientPanel />
               </div>
             </div>
 

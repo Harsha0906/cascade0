@@ -1,18 +1,18 @@
 """
-CascadeZero — 4-node LangGraph StateGraph (Detective → Ops ⇄ CFO → Arbitrator)
+CascadeZero — 4-node LangGraph StateGraph (Detective → speed ⇄ cost scenarios → Arbitrator solver)
 
 What each node actually does:
   - Detective:   structured extraction (Gemini, or regex fallback), blast-radius DB update.
-  - Ops Hawk:    its proposal is the MILP solved with the expedite vendor forced on
+  - Speed scenario: its proposal is the MILP solved with the expedite vendor forced on
                  (maximum-speed position), scored by Monte Carlo.
-  - CFO Watchdog: its proposal is the unconstrained cost-minimal MILP, scored by Monte Carlo.
+  - Cost scenario: its proposal is the unconstrained cost-minimal MILP, scored by Monte Carlo.
   - Rebuttal:    triggered by *computed* risk, not a fixed threshold — when the CFO plan
                  depends on a vendor below RELIABILITY_FLOOR_PCT, is infeasible, or has a
                  materially lower on-time probability than the Ops plan. Ops challenges;
                  the CFO re-solves with low-reliability vendors excluded and keeps whichever
                  version has the lower risk-adjusted expected cost (concede or hold).
                  At most one rebuttal round.
-  - Arbitrator:  generates and ranks all playbooks by
+  - Arbitrator (solver): generates and ranks all playbooks by
                  E[cost] = mitigation_cost + (1 − P_on_time) × SLA_penalty.
 
 The LLM's role is limited and stated plainly: it extracts parameters from free text and
@@ -95,7 +95,7 @@ def _llm_agent_reason(
             f"OBJECTIVE: {objective}\n"
             f"COMPUTED FACTS (from a MILP solver and Monte Carlo simulation — do not change any number): "
             f"{json.dumps(context, default=str)}\n\n"
-            f"Write 2 sentences in the first person stating your position. Quote only numbers "
+            f"Write 2 sentences describing what this result shows. Quote only numbers "
             f"present in COMPUTED FACTS. Do not invent figures."
         )
         resp = _get_genai_client().models.generate_content(model=settings.GEMINI_MODEL, contents=prompt)
@@ -320,7 +320,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         risk_bits.append(disruption.route_note)
     log_agent_step(
         run_id=run_id, step_order=1,
-        agent_name="Blast-Radius Detective", agent_role="Disruption Entity Extractor", badge_color="amber",
+        agent_name="Disruption Detective (agent)", agent_role="Disruption Entity Extractor", badge_color="amber",
         tool_called=f"extract_disruption_entities({source})",
         tool_output_summary=(
             f"{supplier_txt} | {lines_txt} | Shortfall {disruption.shortfall_units} units on #{disruption.order_id}"
@@ -342,7 +342,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         f"{blast['hours_remaining']:g}h to deadline. {supplier_txt}; {lines_txt}."
     )
     msg, mode = _llm_agent_reason(
-        "Blast-Radius Detective", "Causal Dependency Mapper",
+        "Disruption Detective (agent)", "Causal Dependency Mapper",
         "Summarise the compound disruption and what is at stake.",
         {"delay_hours": disruption.delay_hours, "supplier": supplier_txt, "line_impacts": lines_txt,
          "shortfall_units": disruption.shortfall_units, "order_id": disruption.order_id,
@@ -351,7 +351,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     )
     log_agent_step(
         run_id=run_id, step_order=2,
-        agent_name="Blast-Radius Detective", agent_role="Causal Dependency Mapper", badge_color="amber",
+        agent_name="Disruption Detective (agent)", agent_role="Causal Dependency Mapper", badge_color="amber",
         tool_called="query_blast_radius_sql()", tool_output_summary=summary, message=msg,
     )
 
@@ -385,7 +385,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     }
 
 
-# ─── Node 2: Operations Hawk ─────────────────────────────────────────────────
+# ─── Node 2: Speed scenario ─────────────────────────────────────────────────
 
 def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
@@ -398,7 +398,7 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
         if expedite_id is None:
             log_agent_step(
                 run_id=run_id, step_order=3,
-                agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
+                agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
                 tool_called="factory_model.expedite_vendor_id",
                 tool_output_summary=f"{model.name} has no expedite vendor available",
                 message=(f"🔥 {model.name} has no expedite option (no vendor with role EXPEDITE), "
@@ -419,15 +419,15 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
             "feasible": prop["feasible"],
         }
         msg, mode = _llm_agent_reason(
-            "Operations Hawk", "Chief of Manufacturing Operations",
-            "Argue for the fastest, most reliable recovery (expedite option).", facts,
+            "Speed scenario (expedite-first)", "Planning scenario: maximum speed",
+            "Explain this planning scenario's computed result: the fastest, most reliable recovery (expedite option).", facts,
             f"🔥 My position: {facts['plan']} + {prop['overtime_hours']}h overtime. "
             f"Cost ₹{prop['total_cost_inr']:,}, modelled P(on-time) {prop['confidence_pct']}%."
             + ("" if prop["feasible"] else " Even this leaves units uncovered."),
         )
         log_agent_step(
             run_id=run_id, step_order=3,
-            agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
+            agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
             tool_called=f"solve_pulp_milp(force_vendor_id={expedite_id}) + simulate_monte_carlo()",
             tool_output_summary=(
                 f"Expedite {facts['expedite_vendor']}; OT lines {ot_lines} | {facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
@@ -447,26 +447,26 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
         reasons.append("leaves units uncovered")
     if ops is not None and ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT:
         reasons.append(f"P(on-time) {cfo['confidence_pct']}% vs my {ops['confidence_pct']}%")
-    challenge = "CFO plan " + "; ".join(reasons) + "."
+    challenge = "Cost scenario plan " + "; ".join(reasons) + "."
     msg, mode = _llm_agent_reason(
-        "Operations Hawk", "Chief of Manufacturing Operations",
-        "Challenge the CFO plan using only the computed risk evidence.",
+        "Speed scenario (expedite-first)", "Planning scenario: maximum speed",
+        "Explain this planning scenario's computed risk check of the cost scenario plan.",
         {"challenge": challenge, "cfo_plan": _fmt_units(model, cfo["units_by_vendor"])},
         f"⚡ REBUTTAL: {challenge} Re-plan without the weak link.",
     )
     log_agent_step(
         run_id=run_id, step_order=5,
-        agent_name="Operations Hawk", agent_role="Chief of Manufacturing Operations", badge_color="rose",
+        agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
         tool_called="audit_proposal_risk()", tool_output_summary=challenge, message=msg,
     )
     return {
         "rebuttal_pending": False,
-        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"Ops: {challenge}"],
+        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"Speed scenario: {challenge}"],
         "llm_trace": _trace(state, "ops_hawk_rebuttal", mode),
     }
 
 
-# ─── Node 3: CFO Watchdog ────────────────────────────────────────────────────
+# ─── Node 3: Cost scenario ────────────────────────────────────────────────────
 
 def _needs_rebuttal(model: FactoryModel, cfo: Dict[str, Any], ops: Optional[Dict[str, Any]]) -> bool:
     gap = ops is not None and ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT
@@ -495,14 +495,14 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
         }
         saving_txt = f" (₹{saving:,} less than Ops)" if saving is not None else ""
         msg, mode = _llm_agent_reason(
-            "CFO Watchdog", "VP of Finance",
-            "Argue for the lowest-cost plan that still protects the order.", facts,
+            "Cost scenario (cheapest feasible)", "Planning scenario: lowest cost",
+            "Explain this planning scenario's computed result: the lowest-cost plan that still protects the order.", facts,
             f"💰 Cost-minimal plan: {facts['plan']} + {prop['overtime_hours']}h overtime = "
             f"₹{prop['total_cost_inr']:,}{saving_txt}, P(on-time) {prop['confidence_pct']}%.",
         )
         log_agent_step(
             run_id=run_id, step_order=4,
-            agent_name="CFO Watchdog", agent_role="VP of Finance", badge_color="cyan",
+            agent_name="Cost scenario (cheapest feasible)", agent_role="Planning scenario: lowest cost", badge_color="cyan",
             tool_called="solve_pulp_milp(min cost) + simulate_monte_carlo()",
             tool_output_summary=(
                 f"Vendors: {'; '.join(regional) or 'none'} | {facts['plan']} + {prop['overtime_hours']}h OT | ₹{prop['total_cost_inr']:,} | "
@@ -533,12 +533,12 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
         f"vs ₹{original['expected_cost_inr']:,}; the reliability risk does not threaten the deadline."
     )
     msg, mode = _llm_agent_reason(
-        "CFO Watchdog", "VP of Finance", "Respond to the Ops rebuttal using the re-solved numbers.",
+        "Cost scenario (cheapest feasible)", "Planning scenario: lowest cost", "Explain this planning scenario's computed re-solve after the risk check.",
         {"verdict": verdict}, f"🤝 {verdict}",
     )
     log_agent_step(
         run_id=run_id, step_order=6,
-        agent_name="CFO Watchdog", agent_role="VP of Finance", badge_color="cyan",
+        agent_name="Cost scenario (cheapest feasible)", agent_role="Planning scenario: lowest cost", badge_color="cyan",
         tool_called=f"solve_pulp_milp(min_reliability={RELIABILITY_FLOOR_PCT:g}%)",
         tool_output_summary=verdict, message=msg,
     )
@@ -547,7 +547,7 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
         "cfo_reliability_floor_pct": RELIABILITY_FLOOR_PCT if concede else 0.0,
         "rebuttal_count": rounds,  # rounds completed (set to 1 when the rebuttal started)
         "rebuttal_pending": False,
-        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"CFO: {verdict}"],
+        "rebuttal_notes": list(state.get("rebuttal_notes", [])) + [f"Cost scenario: {verdict}"],
         "llm_trace": _trace(state, "cfo_watchdog_response", mode),
     }
 
@@ -585,7 +585,7 @@ def arbitrator_node(state: CascadeGraphState) -> Dict[str, Any]:
         f"Ranked by {solver_dict['ranking_rule']}: {ranking}. Winner {winner_id}."
     )
     msg, mode = _llm_agent_reason(
-        "Arbitrator", "Solver & Risk Ranking", "Explain why the winning plan has the lowest risk-adjusted cost.",
+        "Arbitrator (solver ranking)", "Solver & Risk Ranking", "Explain why the winning plan has the lowest risk-adjusted cost.",
         {"winner": winner_id, "cost_inr": w["total_mitigation_cost_inr"], "p_on_time_pct": w["confidence_pct"],
          "expected_cost_inr": w["expected_cost_inr"], "ranking": ranking},
         f"⚖️ {w['name']} wins: ₹{w['total_mitigation_cost_inr']:,} spend, P(on-time) {w['confidence_pct']}% "
@@ -594,7 +594,7 @@ def arbitrator_node(state: CascadeGraphState) -> Dict[str, Any]:
     )
     log_agent_step(
         run_id=run_id, step_order=7 if state.get("rebuttal_count", 0) > 0 else 5,
-        agent_name="Arbitrator", agent_role="Solver & Risk Ranking", badge_color="emerald",
+        agent_name="Arbitrator (solver ranking)", agent_role="Solver & Risk Ranking", badge_color="emerald",
         tool_called="generate_playbooks(MILP + 1000-run Monte Carlo)", tool_output_summary=summary, message=msg,
     )
     return {
