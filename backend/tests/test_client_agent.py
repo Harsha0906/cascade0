@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 from fastapi.testclient import TestClient
 
 from app import db, main, run_store
@@ -14,7 +15,7 @@ from app.agents import sourcing, sourcing_store
 from app.config import settings
 from app.deadlines import parse_timestamp
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 # Pinned clock for the Client Agent (whole hour, so the quoted deadlines are exact).
 PIN = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
@@ -40,7 +41,7 @@ def _add_slow_vendor():
 class ClientAgentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.api = TestClient(main.app)
+        cls.api = dev_client(main.app)
 
     def setUp(self):
         self.api.post("/api/v1/reset", headers=KEY)
@@ -192,11 +193,12 @@ class ClientAgentTests(unittest.TestCase):
         with self.assertRaises(client_agent.ClientAgentError) as cm:
             client_agent.draft_extension(sim["run_id"], -3)
         self.assertEqual(cm.exception.status_code, 422)
-        r = self.api.post("/api/v1/client/draft", json={"run_id": sim["run_id"], "extension_hours": 5})
+        anon = TestClient(main.app)  # no credentials
+        r = anon.post("/api/v1/client/draft", json={"run_id": sim["run_id"], "extension_hours": 5})
         self.assertEqual(r.status_code, 401)
-        r = self.api.post("/api/v1/client/approve", json={"run_id": sim["run_id"], "approved_by": "x"})
+        r = anon.post("/api/v1/client/approve", json={"run_id": sim["run_id"], "approved_by": "x"})
         self.assertEqual(r.status_code, 401)
-        r = self.api.post("/api/v1/client/answer", json={"run_id": sim["run_id"], "accepted": True})
+        r = anon.post("/api/v1/client/answer", json={"run_id": sim["run_id"], "accepted": True})
         self.assertEqual(r.status_code, 401)
         self.assertEqual(self._approve(sim["run_id"]).status_code, 404)  # nothing drafted
 

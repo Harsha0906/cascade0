@@ -5,13 +5,14 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 from fastapi.testclient import TestClient
 
 from app import db, main
 from app.factory_model import load_factory_model
 from app.reliability import beta_reliability, on_time
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)   # fixed, in the past (future deliveries are 422)
 
 
@@ -48,7 +49,7 @@ class BetaMathTests(unittest.TestCase):
 class _Api(unittest.TestCase):
     def setUp(self):
         db.reset_to_seed()
-        self.client = TestClient(main.app)
+        self.client = dev_client(main.app)
 
     def _record_outcome(self, supplier_id, po, delivered_hours_after_promise, units=100):
         promised = NOW
@@ -139,7 +140,7 @@ class DeliveryEndpointTests(_Api):
         self.assertEqual(self._reliability("SUP-HSR-03"), 76.9)
 
     def test_requires_api_key(self):
-        r = self.client.post("/api/v1/deliveries", json={
+        r = TestClient(main.app).post("/api/v1/deliveries", json={  # no credentials
             "po_number": "P", "supplier_id": "S", "delivered_at": NOW.isoformat()})
         self.assertEqual(r.status_code, 401)
 
@@ -198,9 +199,10 @@ class ExecuteCreatesPendingOutcomesTests(_Api):
 
     def test_execute_rollback_leaves_no_outcomes(self):
         sim = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 1}, headers=KEY).json()
-        with mock.patch.object(db, "update_rows", return_value=[]):  # order not found -> rolls back
+        with mock.patch.object(db, "update_rows_where", return_value=[]):  # order not found -> rolls back
             with self.assertRaises(db.DatabaseError):
-                main._execute(main.ExecutePlanRequest(run_id=sim["run_id"], playbook_id=sim["recommended_plan_id"]))
+                main._execute(main.ExecutePlanRequest(run_id=sim["run_id"], playbook_id=sim["recommended_plan_id"]),
+                              "dev-owner@example.test")
         self.assertEqual(db.get_delivery_outcomes(), [])
 
     def test_repeat_execute_does_not_duplicate_outcomes(self):

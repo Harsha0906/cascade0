@@ -1,33 +1,43 @@
 """
 CascadeZero — FastAPI server
 
-  GET  /api/v1/state                       factory snapshot (read-only, open)
-  GET  /api/v1/factory                     factory model: vendors + lines (read-only, open)
-  POST /api/v1/simulate-crisis             run the agent graph + solver          [API key]
+  GET  /api/v1/state                       factory snapshot                      [any role]
+  GET  /api/v1/factory                     factory model: vendors + lines        [any role]
+  POST /api/v1/simulate-crisis             run the agent graph + solver          [owner/approver, API key]
   GET  /api/v1/webhooks/whatsapp           Meta verification handshake
   POST /api/v1/webhooks/whatsapp           Meta (HMAC-verified) / Twilio webhook
-  POST /api/v1/ingest/plc-telemetry        line telemetry (HTTP JSON, simulated) [API key]
-  POST /api/v1/ingest/erp-csv              Tally/Excel CSV order upsert          [API key]
-  POST /api/v1/ingest/stock-summary        Tally stock summary CSV               [API key]
-  POST /api/v1/ingest/open-purchase-orders open purchase orders CSV              [API key]
-  POST /api/v1/ingest/sales-order-lines    sales order lines CSV                 [API key]
-  POST /api/v1/ingest/live-highway-check   weather check (labelled when offline)
-  POST /api/v1/execute-plan                execute a server-computed playbook    [API key]
-  POST /api/v1/deliveries                  record a vendor delivery (learns reliability) [API key]
-  GET  /api/v1/deliveries                  delivery outcomes (?status=PENDING|DELIVERED)
-  POST /api/v1/sourcing/start              Sourcing Agent: send vendor enquiries [API key]
-  GET  /api/v1/sourcing/{run_id}           enquiry status + confirmed plan
-  POST /api/v1/sourcing/{run_id}/vendor-reply  record a vendor reply           [API key]
-  POST /api/v1/client/draft                Client Agent: draft an extension request [API key]
-  POST /api/v1/client/approve              human sign-off: send it to the client [API key]
-  POST /api/v1/client/answer               record the client's answer (re-plans) [API key]
-  GET  /api/v1/client/{run_id}             the run's extension request / answer
-  POST /api/v1/reset                       reset demo data                       [API key]
+  POST /api/v1/telegram/webhook            Telegram Bot API updates (secret-token header)
+  POST /api/v1/channels/link-code          one-time code to link a chat to this user [any role]
+  POST /api/v1/ingest/plc-telemetry        line telemetry (HTTP JSON, simulated) [owner/approver, API key]
+  POST /api/v1/ingest/erp-csv              Tally/Excel CSV order upsert          [owner/approver, API key]
+  POST /api/v1/ingest/stock-summary        Tally stock summary CSV               [owner/approver, API key]
+  POST /api/v1/ingest/open-purchase-orders open purchase orders CSV              [owner/approver, API key]
+  POST /api/v1/ingest/sales-order-lines    sales order lines CSV                 [owner/approver, API key]
+  POST /api/v1/ingest/live-highway-check   weather check (labelled when offline) [any role, API key]
+  POST /api/v1/execute-plan                execute a server-computed playbook    [owner/approver]
+  POST /api/v1/deliveries                  record a vendor delivery (learns reliability) [owner/approver]
+  GET  /api/v1/deliveries                  delivery outcomes (?status=PENDING|DELIVERED) [any role]
+  POST /api/v1/sourcing/start              Sourcing Agent: send vendor enquiries [owner/approver]
+  GET  /api/v1/sourcing/{run_id}           enquiry status + confirmed plan       [any role]
+  POST /api/v1/sourcing/{run_id}/vendor-reply  record a vendor reply           [owner/approver]
+  POST /api/v1/client/draft                Client Agent: draft an extension request [owner/approver]
+  POST /api/v1/client/approve              human sign-off: send it to the client [owner/approver]
+  POST /api/v1/client/answer               record the client's answer (re-plans) [owner/approver]
+  GET  /api/v1/client/{run_id}             the run's extension request / answer  [any role]
+  GET  /api/v1/whatsapp/health             WhatsApp configuration check          [owner/approver, API key]
+  POST /api/v1/reset                       reset demo data                       [owner]
 
-Security model: mutating endpoints require the shared operator key in `X-API-Key`
-(set CASCADE_API_KEY). The Next.js middleware injects it server-side so it never reaches
-the browser. This is an operator-level gate, not per-user auth; add Supabase Auth (or SSO)
-before giving access to more than one trusted team.
+Security model (app/auth.py): every route except `/`, `/healthz` and the signature-checked
+WhatsApp / secret-checked Telegram webhooks needs a verified actor: a Supabase user (Authorization: Bearer <access token>)
+with a role in the factory (`factory_members`), or, on automation endpoints only, the machine
+key in X-API-Key.
+
+Tenancy: every endpoint authorises against the factory of the RESOURCE it touches: a run's
+`factory_id` (sourcing sessions, client records and receipts through their run), a delivery
+outcome's or a production line's `factory_id`, or the factory a request names
+(`factory_id` query/body field, default: the caller's own factory). A caller who is not a member
+of that factory gets 404, identical to an unknown resource; a member without the role gets 403. `approved_by` / `entered_by` always come from the verified user, never from
+the request body. AUTH_MODE=dev (offline storage only, never production) accepts X-Dev-User.
 """
 
 from __future__ import annotations
@@ -45,15 +55,25 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import importers, reliability, run_store
+from app import importers, inbound, reliability, run_store
+from app.auth import (
+    ANY_ROLE,
+    OWNER_ONLY,
+    WRITE_ROLES,
+    Actor,
+    machine_actor,
+    require,
+    user_actor,
+)
 from app.agents import client as client_agent
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
+from app.channels import TelegramChannel, WhatsAppChannel
 from app import db
 from app.config import settings
 from app.factory_model import FactoryDataError, load_factory_model
@@ -70,8 +90,10 @@ from app.meta_whatsapp import send_whatsapp_interactive_buttons, send_whatsapp_t
 from app.schemas import (
     DeliveryRecordRequest,
     ErpCsvSyncRequest,
+    ResetRequest,
     ExecutePlanRequest,
     ExecutionReceiptResponse,
+    LinkCodeRequest,
     LiveHighwayCheckRequest,
     PlcTelemetryRequest,
     SimulateCrisisRequest,
@@ -85,34 +107,76 @@ from app.schemas import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("cascadezero.server")
 
+def _docs_kwargs(cfg) -> Dict[str, Any]:
+    """In production the interactive docs and the OpenAPI schema are not served."""
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None} if cfg.is_production else {}
+
+
 app = FastAPI(
     title="CascadeZero API",
     description="Disruption-response copilot: LLM extraction + MILP/Monte Carlo planning with human approval",
     version="2.1.0",
+    **_docs_kwargs(settings),
 )
 
 # ─── Startup security posture ────────────────────────────────────────────────
-_problems = settings.security_problems()
-if settings.is_production and _problems:
-    raise RuntimeError("Refusing to start in production: " + "; ".join(_problems))
-for _p in _problems:
-    logger.warning("SECURITY (dev mode): %s", _p)
+def _enforce_startup_security(cfg) -> None:
+    """Refuse to start on an auth misconfiguration (always) or any security gap (production)."""
+    fatal = cfg.auth_problems()
+    if fatal:
+        raise RuntimeError("Refusing to start: " + "; ".join(fatal))
+    problems = cfg.security_problems()
+    if cfg.is_production and problems:
+        raise RuntimeError("Refusing to start in production: " + "; ".join(problems))
+    for p in problems:
+        logger.warning("SECURITY (dev mode): %s", p)
+    if cfg.AUTH_MODE == "dev":
+        logger.warning("SECURITY (dev mode): AUTH_MODE=dev, X-Dev-User headers are trusted")
+
+
+_enforce_startup_security(settings)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
+# Endpoints that touch no factory resource (configuration checks, weather): a role in the
+# caller's own factory. Everything factory-scoped authorises per resource (helpers below).
+machine_read_access = require(*ANY_ROLE, machine=True)
+machine_write_access = require(*WRITE_ROLES, machine=True)
 
-def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
-    """Shared operator key on mutating endpoints. Open only in dev mode with no key configured."""
-    if not settings.CASCADE_API_KEY:
-        return
-    if not x_api_key or not secrets.compare_digest(x_api_key, settings.CASCADE_API_KEY):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing X-API-Key")
+_RUN_GONE = "Unknown or expired run_id; run the analysis again."
+
+
+def _authorize_resource(actor: Actor, factory_id: Optional[str], roles, not_found: str) -> str:
+    """Authorise against the factory owning a resource. A non-member sees exactly the 404 an
+    unknown resource gives (`not_found`), so a foreign id cannot be told from a missing one."""
+    try:
+        return actor.authorize_resource(factory_id, *roles)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=404, detail=not_found) from None
+        raise
+
+
+def _authorized_run(actor: Actor, run_id: str, roles, not_found: str = _RUN_GONE) -> Dict[str, Any]:
+    """The stored run, after authorising `roles` in the run's own factory. A derived run
+    (sourced / client re-plan) must belong to the same factory as its root."""
+    run = run_store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=not_found)
+    factory_id = run.get("factory_id")
+    parent_id = run.get("parent_run_id")
+    if parent_id:
+        root = run_store.get_run(parent_id)
+        if root is None or root.get("factory_id") != factory_id:
+            raise HTTPException(status_code=404, detail=not_found)
+    _authorize_resource(actor, factory_id, roles, not_found)
+    return run
 
 
 def _run_pipeline(
@@ -123,6 +187,7 @@ def _run_pipeline(
     line_speeds=None,
     order_id=None,
     extra: Optional[Dict[str, Any]] = None,
+    factory_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     result = run_cascade_pipeline(
         raw_message=message,
@@ -131,6 +196,7 @@ def _run_pipeline(
         override_shortfall_units=shortfall,
         override_line_speeds=line_speeds,
         order_id=order_id,
+        factory_id=factory_id,
     )
     result.update(extra or {})   # request context kept with the run (GET /api/v1/runs/{run_id})
     run_store.save_run(result)
@@ -193,8 +259,8 @@ def _startup_migration_check() -> None:
 
 
 @app.get("/api/v1/state")
-def get_state():
-    return get_full_state()
+def get_state(factory_id: Optional[str] = None, actor: Actor = Depends(user_actor)):
+    return get_full_state(actor.authorize(factory_id, *ANY_ROLE))
 
 
 @app.exception_handler(db.DatabaseError)
@@ -216,10 +282,11 @@ def _factory_503(exc: Exception) -> HTTPException:
 
 
 @app.get("/api/v1/factory")
-def get_factory():
+def get_factory(factory_id: Optional[str] = None, actor: Actor = Depends(user_actor)):
     """The factory model the planner uses (vendors + lines), loaded from the database."""
+    fid = actor.authorize(factory_id, *ANY_ROLE)
     try:
-        m = load_factory_model()
+        m = load_factory_model(fid)
     except FactoryDataError as exc:
         raise _factory_503(exc)
     return {
@@ -240,9 +307,9 @@ def get_factory():
 
 
 @app.get("/api/v1/runs/latest")
-def get_latest_run():
-    """Summary of the most recent analysis run (used by the mobile controller to approve it)."""
-    run_id = run_store.latest_run_id()
+def get_latest_run(factory_id: Optional[str] = None, actor: Actor = Depends(user_actor)):
+    """Summary of the factory's most recent analysis run (used by the mobile controller to approve it)."""
+    run_id = run_store.latest_run_id(actor.authorize(factory_id, *ANY_ROLE))
     run = run_store.get_run(run_id) if run_id else None
     if not run:
         return {"run_id": None}
@@ -259,13 +326,11 @@ def get_latest_run():
 
 
 @app.get("/api/v1/runs/{run_id}")
-def get_run_by_id(run_id: str):
+def get_run_by_id(run_id: str, actor: Actor = Depends(user_actor)):
     """A stored run in the simulate-crisis response shape, so the dashboard can restore the latest
     run after a reload; plus its root run id (for the Sourcing and Client panels) and whether it
     was executed."""
-    run = run_store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"Unknown run {run_id}")
+    run = _authorized_run(actor, run_id, ANY_ROLE, not_found=f"Unknown run {run_id}")
     root_id = run.get("parent_run_id") or run_id
     return {
         **_run_response(run),
@@ -278,14 +343,15 @@ def get_run_by_id(run_id: str):
 # ─── 2. Crisis simulation ────────────────────────────────────────────────────
 
 @app.get("/api/v1/scenarios")
-def list_scenarios():
-    """Preset disruption scenarios of the default factory (read-only)."""
+def list_scenarios(factory_id: Optional[str] = None, actor: Actor = Depends(user_actor)):
+    """Preset disruption scenarios of the caller's factory (read-only)."""
+    fid = actor.authorize(factory_id, *ANY_ROLE)
     return [
         {k: row.get(k) for k in (
             "scenario_id", "title", "summary", "raw_message",
             "delay_hours", "shortfall_units", "line_speeds", "order_id",
         )}
-        for row in db.get_scenarios(settings.DEFAULT_FACTORY_ID)
+        for row in db.get_scenarios(fid)
     ]
 
 
@@ -335,9 +401,10 @@ def _run_response(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-@app.post("/api/v1/simulate-crisis", dependencies=[Depends(require_api_key)])
-def simulate_crisis(req: SimulateCrisisRequest):
-    scenarios = {r["scenario_id"]: r for r in db.get_scenarios(settings.DEFAULT_FACTORY_ID)}
+@app.post("/api/v1/simulate-crisis")
+def simulate_crisis(req: SimulateCrisisRequest, actor: Actor = Depends(machine_actor)):
+    factory_id = actor.authorize(req.factory_id, *WRITE_ROLES)
+    scenarios = {r["scenario_id"]: r for r in db.get_scenarios(factory_id)}
     if req.scenario_id is not None and req.scenario_id not in scenarios:
         raise HTTPException(status_code=404, detail=f"Unknown scenario_id {req.scenario_id}")
 
@@ -370,7 +437,8 @@ def simulate_crisis(req: SimulateCrisisRequest):
     try:
         overridden = any(v is not None for v in (delay, shortfall, line_speeds))
         result = _run_pipeline(message, req.source_channel, delay, shortfall, line_speeds, order_id,
-                               extra={"scenario_id": req.scenario_id, "overridden_by_preset_or_slider": overridden})
+                               extra={"scenario_id": req.scenario_id, "overridden_by_preset_or_slider": overridden},
+                               factory_id=factory_id)
     except SolverInputError as exc:
         raise HTTPException(status_code=422, detail=f"Cannot plan for these inputs: {exc}")
     except FactoryDataError as exc:
@@ -383,170 +451,45 @@ def simulate_crisis(req: SimulateCrisisRequest):
 
 def _verify_meta_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
     if not settings.META_APP_SECRET:
-        return not settings.is_production  # dev mode without a secret: accept (warned at startup)
+        # Unsigned payloads only against offline (in-memory) storage in development; with a live
+        # database they are refused, since an approval here would execute without a verified actor.
+        return settings.storage_mode == "offline" and not settings.is_production
     if not signature_header or not signature_header.startswith("sha256="):
         return False
     expected = hmac.new(settings.META_APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature_header.split("=", 1)[1])
 
 
-def _is_approver(number: str) -> bool:
-    if not settings.WA_APPROVER_NUMBERS:
-        # No allowlist configured: approvals over WhatsApp are disabled rather than open to anyone.
-        return False
-    return number.lstrip("+") in settings.WA_APPROVER_NUMBERS
+# The chat flow itself (dedupe, /link, status, vendor replies, alerts, approvals) is shared by
+# every channel: app/inbound.py. These are kept here for the Twilio sandbox and existing callers.
+_status_text = inbound.status_text
+_winner_summary = inbound.winner_summary
 
 
-def _status_text() -> str:
-    state = get_full_state()
-    lines = [
-        f"• {l.get('name', l['line_id'])}: {l.get('status', '?')} "
-        f"({l.get('speed_pct', '?')}% speed, {l.get('temp_celsius', '?')}°C)"
-        for l in state["production_lines"] if l.get("status") != "NORMAL"
-    ]
-    orders = [
-        f"• Order #{o['order_id']} ({o.get('client', '')}): {o['status']}, "
-        f"SLA penalty exposure ₹{o.get('sla_penalty_inr', 0):,}"
-        for o in state["orders"] if o.get("status") != "ON_TRACK"
-    ]
-    if not lines and not orders:
-        return "🏭 *PLANT STATUS*\nAll lines normal; all orders on track."
-    return "🏭 *PLANT STATUS*\n" + "\n".join(lines + orders)
-
-
-def _winner_summary(result: Dict[str, Any]) -> str:
-    winner = next(p for p in result["playbooks"] if p["id"] == result["recommended_plan_id"])
-    penalty = result.get("blast_radius", {}).get("sla_penalty_inr", 0)
-    mode = result.get("ai_mode", {}).get("overall", "fallback")
-    return (
-        f"🚨 *CASCADEZERO RECOVERY PLAN* ({result['run_id']})\n"
-        f"• Order #{result['order_id']} — ₹{penalty:,} SLA exposure\n"
-        f"• Shortfall: {result['shortfall_units']} {result['factory_model'].stock_item_name} (+{result['delay_hours']}h delay)\n\n"
-        f"⚖️ *Recommended: {winner['id']}* — {winner['name']}\n"
-        f"• Cost: ₹{winner['total_mitigation_cost_inr']:,}\n"
-        f"• Modelled P(on-time): {winner['confidence_pct']}%\n"
-        f"• Expected cost incl. risk: ₹{winner['expected_cost_inr']:,}\n"
-        f"_Numbers from MILP + Monte Carlo; narration mode: {mode}._"
+def _whatsapp_channel() -> WhatsAppChannel:
+    """The WhatsApp adapter. The send helpers are bound late (looked up on this module at call
+    time), so a patched `main.send_whatsapp_text` is what the adapter calls."""
+    return WhatsAppChannel(
+        send_text=lambda to, text: send_whatsapp_text(to, text),
+        send_buttons=lambda to, text, buttons, header=None, footer=None:
+            send_whatsapp_interactive_buttons(to, text, buttons, header, footer),
     )
+
+
+def _telegram_channel() -> TelegramChannel:
+    return TelegramChannel(settings.TELEGRAM_BOT_TOKEN)
 
 
 async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        changes = payload["entry"][0]["changes"][0]["value"]
+        payload["entry"][0]["changes"][0]["value"]
     except (KeyError, IndexError, TypeError):
         return {"status": "ignored"}
-    messages = changes.get("messages", [])
+    channel = _whatsapp_channel()
+    messages = channel.parse_inbound(payload)   # delivery/read receipts are logged, yield nothing
     if not messages:
-        # Delivery/read receipts. Log failures so undelivered replies are visible.
-        for st in changes.get("statuses", []):
-            errors = st.get("errors") or []
-            if st.get("status") == "failed" or errors:
-                for e in errors or [{}]:
-                    logger.error("WhatsApp delivery FAILED to %s: code %s %s — %s",
-                                 st.get("recipient_id"), e.get("code"), e.get("title"),
-                                 (e.get("error_data") or {}).get("details", e.get("message", "")))
-            else:
-                logger.info("WhatsApp message %s to %s", st.get("status"), st.get("recipient_id"))
         return {"status": "ok"}
-
-    msg = messages[0]
-    sender = msg.get("from", "")
-
-    # De-duplicate Meta retries/redeliveries. The id is recorded before processing so a replayed
-    # approval or vendor reply can never run twice. If processing then fails unexpectedly (database
-    # error or any other exception) the id is released again and the error re-raised (503/500), so
-    # Meta's retry is processed rather than dropped as a duplicate. Handled outcomes (replies already
-    # sent, including error replies) keep the id recorded.
-    message_id = msg.get("id")
-    if message_id and not await run_in_threadpool(db.record_webhook_event, str(message_id)):
-        logger.info("Duplicate WhatsApp message %s ignored", message_id)
-        return {"status": "duplicate"}
-
-    try:
-        return await _process_meta_message(msg, sender)
-    except Exception:
-        if message_id:
-            try:
-                await run_in_threadpool(db.release_webhook_event, str(message_id))
-            except Exception:
-                logger.exception("Could not release webhook event %s after a processing failure", message_id)
-        raise
-
-
-async def _process_meta_message(msg: Dict[str, Any], sender: str) -> Dict[str, Any]:
-    if msg.get("type") == "interactive":
-        button_id = msg.get("interactive", {}).get("button_reply", {}).get("id", "")
-        if button_id.startswith("APPROVE:"):
-            run_id, _, playbook_id = button_id[len("APPROVE:"):].partition(":")
-            if not _is_approver(sender):
-                logger.warning("Rejected WhatsApp approval from non-allowlisted number %s", sender)
-                await run_in_threadpool(send_whatsapp_text, sender, "⛔ This number is not authorised to approve plans.")
-                return {"status": "forbidden"}
-            try:
-                receipt = await run_in_threadpool(
-                    _execute, ExecutePlanRequest(run_id=run_id, playbook_id=playbook_id, approved_by=f"whatsapp:{sender}")
-                )
-            except HTTPException as exc:
-                await run_in_threadpool(send_whatsapp_text, sender, f"⚠️ Could not execute: {exc.detail}")
-                return {"status": "error", "detail": exc.detail}
-            await run_in_threadpool(
-                send_whatsapp_text, sender,
-                f"✅ *APPROVED* {receipt.playbook_id} for run {receipt.run_id}\n"
-                f"• Draft PO: {receipt.po_number}\n• Cost: ₹{receipt.total_cost_inr:,}\n"
-                f"• Modelled P(on-time): {receipt.confidence_pct}%\n"
-                f"Drafts generated; send POs/notices through your normal channels.",
-            )
-            return {"status": "success", "action": "plan_executed"}
-        if button_id == "VIEW_STATUS":
-            await run_in_threadpool(send_whatsapp_text, sender, await run_in_threadpool(_status_text))
-            return {"status": "success", "action": "status_sent"}
-        return {"status": "ignored"}
-
-    body_text = msg.get("text", {}).get("body", "").strip()
-    if not body_text:
-        return {"status": "ignored"}
-
-    open_rfq = await run_in_threadpool(sourcing.find_open_rfq_by_number, sender)
-    if open_rfq:
-        run_id, supplier_id = open_rfq
-        try:
-            await run_in_threadpool(sourcing.record_reply, run_id, supplier_id, body_text, f"whatsapp:{sender}")
-        except (FactoryDataError, db.DatabaseError, sourcing.SourcingError) as exc:
-            logger.error("Vendor reply from %s could not be processed: %s", sender, exc)
-            await run_in_threadpool(
-                send_whatsapp_text, sender,
-                "⚠️ We could not process your reply right now. Please contact the plant team directly.",
-            )
-            return {"status": "error", "detail": str(exc), "run_id": run_id}
-        await run_in_threadpool(send_whatsapp_text, sender, "🙏 Thank you — your reply has been recorded. This is not yet a purchase order.")
-        return {"status": "success", "action": "vendor_reply_recorded", "run_id": run_id}
-    if body_text.lower() in ("status", "plant", "check"):
-        await run_in_threadpool(send_whatsapp_text, sender, await run_in_threadpool(_status_text))
-        return {"status": "ok"}
-
-    try:
-        result = await run_in_threadpool(_run_pipeline, body_text, "META_WHATSAPP_CLOUD_API")
-    except (FactoryDataError, db.DatabaseError) as exc:
-        logger.error("WhatsApp pipeline failed, factory data/database unavailable: %s", exc)
-        await run_in_threadpool(send_whatsapp_text, sender, _MISCONFIGURED_REPLY)
-        return {"status": "error", "detail": "Factory data invalid (details in server log)"}
-    except SolverInputError as exc:
-        logger.warning("WhatsApp pipeline rejected inputs: %s", exc)
-        await run_in_threadpool(send_whatsapp_text, sender, f"⚠️ Cannot plan for these inputs: {exc}")
-        return {"status": "error", "detail": str(exc)}
-    winner_id = result["recommended_plan_id"]
-    await run_in_threadpool(
-        send_whatsapp_interactive_buttons,
-        sender,
-        _winner_summary(result),
-        [
-            {"id": f"APPROVE:{result['run_id']}:{winner_id}", "title": f"Approve {winner_id}"},
-            {"id": "VIEW_STATUS", "title": "Plant status"},
-        ],
-        "Disruption detected",
-        "Approval requires an authorised number",
-    )
-    return {"status": "success", "run_id": result["run_id"]}
+    return await inbound.handle(channel, messages[0])
 
 
 @app.get("/api/v1/webhooks/whatsapp")
@@ -582,9 +525,10 @@ async def whatsapp_webhook(request: Request):
             return {"status": "ignored"}
         return await _handle_meta_payload(payload)
 
-    # Twilio sandbox (form-encoded). Read-only: it can run analysis but never approve execution.
-    if settings.is_production:
-        raise HTTPException(status_code=403, detail="Twilio sandbox webhook disabled in production")
+    # Twilio sandbox (form-encoded, unsigned). Offline development only: it runs analysis
+    # anonymously (never approves), so it is not served with a live database or in production.
+    if settings.is_production or settings.storage_mode != "offline":
+        raise HTTPException(status_code=404, detail="Not Found")
     form = await request.form()
     body_text = str(form.get("Body", "")).strip()
     sender = str(form.get("From", "")).strip()
@@ -607,7 +551,7 @@ async def whatsapp_webhook(request: Request):
     return Response(content=twiml, media_type="text/xml")
 
 
-@app.get("/api/v1/whatsapp/health", dependencies=[Depends(require_api_key)])
+@app.get("/api/v1/whatsapp/health", dependencies=[Depends(machine_write_access)])
 def whatsapp_health():
     """Verify token, phone number, app secret and webhook subscription. Never returns secrets."""
     from app.whatsapp_health import check_whatsapp_health
@@ -615,12 +559,48 @@ def whatsapp_health():
     return check_whatsapp_health()
 
 
+# ─── 3b. Telegram webhook and chat linking ─────────────────────────────────────
+
+@app.post("/api/v1/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Telegram Bot API updates. Telegram echoes the setWebhook `secret_token` in
+    X-Telegram-Bot-Api-Secret-Token; without TELEGRAM_WEBHOOK_SECRET every update is refused."""
+    expected = settings.TELEGRAM_WEBHOOK_SECRET
+    given = request.headers.get("x-telegram-bot-api-secret-token") or ""
+    if not expected or not secrets.compare_digest(given.encode(), expected.encode()):
+        logger.warning("Rejected Telegram webhook with a missing or wrong secret token")
+        raise HTTPException(status_code=401, detail="Invalid secret token")
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    channel = _telegram_channel()
+    # parse_inbound answers a button's callback query (a Bot API call): off the event loop.
+    messages = await run_in_threadpool(channel.parse_inbound, payload)
+    if not messages:
+        return {"status": "ignored"}
+    return await inbound.handle(channel, messages[0])
+
+
+@app.post("/api/v1/channels/link-code")
+def create_channel_link_code(req: Optional[LinkCodeRequest] = None, actor: Actor = Depends(user_actor)):
+    """A one-time code (15 min) that links a WhatsApp/Telegram chat to the signed-in user for one
+    factory: send `/link <code>` to the bot. Any role may link; approvals still need owner/approver."""
+    factory_id = actor.authorize((req or LinkCodeRequest()).factory_id, *ANY_ROLE)
+    if not actor.user_id:
+        raise HTTPException(status_code=403, detail="Linking a chat needs a signed-in user")
+    return inbound.create_link_code(actor.user_id, factory_id)
+
+
 # ─── 4. Telemetry (simulated PLC over HTTP) ──────────────────────────────────
 
-@app.post("/api/v1/ingest/plc-telemetry", dependencies=[Depends(require_api_key)])
-def ingest_plc_telemetry(telemetry: PlcTelemetryRequest):
-    if db.get_production_line(telemetry.line_id) is None:
-        raise HTTPException(status_code=404, detail=f"Unknown line_id {telemetry.line_id}")
+@app.post("/api/v1/ingest/plc-telemetry")
+def ingest_plc_telemetry(telemetry: PlcTelemetryRequest, actor: Actor = Depends(machine_actor)):
+    unknown = f"Unknown line_id {telemetry.line_id}"
+    line = db.get_production_line(telemetry.line_id)
+    if line is None:
+        raise HTTPException(status_code=404, detail=unknown)
+    _authorize_resource(actor, line.get("factory_id"), WRITE_ROLES, unknown)
     update_rows("production_lines", "line_id", telemetry.line_id, {
         "speed_pct": telemetry.speed_pct,
         "temp_celsius": telemetry.temp_celsius,
@@ -650,8 +630,8 @@ def _int_field(row: Dict[str, str], key: str, default: Optional[int] = None) -> 
 DEFAULT_ORDER_PRIORITY = 100
 
 
-@app.post("/api/v1/ingest/erp-csv", dependencies=[Depends(require_api_key)])
-def ingest_erp_csv(payload: ErpCsvSyncRequest):
+@app.post("/api/v1/ingest/erp-csv")
+def ingest_erp_csv(payload: ErpCsvSyncRequest, actor: Actor = Depends(machine_actor)):
     """Upsert orders from a Tally/Excel CSV export. New orders are inserted, existing ones updated.
 
     required_qty and sla_penalty_inr are always required; partial_delay_penalty_inr and a deadline
@@ -660,6 +640,7 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
     `priority` is optional (lower ranks first); a new order without it gets DEFAULT_ORDER_PRIORITY.
     Updates never overwrite the order's status or shortfall_units.
     """
+    factory_id = actor.authorize(payload.factory_id, *WRITE_ROLES)
     if not payload.csv_content.strip():
         raise HTTPException(status_code=400, detail="Empty CSV content")
 
@@ -673,11 +654,14 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
             continue
         try:
             existing = db.get_order(order_id)
+            if existing is not None and existing.get("factory_id") != factory_id:
+                # Order ids are global keys: never overwrite (or move) another factory's order.
+                raise ValueError(f"order_id {order_id} cannot be used by this factory") from None
             record = {
                 "order_id": order_id,
                 "required_qty": _int_field(row, "required_qty"),
                 "sla_penalty_inr": _int_field(row, "sla_penalty_inr"),
-                "factory_id": settings.DEFAULT_FACTORY_ID,
+                "factory_id": factory_id,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             if existing is None or (row.get("partial_delay_penalty_inr") or "").strip():
@@ -705,7 +689,10 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest):
             if existing is None:
                 record["status"] = "ON_TRACK"
                 record["shortfall_units"] = 0
-            upsert_row("orders", record)
+            try:   # conditional write: closes the race between the check above and this write
+                db.upsert_owned("orders", record, ("order_id",))
+            except db.OwnershipConflict:
+                raise ValueError(f"order_id {order_id} cannot be used by this factory") from None
             imported.append(order_id)
         except ValueError as exc:
             errors.append({"line": line_no, "order_id": order_id, "error": str(exc)})
@@ -744,16 +731,16 @@ def _snapshot_warning(text: str) -> Dict[str, Any]:
     return {"line": None, "warning": text}
 
 
-@app.post("/api/v1/ingest/stock-summary", dependencies=[Depends(require_api_key)])
-def ingest_stock_summary(payload: ErpCsvSyncRequest):
+@app.post("/api/v1/ingest/stock-summary")
+def ingest_stock_summary(payload: ErpCsvSyncRequest, actor: Actor = Depends(machine_actor)):
     """Replace on-hand stock from a Tally Stock Summary export (creates items with new codes).
 
     The file is a full snapshot of the factory's stock: an item of the factory it does not mention
     is set to on_hand_qty 0 (Tally hides zero-balance items; reported in warnings). An item on a
     row with an error is left unchanged.
     """
+    factory_id = actor.authorize(payload.factory_id, *WRITE_ROLES)
     _require_csv(payload)
-    factory_id = settings.DEFAULT_FACTORY_ID
     result = importers.parse_stock_summary(payload.csv_content, factory_id, _factory_item_codes(factory_id))
     # Every item of the factory (with or without a stock row) is covered by the snapshot.
     before = (_factory_item_codes(factory_id) | set(db.get_stock_levels(factory_id))
@@ -771,15 +758,15 @@ def ingest_stock_summary(payload: ErpCsvSyncRequest):
     return _import_response(payload, result)
 
 
-@app.post("/api/v1/ingest/open-purchase-orders", dependencies=[Depends(require_api_key)])
-def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
+@app.post("/api/v1/ingest/open-purchase-orders")
+def ingest_open_purchase_orders(payload: ErpCsvSyncRequest, actor: Actor = Depends(machine_actor)):
     """Import open inbound shipments from a pending purchase orders export (dates are IST).
 
     The file is a full snapshot of the factory's pending POs: an OPEN shipment it does not
     mention is marked CLOSED (received or cancelled) and listed in warnings.
     """
+    factory_id = actor.authorize(payload.factory_id, *WRITE_ROLES)
     _require_csv(payload)
-    factory_id = settings.DEFAULT_FACTORY_ID
     suppliers = {s["id"] for s in db.get_all_suppliers()
                  if s.get("factory_id") == factory_id}
     result = importers.parse_open_purchase_orders(
@@ -789,8 +776,12 @@ def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
     )
     before = ({s["shipment_id"] for s in db.get_inbound_shipments(factory_id)}
               if result.header_ok else set())
-    for row in result.rows:
-        upsert_row("inbound_shipments", row, key_columns=("shipment_id",))
+    for row in list(result.rows):
+        try:   # conditional write: never overwrites another factory's shipment with this PO number
+            db.upsert_owned("inbound_shipments", row, ("shipment_id",))
+        except db.OwnershipConflict:
+            result.rows.remove(row)
+            result.errors.append({"line": None, "error": f"PO number {row['shipment_id']} belongs to another factory"})
     closed = sorted(before - result.mentioned)
     for sid in closed:
         db.update_rows_where("inbound_shipments", {"shipment_id": sid, "factory_id": factory_id},
@@ -802,23 +793,28 @@ def ingest_open_purchase_orders(payload: ErpCsvSyncRequest):
     return _import_response(payload, result)
 
 
-@app.post("/api/v1/ingest/sales-order-lines", dependencies=[Depends(require_api_key)])
-def ingest_sales_order_lines(payload: ErpCsvSyncRequest):
+@app.post("/api/v1/ingest/sales-order-lines")
+def ingest_sales_order_lines(payload: ErpCsvSyncRequest, actor: Actor = Depends(machine_actor)):
     """Import order lines (item quantities per sales order) from a sales order export.
 
     For every order the file lists, the file replaces that order's lines: a line of that order
     the file does not mention is removed (reported in warnings). Other orders are untouched.
     """
+    factory_id = actor.authorize(payload.factory_id, *WRITE_ROLES)
     _require_csv(payload)
-    factory_id = settings.DEFAULT_FACTORY_ID
     orders = {o["order_id"] for o in db.get_all_orders() if o.get("factory_id") == factory_id}
     result = importers.parse_sales_order_lines(payload.csv_content, orders, _factory_item_codes(factory_id))
     in_file = sorted({oid for oid, _ in result.mentioned}) if result.header_ok else []
     stale = [l for l in db.get_order_lines(in_file) if (l["order_id"], l["item_code"]) not in result.mentioned]
-    for row in result.rows:
-        upsert_row("order_lines", row, key_columns=("order_id", "item_code"))
+    for row in list(result.rows):
+        try:
+            db.upsert_owned("order_lines", {**row, "factory_id": factory_id}, ("order_id", "item_code"))
+        except db.OwnershipConflict:
+            result.rows.remove(row)
+            result.errors.append({"line": None, "error": f"order {row['order_id']} cannot be used by this factory"})
     for line in stale:
-        db.delete_rows_where("order_lines", {"order_id": line["order_id"], "item_code": line["item_code"]})
+        db.delete_rows_where("order_lines", {"order_id": line["order_id"], "item_code": line["item_code"],
+                                             "factory_id": factory_id})
         result.warnings.append(_snapshot_warning(
             f"order {line['order_id']} line for item {line['item_code']} is not in this file: removed "
             f"(the file replaces all lines of each order it lists)"))
@@ -827,7 +823,7 @@ def ingest_sales_order_lines(payload: ErpCsvSyncRequest):
 
 # ─── 6. Highway weather ──────────────────────────────────────────────────────
 
-@app.post("/api/v1/ingest/live-highway-check")
+@app.post("/api/v1/ingest/live-highway-check", dependencies=[Depends(machine_read_access)])
 def live_highway_check(req: LiveHighwayCheckRequest):
     if settings.has_weather:
         try:
@@ -866,10 +862,20 @@ def live_highway_check(req: LiveHighwayCheckRequest):
 
 # ─── 7. Plan execution (human-approved, server-computed) ─────────────────────
 
-def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
-    run = run_store.get_run(req.run_id)
+_EXECUTE_RUN_GONE = "Unknown or expired run_id; run the simulation again."
+
+
+def _execute(req: ExecutePlanRequest, approved_by: str,
+             run: Optional[Dict[str, Any]] = None) -> ExecutionReceiptResponse:
+    """Execute a playbook. `approved_by` is the verified approver (never taken from a request body);
+    `run` is the run already authorised by the caller (looked up here when not given)."""
     if run is None:
-        raise HTTPException(status_code=404, detail="Unknown or expired run_id; run the simulation again.")
+        run = run_store.get_run(req.run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=_EXECUTE_RUN_GONE)
+    factory_id = run.get("factory_id")
+    if not factory_id:
+        raise HTTPException(status_code=404, detail=_EXECUTE_RUN_GONE)   # fail closed: no tenant
     playbook = next((p for p in run["playbooks"] if p["id"] == req.playbook_id), None)
     if playbook is None:
         raise HTTPException(status_code=404, detail=f"Playbook {req.playbook_id} not in run {req.run_id}")
@@ -913,8 +919,9 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         "shift_broadcast_msg": playbook["shift_broadcast_msg"],
         "client_sla_notice": playbook["client_sla_notice"],
         "status": "APPROVED_DRAFT",
-        "approved_by": req.approved_by,
+        "approved_by": approved_by,
         "run_id": req.run_id,
+        "factory_id": factory_id,
         "created_at": now,
     }
     new_order_status = {
@@ -930,7 +937,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
     # vendor itself promised: the ETA it confirmed to the Sourcing Agent, else its own (unshifted)
     # lead time from the live factory model; never the run's risk-shifted planning lead.
     # Recorded deliveries later move the vendor's learned reliability (POST /api/v1/deliveries).
-    outcome_factory = run.get("factory_id") or settings.DEFAULT_FACTORY_ID
+    outcome_factory = factory_id
     promised_lead = _promised_leads(root_id, outcome_factory)
     executed_at = datetime.fromisoformat(now)
     outcomes = [
@@ -943,12 +950,12 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         for a in playbook["vendor_allocations"] if a["units_allocated"] > 0
     ]
     agent_log = {
-        "run_id": req.run_id, "step_order": 10,
+        "run_id": req.run_id, "factory_id": factory_id, "step_order": 10,
         "agent_name": "Human Approver", "agent_role": "HITL Execution", "badge_color": "emerald",
         "tool_called": "commit_purchase_order()",
-        "tool_output_summary": f"PO {po_number} approved by {req.approved_by}; order #{order_id} → {new_order_status}.",
+        "tool_output_summary": f"PO {po_number} approved by {approved_by}; order #{order_id} → {new_order_status}.",
         "message": (
-            f"✅ {playbook['id']} approved by {req.approved_by}. Draft Tally PO {po_number}, "
+            f"✅ {playbook['id']} approved by {approved_by}. Draft Tally PO {po_number}, "
             f"shift notice ({playbook['overtime_hours']}h) and client notice generated. "
             f"Nothing has been sent to suppliers automatically."
         ),
@@ -960,7 +967,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         po_number=po_number,
         playbook_id=playbook["id"],
         order_id=order_id,
-        approved_by=req.approved_by,
+        approved_by=approved_by,
         total_cost_inr=playbook["total_mitigation_cost_inr"],
         net_sla_saved_inr=playbook["net_sla_saved_inr"],
         confidence_pct=playbook["confidence_pct"],
@@ -969,7 +976,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
             "voucher_type": "Purchase Order",
             "po_number": po_number,
             "date": datetime.now().strftime("%Y-%m-%d"),
-            "company": default_factory_name(),
+            "company": getattr(run.get("factory_model"), "name", None) or factory_id,
             "total_cost_inr": playbook["total_mitigation_cost_inr"],
             "allocations": playbook["vendor_allocations"],
             "overtime_hours": playbook["overtime_hours"],
@@ -1009,22 +1016,26 @@ def _promised_leads(root_id: str, factory_id: str) -> Dict[str, float]:
     return leads
 
 
-@app.post("/api/v1/execute-plan", dependencies=[Depends(require_api_key)])
-def execute_plan(req: ExecutePlanRequest):
-    logger.info("Executing %s from run %s (approved_by=%s)", req.playbook_id, req.run_id, req.approved_by)
-    return _execute(req)
+@app.post("/api/v1/execute-plan")
+def execute_plan(req: ExecutePlanRequest, actor: Actor = Depends(user_actor)):
+    run = _authorized_run(actor, req.run_id, WRITE_ROLES, not_found=_EXECUTE_RUN_GONE)
+    approved_by = actor.approver_name
+    logger.info("Executing %s from run %s (approved_by=%s)", req.playbook_id, req.run_id, approved_by)
+    return _execute(req, approved_by, run)
 
 
 # ─── 7b. Delivery outcomes (vendor reliability is learned from these) ────────
 
-@app.post("/api/v1/deliveries", dependencies=[Depends(require_api_key)])
-def record_delivery(req: DeliveryRecordRequest):
+@app.post("/api/v1/deliveries")
+def record_delivery(req: DeliveryRecordRequest, actor: Actor = Depends(user_actor)):
     """Record that a purchase-order line was delivered. Moves the vendor's learned reliability."""
+    unknown = f"No delivery outcome for PO {req.po_number} / supplier {req.supplier_id}"
     matches = [o for o in db.get_delivery_outcomes(supplier_id=req.supplier_id)
                if o["po_number"] == req.po_number]
     if not matches:
-        raise HTTPException(status_code=404, detail=f"No delivery outcome for PO {req.po_number} / supplier {req.supplier_id}")
+        raise HTTPException(status_code=404, detail=unknown)
     outcome = matches[0]
+    factory_id = _authorize_resource(actor, outcome.get("factory_id"), WRITE_ROLES, unknown)
     if outcome["status"] == "DELIVERED":
         raise HTTPException(status_code=409, detail="This delivery was already recorded.")
     if reliability.in_the_future(req.delivered_at):
@@ -1039,14 +1050,16 @@ def record_delivery(req: DeliveryRecordRequest):
         )
     updated = db.update_rows_where(
         "delivery_outcomes",
-        {"po_number": req.po_number, "supplier_id": req.supplier_id, "status": "PENDING"},
-        {"status": "DELIVERED", "delivered_at": reliability.parse_timestamp(req.delivered_at).isoformat()},
+        {"po_number": req.po_number, "supplier_id": req.supplier_id, "status": "PENDING",
+         "factory_id": factory_id},
+        {"status": "DELIVERED", "delivered_at": reliability.parse_timestamp(req.delivered_at).isoformat(),
+         "recorded_by": actor.approver_name},
     )
     if not updated:  # lost a race with another recording
         raise HTTPException(status_code=409, detail="This delivery was already recorded.")
     row = updated[0]
     try:
-        vendor = next((v for v in load_factory_model(outcome.get("factory_id")).vendors
+        vendor = next((v for v in load_factory_model(factory_id).vendors
                        if v.supplier_id == req.supplier_id), None)
     except FactoryDataError as exc:
         raise _factory_503(exc)
@@ -1058,11 +1071,13 @@ def record_delivery(req: DeliveryRecordRequest):
 
 
 @app.get("/api/v1/deliveries")
-def list_deliveries(status: Optional[str] = None):
-    """Delivery outcomes, newest facts first by id order; filter with ?status=PENDING or DELIVERED."""
+def list_deliveries(status: Optional[str] = None, factory_id: Optional[str] = None,
+                    actor: Actor = Depends(user_actor)):
+    """The factory's delivery outcomes, by id order; filter with ?status=PENDING or DELIVERED."""
+    fid = actor.authorize(factory_id, *ANY_ROLE)
     if status is not None and status not in ("PENDING", "DELIVERED"):
         raise HTTPException(status_code=422, detail="status must be PENDING or DELIVERED")
-    return {"outcomes": db.get_delivery_outcomes(status=status)}
+    return {"outcomes": db.get_delivery_outcomes(status=status, factory_id=fid)}
 
 
 # ─── 8. Sourcing Agent (confirm vendor offers before approval) ───────────────
@@ -1076,22 +1091,29 @@ def _sourcing_call(fn, *args):
         raise _factory_503(exc)
 
 
-@app.post("/api/v1/sourcing/start", dependencies=[Depends(require_api_key)])
-def start_sourcing(req: SourcingStartRequest):
+_NO_SESSION = "No sourcing session for this run."
+
+
+@app.post("/api/v1/sourcing/start")
+def start_sourcing(req: SourcingStartRequest, actor: Actor = Depends(user_actor)):
     """Send enquiries to the vendors in a plan and start the confirm → re-plan loop."""
+    _authorized_run(actor, req.run_id, WRITE_ROLES)
     return _sourcing_call(sourcing.start_sourcing, req.run_id, req.playbook_id)
 
 
 @app.get("/api/v1/sourcing/{run_id}")
-def get_sourcing(run_id: str):
+def get_sourcing(run_id: str, actor: Actor = Depends(user_actor)):
     """Current enquiries, offers and (when finished) the confirmed plan. Also expires timed-out enquiries."""
+    _authorized_run(actor, run_id, ANY_ROLE, not_found=_NO_SESSION)
     return _sourcing_call(sourcing.view, run_id)
 
 
-@app.post("/api/v1/sourcing/{run_id}/vendor-reply", dependencies=[Depends(require_api_key)])
-def post_vendor_reply(run_id: str, req: SourcingReplyRequest):
+@app.post("/api/v1/sourcing/{run_id}/vendor-reply")
+def post_vendor_reply(run_id: str, req: SourcingReplyRequest, actor: Actor = Depends(user_actor)):
     """Record a vendor's reply typed by an operator (phone call) or, in simulated mode, a simulated vendor."""
-    return _sourcing_call(sourcing.record_reply, run_id, req.supplier_id, req.text, f"operator:{req.entered_by}")
+    _authorized_run(actor, run_id, WRITE_ROLES, not_found=_NO_SESSION)
+    return _sourcing_call(sourcing.record_reply, run_id, req.supplier_id, req.text,
+                          f"operator:{actor.approver_name}")
 
 
 # ─── 8b. Client Agent (deadline extension; human sign-off before sending) ──
@@ -1109,38 +1131,47 @@ def _client_call(fn, *args, **kwargs):
         raise _factory_503(exc)
 
 
-@app.post("/api/v1/client/draft", dependencies=[Depends(require_api_key)])
-def client_draft(req: ClientDraftRequest):
+@app.post("/api/v1/client/draft")
+def client_draft(req: ClientDraftRequest, actor: Actor = Depends(user_actor)):
     """Draft a deadline-extension request for the run's order. Nothing is sent."""
+    _authorized_run(actor, req.run_id, WRITE_ROLES)
     return _client_call(client_agent.draft_extension, req.run_id, req.extension_hours, req.reason)
 
 
-@app.post("/api/v1/client/approve", dependencies=[Depends(require_api_key)])
-def client_approve(req: ClientApproveRequest):
-    """A named person approves the draft; only then is it sent (SOURCING_MODE channel)."""
-    return _client_call(client_agent.approve_extension, req.run_id, req.approved_by)
+@app.post("/api/v1/client/approve")
+def client_approve(req: ClientApproveRequest, actor: Actor = Depends(user_actor)):
+    """The signed-in user approves the draft; only then is it sent (SOURCING_MODE channel)."""
+    _authorized_run(actor, req.run_id, WRITE_ROLES)
+    return _client_call(client_agent.approve_extension, req.run_id, actor.approver_name)
 
 
-@app.post("/api/v1/client/answer", dependencies=[Depends(require_api_key)])
-def client_answer(req: ClientAnswerRequest):
+@app.post("/api/v1/client/answer")
+def client_answer(req: ClientAnswerRequest, actor: Actor = Depends(user_actor)):
     """Record the client's answer: extends the deadline (accepted), re-plans and restarts sourcing."""
+    _authorized_run(actor, req.run_id, WRITE_ROLES)
     return _client_call(client_agent.record_client_answer, req.run_id, req.accepted, req.text,
-                        req.new_deadline_hours, f"operator:{req.entered_by}")
+                        req.new_deadline_hours, f"operator:{actor.approver_name}")
 
 
 @app.get("/api/v1/client/{run_id}")
-def get_client(run_id: str):
+def get_client(run_id: str, actor: Actor = Depends(user_actor)):
     """The run's extension request: draft, sent message, answer and re-plan."""
+    _authorized_run(actor, run_id, ANY_ROLE)
     return _client_call(client_agent.view, run_id)
 
 
 # ─── 9. Reset ────────────────────────────────────────────────────────────────
 
-@app.post("/api/v1/reset", dependencies=[Depends(require_api_key)])
-def reset_factory():
+@app.post("/api/v1/reset")
+def reset_factory(req: Optional[ResetRequest] = None, actor: Actor = Depends(user_actor)):
+    """Reset ONE factory (the body's factory_id, default the caller's) to its demo seed. Needs
+    the owner role in that factory; a factory without demo seed data is a 409."""
+    factory_id = actor.authorize(req.factory_id if req else None, *OWNER_ONLY)
     if settings.is_production:
         raise HTTPException(status_code=403, detail="Reset is disabled in production")
-    return reset_to_seed()
+    if factory_id != db.DEMO_FACTORY_ID:
+        raise HTTPException(status_code=409, detail="no demo seed for this factory")
+    return reset_to_seed(factory_id)
 
 
 if __name__ == "__main__":

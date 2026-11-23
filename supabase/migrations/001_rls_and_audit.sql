@@ -5,7 +5,21 @@
 -- Before applying, set SUPABASE_SERVICE_ROLE_KEY in backend/.env: once RLS is on,
 -- the anon key is read-only and every backend write must use the service-role key
 -- (which bypasses RLS). Never put the service-role key in the frontend.
+-- Refuses to run once 008 (member-only RLS) is applied: see the level-8 guard below.
 -- ============================================================================
+
+-- Level-8 guard: once 008 (member-only RLS) is applied, re-running this file would reopen
+-- anon / USING (true) read policies, so it refuses to run at level 8 or above.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'schema_migrations') THEN
+        IF EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 8) THEN
+            RAISE EXCEPTION 'database is at level 8+; re-running 001 would reopen anon/USING(true) policies — not allowed';
+        END IF;
+    END IF;
+END
+$$;
 
 -- 1. Audit columns on the execution ledger
 ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS approved_by TEXT NOT NULL DEFAULT '';

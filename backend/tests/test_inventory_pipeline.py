@@ -5,14 +5,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
-from fastapi.testclient import TestClient
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 
 from app import db, main
 from app.agents.graph import run_cascade_pipeline
 from app.config import settings
 from app.disruption import DisruptionResolutionError
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 SAMPLES = Path(__file__).resolve().parents[2] / "samples" / "tally"
 TEXT = "Chennai shipment delayed 48h, order EV-402"
 
@@ -24,7 +24,7 @@ def _now():
 class InventoryPipelineTests(unittest.TestCase):
     def setUp(self):
         db.reset_to_seed()
-        self.client = TestClient(main.app)
+        self.client = dev_client(main.app)
 
     def tearDown(self):
         db.reset_to_seed()

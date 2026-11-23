@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 from fastapi.testclient import TestClient
 
 from app import main, run_store
@@ -16,7 +17,7 @@ from app.agents import sourcing, sourcing_store
 from app.agents.sourcing import RFQ, _regex_parse
 from app.db import update_rows
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 
 
 def _rfq(units=150):
@@ -67,7 +68,7 @@ class ReplyParsingTests(unittest.TestCase):
 class SourcingFlowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(main.app)
+        cls.client = dev_client(main.app)
         cls._patches = [
             mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: True),
             mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: True),
@@ -221,8 +222,8 @@ class SourcingFlowTests(unittest.TestCase):
         r = self.client.post(f"/api/v1/sourcing/{sim['run_id']}/vendor-reply",
                              json={"supplier_id": "SUP-HSR-03", "text": "yes"}, headers=KEY)
         self.assertEqual(r.status_code, 409)
-        r = self.client.post(f"/api/v1/sourcing/{sim['run_id']}/vendor-reply",
-                             json={"supplier_id": "SUP-PNY-02", "text": "yes"})
+        r = TestClient(main.app).post(f"/api/v1/sourcing/{sim['run_id']}/vendor-reply",  # no credentials
+                                      json={"supplier_id": "SUP-PNY-02", "text": "yes"})
         self.assertEqual(r.status_code, 401)
 
     def test_plan_without_vendors_needs_no_sourcing(self):

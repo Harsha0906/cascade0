@@ -1,10 +1,10 @@
 from tests import _offline_env  # noqa: F401  (must precede any app import)
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from fastapi.testclient import TestClient
 
 from app import db, main, run_store
 from app.agents import client as client_agent
@@ -53,7 +53,7 @@ class I1PlainEnglishDeclines(unittest.TestCase):
 class _Flow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.api = TestClient(main.app)
+        cls.api = dev_client(main.app)
 
     def setUp(self):
         self.api.post("/api/v1/reset", headers=KEY)
@@ -137,7 +137,7 @@ class I3ConfirmedEtaBeatsTheRiskShift(unittest.TestCase):
         session.rfqs.append(RFQ(id="R1", run_id="X", round=1, supplier_id="SUP-HSR-03", supplier_name="Hosur",
                                 units_requested=150, expected_unit_price_inr=600, needed_within_hours=30,
                                 channel="simulated"))
-        with mock.patch.object(sourcing, "_persist", lambda r: None), \
+        with mock.patch.object(sourcing, "_persist", lambda *a: None), \
                 mock.patch.object(sourcing, "_advance", lambda s: None), \
                 mock.patch.object(sourcing, "log_agent_step", lambda **k: None):
             sourcing._apply_reply(session, "SUP-HSR-03", "Yes 150 units in 12 hours", "operator")
@@ -157,7 +157,7 @@ class I3ConfirmedEtaBeatsTheRiskShift(unittest.TestCase):
         session.rfqs.append(RFQ(id="R1", run_id="X", round=1, supplier_id="SUP-PNY-02", supplier_name="Peenya",
                                 units_requested=150, expected_unit_price_inr=600, needed_within_hours=30,
                                 channel="simulated"))
-        with mock.patch.object(sourcing, "_persist", lambda r: None), \
+        with mock.patch.object(sourcing, "_persist", lambda *a: None), \
                 mock.patch.object(sourcing, "_advance", lambda s: None), \
                 mock.patch.object(sourcing, "log_agent_step", lambda **k: None):
             sourcing._apply_reply(session, "SUP-PNY-02", "Yes 150 units in 20 hours", "operator")
@@ -205,7 +205,7 @@ class I4PromiseIsTheVendorsOwn(_Flow):
 class FutureDeliveryIsRejected(unittest.TestCase):
     def setUp(self):
         db.reset_to_seed()
-        self.api = TestClient(main.app)
+        self.api = dev_client(main.app)
         now = datetime.now(timezone.utc)
         db.insert_row("delivery_outcomes", {
             "id": len(db._mirror.delivery_outcomes) + 1, "factory_id": "apex-volt-blr2",

@@ -1,7 +1,9 @@
 -- ============================================================================
 -- CASCADEZERO — Complete PostgreSQL Schema, Realtime Setup & Seed Data
 -- Target: Supabase Cloud PostgreSQL (ap-south-1)
--- Fresh install: run this file, then migrations 001, 002, 003, 004, 005, 006, 007 in order.
+-- Fresh install: run this file, then migrations 001, 002, 003, 004, 005, 006, 007, 008 in order.
+-- Row-Level Security (end state, see the section before Realtime): anon reads nothing; a signed-in
+-- member reads only their factories' rows; every write goes through the backend's service role.
 -- Factory: Apex Volt EV Battery Plant (Bengaluru Unit-2)
 -- ============================================================================
 
@@ -17,9 +19,44 @@ CREATE TABLE IF NOT EXISTS factories (
     safety_stock_units          INTEGER NOT NULL,
     production_hours_in_window  FLOAT NOT NULL
 );
-ALTER TABLE factories ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS factories_read ON factories;
-CREATE POLICY factories_read ON factories FOR SELECT TO anon, authenticated USING (true);
+
+-- ============================================================================
+-- TABLE 0b: factory_members (which Supabase Auth user holds which role in which factory)
+-- Written only by the backend (`python -m app.admin add-member`).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS factory_members (
+    user_id     UUID NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
+    factory_id  TEXT NOT NULL REFERENCES factories (id) ON DELETE CASCADE,
+    role        TEXT NOT NULL CHECK (role IN ('owner', 'approver', 'viewer')),
+    email       TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, factory_id)
+);
+CREATE INDEX IF NOT EXISTS idx_factory_members_factory ON factory_members (factory_id);
+
+-- ============================================================================
+-- TABLE 0c: user_channels / link_codes (chat identities, migration 008 Part 3; service-only)
+-- A WhatsApp number / Telegram chat is linked to a user + factory by a one-time code.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS user_channels (
+    channel     TEXT NOT NULL CHECK (channel IN ('whatsapp', 'telegram')),
+    address     TEXT NOT NULL,              -- WhatsApp number (digits) / Telegram chat id
+    user_id     UUID NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
+    factory_id  TEXT NOT NULL REFERENCES factories (id) ON DELETE CASCADE,
+    linked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (channel, address)
+);
+CREATE INDEX IF NOT EXISTS idx_user_channels_user ON user_channels (user_id);
+CREATE INDEX IF NOT EXISTS idx_user_channels_factory ON user_channels (factory_id);
+
+CREATE TABLE IF NOT EXISTS link_codes (
+    code        TEXT PRIMARY KEY,           -- sha256(code), never the code itself
+    user_id     UUID NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
+    factory_id  TEXT NOT NULL REFERENCES factories (id) ON DELETE CASCADE,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    used_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes (expires_at);
 
 -- ============================================================================
 -- TABLE 1: suppliers
@@ -41,7 +78,8 @@ CREATE TABLE IF NOT EXISTS suppliers (
     status          TEXT NOT NULL DEFAULT 'ON_TIME',
     delay_hours     INTEGER NOT NULL DEFAULT 0,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    factory_id      TEXT,
+    factory_id      TEXT NOT NULL,
+    telegram_chat_id TEXT,                  -- vendor RFQ chat (SOURCING_MODE=telegram)
     sourcing_role   TEXT,
     lead_time_sigma_hours FLOAT,
     delay_shock_min_hours FLOAT,
@@ -62,7 +100,8 @@ CREATE TABLE IF NOT EXISTS vendor_history (
     on_time_deliveries      INTEGER NOT NULL DEFAULT 0,
     reliability_score_pct   FLOAT NOT NULL DEFAULT 0.0,
     quality_rejection_rate_pct FLOAT NOT NULL DEFAULT 0.0,
-    last_incident_note      TEXT NOT NULL DEFAULT ''
+    last_incident_note      TEXT NOT NULL DEFAULT '',
+    factory_id              TEXT NOT NULL
 );
 
 -- ============================================================================
@@ -80,7 +119,7 @@ CREATE TABLE IF NOT EXISTS production_lines (
     extra_units_per_ot_hour INTEGER NOT NULL DEFAULT 0,
     max_ot_hours            INTEGER NOT NULL DEFAULT 0,
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    factory_id              TEXT,
+    factory_id              TEXT NOT NULL,
     rated_units_per_hour    FLOAT
 );
 
@@ -99,9 +138,10 @@ CREATE TABLE IF NOT EXISTS orders (
     status                  TEXT NOT NULL DEFAULT 'ON_TRACK',
     shortfall_units         INTEGER NOT NULL DEFAULT 0,
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    factory_id              TEXT,
+    factory_id              TEXT NOT NULL,
     priority                INT NOT NULL DEFAULT 100,
-    due_at                  TIMESTAMPTZ   -- absolute deadline; hours_remaining is display only
+    due_at                  TIMESTAMPTZ,  -- absolute deadline; hours_remaining is display only
+    client_contact          TEXT                    -- '<channel>:<address>' the Client Agent messages
 );
 
 -- ============================================================================
@@ -116,7 +156,7 @@ CREATE TABLE IF NOT EXISTS disruption_events (
     line2_speed_pct     INTEGER NOT NULL DEFAULT 100,
     shortfall_units     INTEGER NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    factory_id          TEXT,
+    factory_id          TEXT NOT NULL,
     order_id            TEXT,
     affected_supplier_id TEXT,
     line_impacts        JSONB NOT NULL DEFAULT '[]'
@@ -137,9 +177,6 @@ CREATE TABLE IF NOT EXISTS scenarios (
     order_id         TEXT NOT NULL,
     PRIMARY KEY (factory_id, scenario_id)
 );
-ALTER TABLE scenarios ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS scenarios_read ON scenarios;
-CREATE POLICY scenarios_read ON scenarios FOR SELECT TO anon, authenticated USING (true);
 
 -- ============================================================================
 -- TABLE 5c: inventory (Phase 4) - items, stock levels, inbound shipments, order lines
@@ -171,27 +208,13 @@ CREATE TABLE IF NOT EXISTS inbound_shipments (
 );
 
 CREATE TABLE IF NOT EXISTS order_lines (
-    order_id   TEXT NOT NULL,
-    item_code  TEXT NOT NULL,
-    qty        INT NOT NULL CHECK (qty > 0),
+    order_id    TEXT NOT NULL,
+    item_code   TEXT NOT NULL,
+    qty         INT NOT NULL CHECK (qty > 0),
+    -- Nullable here only because 006's seed insert predates the column; 008 sets NOT NULL.
+    factory_id  TEXT,
     PRIMARY KEY (order_id, item_code)
 );
-
-ALTER TABLE items ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS items_read ON items;
-CREATE POLICY items_read ON items FOR SELECT TO anon, authenticated USING (true);
-
-ALTER TABLE stock_levels ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS stock_levels_read ON stock_levels;
-CREATE POLICY stock_levels_read ON stock_levels FOR SELECT TO anon, authenticated USING (true);
-
-ALTER TABLE inbound_shipments ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS inbound_shipments_read ON inbound_shipments;
-CREATE POLICY inbound_shipments_read ON inbound_shipments FOR SELECT TO anon, authenticated USING (true);
-
-ALTER TABLE order_lines ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS order_lines_read ON order_lines;
-CREATE POLICY order_lines_read ON order_lines FOR SELECT TO anon, authenticated USING (true);
 
 -- Recorded vendor deliveries (Round A): reliability is learned from DELIVERED rows.
 CREATE TABLE IF NOT EXISTS delivery_outcomes (
@@ -204,11 +227,9 @@ CREATE TABLE IF NOT EXISTS delivery_outcomes (
     delivered_at  TIMESTAMPTZ,
     status        TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'DELIVERED')),
     recorded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    recorded_by   TEXT,
     UNIQUE (po_number, supplier_id)
 );
-ALTER TABLE delivery_outcomes ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS delivery_outcomes_read ON delivery_outcomes;
-CREATE POLICY delivery_outcomes_read ON delivery_outcomes FOR SELECT TO anon, authenticated USING (true);
 
 -- Client Agent coordination (Task 3): one record per root analysis run, shared by the Client
 -- and Sourcing agents. Optimistic concurrency like sourcing_sessions: every save is a
@@ -239,7 +260,8 @@ CREATE TABLE IF NOT EXISTS agent_logs (
     tool_called     TEXT NOT NULL DEFAULT '',
     tool_output_summary TEXT NOT NULL DEFAULT '',
     message         TEXT NOT NULL DEFAULT '',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    factory_id      TEXT NOT NULL
 );
 
 -- ============================================================================
@@ -261,7 +283,8 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
     status                  TEXT NOT NULL DEFAULT 'DRAFT',
     approved_by             TEXT NOT NULL DEFAULT '',
     run_id                  TEXT NOT NULL DEFAULT '',
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    factory_id              TEXT NOT NULL
 );
 
 -- ============================================================================
@@ -281,12 +304,12 @@ VALUES
     ('SUP-AIR-04', 'BlueDart Aviation Charter', 'EMERGENCY-AIR', 'HAL/KEMPEGOWDA Air Cargo Corridor', 'Aluminum Battery Casings', 0, 500, 0, 600000, 6, 0.0, 2.0, 'STANDBY', 0, 'apex-volt-blr2', 'EXPEDITE', 0.25, 1.0, 2.0, 1.0, 2.0, 4.5);
 
 -- Vendor History (Episodic Memory)
-INSERT INTO vendor_history (supplier_id, past_orders_count, on_time_deliveries, reliability_score_pct, quality_rejection_rate_pct, last_incident_note)
+INSERT INTO vendor_history (supplier_id, past_orders_count, on_time_deliveries, reliability_score_pct, quality_rejection_rate_pct, last_incident_note, factory_id)
 VALUES
-    ('SUP-CHN-01', 50, 48, 96.0, 0.5, 'Vulnerable to NE Monsoon flooding near Vellore/Ambur.'),
-    ('SUP-PNY-02', 15, 14, 93.3, 0.8, 'Consistent 4h delivery via Tumkur Road; max batch 200 units.'),
-    ('SUP-HSR-03', 11, 9, 81.8, 2.1, 'Border toll bottleneck at Attibele during peak hours.'),
-    ('SUP-AIR-04', 5, 5, 98.5, 0.0, 'Guaranteed priority airfreight slot; high flat charter fee.');
+    ('SUP-CHN-01', 50, 48, 96.0, 0.5, 'Vulnerable to NE Monsoon flooding near Vellore/Ambur.', 'apex-volt-blr2'),
+    ('SUP-PNY-02', 15, 14, 93.3, 0.8, 'Consistent 4h delivery via Tumkur Road; max batch 200 units.', 'apex-volt-blr2'),
+    ('SUP-HSR-03', 11, 9, 81.8, 2.1, 'Border toll bottleneck at Attibele during peak hours.', 'apex-volt-blr2'),
+    ('SUP-AIR-04', 5, 5, 98.5, 0.0, 'Guaranteed priority airfreight slot; high flat charter fee.', 'apex-volt-blr2');
 
 -- Production Lines
 INSERT INTO production_lines (line_id, name, status, speed_pct, temp_celsius, daily_capacity_units, overtime_cost_per_hour_inr, extra_units_per_ot_hour, max_ot_hours, factory_id, rated_units_per_hour)
@@ -309,8 +332,8 @@ INSERT INTO stock_levels (factory_id, item_code, on_hand_qty)
 VALUES ('apex-volt-blr2', 'CASING', 350);
 INSERT INTO inbound_shipments (shipment_id, factory_id, item_code, supplier_id, qty, eta, status)
 VALUES ('SHP-CHN-0001', 'apex-volt-blr2', 'CASING', 'SUP-CHN-01', 500, NOW() + INTERVAL '20 hours', 'OPEN');
-INSERT INTO order_lines (order_id, item_code, qty)
-VALUES ('EV-402', 'CASING', 500), ('EV-405', 'CASING', 300);
+INSERT INTO order_lines (order_id, item_code, qty, factory_id)
+VALUES ('EV-402', 'CASING', 500, 'apex-volt-blr2'), ('EV-405', 'CASING', 300, 'apex-volt-blr2');
 
 -- Scenario presets
 INSERT INTO scenarios (factory_id, scenario_id, title, summary, raw_message, delay_hours, shortfall_units, line_speeds, order_id)
@@ -325,6 +348,128 @@ VALUES
      'Severe supplier collapse: Chennai Precision Casings shipment blocked by 72 hours due to bridge damage near Ranipet. Robotic Welding Line 2 overheated to 92°C and dropped to 25% speed. Compound shortfall of 350 battery casings on Order #EV-402.',
      72, 350, '{"LINE-2": 25}', 'EV-402')
 ON CONFLICT (factory_id, scenario_id) DO NOTHING;
+
+-- ============================================================================
+-- ROW-LEVEL SECURITY (end state; migrations 001-008 converge to the same)
+-- anon: no policy and no privileges. authenticated: SELECT only, filtered to the factories the
+-- user is a member of (RLS also filters Realtime). No INSERT/UPDATE/DELETE policies: the backend
+-- writes with the service role. order_coordination, user_channels and link_codes are
+-- service-only (RLS on, no policy). The
+-- tables of 002/004 (sourcing_rfqs, analysis_runs, ...) get theirs from those migrations and 008.
+-- ============================================================================
+ALTER TABLE factories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE factory_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE suppliers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vendor_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE production_lines ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE disruption_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE purchase_orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE scenarios ENABLE ROW LEVEL SECURITY;
+ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE stock_levels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE inbound_shipments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE order_lines ENABLE ROW LEVEL SECURITY;
+ALTER TABLE delivery_outcomes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE order_coordination ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_channels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE link_codes ENABLE ROW LEVEL SECURITY;
+
+-- A signed-in member reads only their own memberships.
+DROP POLICY IF EXISTS factory_members_self_read ON factory_members;
+CREATE POLICY factory_members_self_read ON factory_members
+    FOR SELECT TO authenticated USING (user_id = (SELECT auth.uid()));
+DROP POLICY IF EXISTS factories_member_read ON factories;
+CREATE POLICY factories_member_read ON factories
+    FOR SELECT TO authenticated
+    USING (id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS suppliers_member_read ON suppliers;
+CREATE POLICY suppliers_member_read ON suppliers
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS vendor_history_member_read ON vendor_history;
+CREATE POLICY vendor_history_member_read ON vendor_history
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS production_lines_member_read ON production_lines;
+CREATE POLICY production_lines_member_read ON production_lines
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS orders_member_read ON orders;
+CREATE POLICY orders_member_read ON orders
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS disruption_events_member_read ON disruption_events;
+CREATE POLICY disruption_events_member_read ON disruption_events
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS agent_logs_member_read ON agent_logs;
+CREATE POLICY agent_logs_member_read ON agent_logs
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS purchase_orders_member_read ON purchase_orders;
+CREATE POLICY purchase_orders_member_read ON purchase_orders
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS scenarios_member_read ON scenarios;
+CREATE POLICY scenarios_member_read ON scenarios
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS items_member_read ON items;
+CREATE POLICY items_member_read ON items
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS stock_levels_member_read ON stock_levels;
+CREATE POLICY stock_levels_member_read ON stock_levels
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS inbound_shipments_member_read ON inbound_shipments;
+CREATE POLICY inbound_shipments_member_read ON inbound_shipments
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS order_lines_member_read ON order_lines;
+CREATE POLICY order_lines_member_read ON order_lines
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+DROP POLICY IF EXISTS delivery_outcomes_member_read ON delivery_outcomes;
+CREATE POLICY delivery_outcomes_member_read ON delivery_outcomes
+    FOR SELECT TO authenticated
+    USING (factory_id IN (SELECT factory_id FROM factory_members WHERE user_id = (SELECT auth.uid())));
+
+REVOKE ALL ON factories FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON factories FROM authenticated;
+REVOKE ALL ON suppliers FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON suppliers FROM authenticated;
+REVOKE ALL ON vendor_history FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON vendor_history FROM authenticated;
+REVOKE ALL ON production_lines FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON production_lines FROM authenticated;
+REVOKE ALL ON orders FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON orders FROM authenticated;
+REVOKE ALL ON disruption_events FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON disruption_events FROM authenticated;
+REVOKE ALL ON agent_logs FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON agent_logs FROM authenticated;
+REVOKE ALL ON purchase_orders FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON purchase_orders FROM authenticated;
+REVOKE ALL ON scenarios FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON scenarios FROM authenticated;
+REVOKE ALL ON items FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON items FROM authenticated;
+REVOKE ALL ON stock_levels FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON stock_levels FROM authenticated;
+REVOKE ALL ON inbound_shipments FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON inbound_shipments FROM authenticated;
+REVOKE ALL ON order_lines FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON order_lines FROM authenticated;
+REVOKE ALL ON delivery_outcomes FROM anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON delivery_outcomes FROM authenticated;
+REVOKE ALL ON factory_members FROM anon;
+REVOKE INSERT, UPDATE, DELETE ON factory_members FROM authenticated;
+REVOKE ALL ON order_coordination FROM anon, authenticated;
+REVOKE ALL ON user_channels FROM anon, authenticated;
+REVOKE ALL ON link_codes FROM anon, authenticated;
 
 -- ============================================================================
 -- SUPABASE REALTIME: Enable postgres_changes on all 7 tables

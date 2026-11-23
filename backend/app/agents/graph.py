@@ -373,6 +373,12 @@ def _make_order_ranker(model: FactoryModel, now: datetime) -> Callable[..., List
     return rank
 
 
+def _factory_of(state: CascadeGraphState) -> Optional[str]:
+    """The tenant of this run's agent-log entries."""
+    model = state.get("factory_model")
+    return getattr(model, "factory_id", None) or state.get("factory_id")
+
+
 def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
     model = load_factory_model(state.get("factory_id"))   # FactoryDataError propagates (-> 503 in main)
@@ -442,6 +448,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     if disruption.route_note:
         risk_bits.append(disruption.route_note)
     log_agent_step(
+        factory_id=model.factory_id,
         run_id=run_id, step_order=1,
         agent_name="Disruption Detective (agent)", agent_role="Disruption Entity Extractor", badge_color="amber",
         tool_called=f"extract_disruption_entities({source})",
@@ -473,6 +480,7 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         f"⚠️ {summary} Shortfall: {disruption.shortfall_units} units.",
     )
     log_agent_step(
+        factory_id=model.factory_id,
         run_id=run_id, step_order=2,
         agent_name="Disruption Detective (agent)", agent_role="Causal Dependency Mapper", badge_color="amber",
         tool_called="query_blast_radius_sql()", tool_output_summary=summary, message=msg,
@@ -521,6 +529,7 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
         expedite_id = model.expedite_vendor_id
         if expedite_id is None:
             log_agent_step(
+                factory_id=_factory_of(state),
                 run_id=run_id, step_order=3,
                 agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
                 tool_called="factory_model.expedite_vendor_id",
@@ -550,6 +559,7 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
             + ("" if prop["feasible"] else " Even this leaves units uncovered."),
         )
         log_agent_step(
+            factory_id=_factory_of(state),
             run_id=run_id, step_order=3,
             agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
             tool_called=f"solve_pulp_milp(force_vendor_id={expedite_id}) + simulate_monte_carlo()",
@@ -579,6 +589,7 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
         f"⚡ REBUTTAL: {challenge} Re-plan without the weak link.",
     )
     log_agent_step(
+        factory_id=_factory_of(state),
         run_id=run_id, step_order=5,
         agent_name="Speed scenario (expedite-first)", agent_role="Planning scenario: maximum speed", badge_color="rose",
         tool_called="audit_proposal_risk()", tool_output_summary=challenge, message=msg,
@@ -625,6 +636,7 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
             f"₹{prop['total_cost_inr']:,}{saving_txt}, P(on-time) {prop['confidence_pct']}%.",
         )
         log_agent_step(
+            factory_id=_factory_of(state),
             run_id=run_id, step_order=4,
             agent_name="Cost scenario (cheapest feasible)", agent_role="Planning scenario: lowest cost", badge_color="cyan",
             tool_called="solve_pulp_milp(min cost) + simulate_monte_carlo()",
@@ -661,6 +673,7 @@ def cfo_watchdog_node(state: CascadeGraphState) -> Dict[str, Any]:
         {"verdict": verdict}, f"Cost scenario re-solve: {verdict}",
     )
     log_agent_step(
+        factory_id=_factory_of(state),
         run_id=run_id, step_order=6,
         agent_name="Cost scenario (cheapest feasible)", agent_role="Planning scenario: lowest cost", badge_color="cyan",
         tool_called=f"solve_pulp_milp(min_reliability={RELIABILITY_FLOOR_PCT:g}%)",
@@ -717,6 +730,7 @@ def arbitrator_node(state: CascadeGraphState) -> Dict[str, Any]:
         f"lowest expected cost ₹{w['expected_cost_inr']:,}.",
     )
     log_agent_step(
+        factory_id=_factory_of(state),
         run_id=run_id, step_order=7 if state.get("rebuttal_count", 0) > 0 else 5,
         agent_name="Arbitrator (solver ranking)", agent_role="Solver & Risk Ranking", badge_color="emerald",
         tool_called="generate_playbooks(MILP + 1000-run Monte Carlo)", tool_output_summary=summary, message=msg,

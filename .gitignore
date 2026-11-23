@@ -48,3 +48,7 @@ Thumbs.db
 
 # Localtunnel / Test logs
 *.log
+
+# Telegram poller state
+.telegram_poll_offset
+.telegram_poll_offset.tmp

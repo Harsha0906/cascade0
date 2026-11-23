@@ -1,6 +1,8 @@
 "use client";
 
 import React, { useRef, useState } from "react";
+import { apiFetch } from "@/lib/session";
+import { AccountControls } from "./AccountControls";
 import { useFactoryStore } from "@/store/useFactoryStore";
 import { focusOrder } from "@/lib/twinGraph";
 import {
@@ -68,7 +70,7 @@ export function TopKpiBar() {
     const text = await file.text();
     const API_BASE = typeof window !== "undefined" ? "" : (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000");
     try {
-      const res = await fetch(`${API_BASE}${importKind.path}`, {
+      const res = await apiFetch(`${API_BASE}${importKind.path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filename: file.name, csv_content: text }),
@@ -175,6 +177,8 @@ export function TopKpiBar() {
               🏭 2.5D Twin Studio
             </button>
           </div>
+
+          <AccountControls />
 
           {/* Active Contract Risk Pill */}
           <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-white/40 border border-white/50 text-xs font-mono">

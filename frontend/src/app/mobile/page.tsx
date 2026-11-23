@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import { apiFetch } from "@/lib/session";
 import { focusOrder, type Scenario } from "@/lib/twinGraph";
 import {
   AlertTriangle,
@@ -69,7 +70,7 @@ export default function MobileControllerPage() {
   // Poll state every 2 seconds for mobile responsiveness
   const refreshState = async () => {
     try {
-      const res = await fetch("/api/v1/state");
+      const res = await apiFetch("/api/v1/state");
       if (res.ok) {
         const data = await res.json();
         const focus = focusOrder(data.orders ?? [], activeOrderRef.current);
@@ -91,7 +92,7 @@ export default function MobileControllerPage() {
           bestPlaybook: null,
         });
       }
-      const runRes = await fetch("/api/v1/runs/latest");
+      const runRes = await apiFetch("/api/v1/runs/latest");
       if (runRes.ok) setLatestRun(await runRes.json());
     } catch {
       // Keep existing state if offline
@@ -100,7 +101,7 @@ export default function MobileControllerPage() {
 
   const loadScenarios = async () => {
     try {
-      const res = await fetch("/api/v1/scenarios");
+      const res = await apiFetch("/api/v1/scenarios");
       if (!res.ok) throw new Error(`Scenario presets unavailable (HTTP ${res.status})`);
       setScenarios((await res.json()) as Scenario[]);
       setScenariosError(null);
@@ -120,7 +121,7 @@ export default function MobileControllerPage() {
     setIsSubmitting(true);
     setFeedbackMsg(`Transmitting Scenario ${scenarioId} crisis telemetry...`);
     try {
-      const res = await fetch("/api/v1/simulate-crisis", {
+      const res = await apiFetch("/api/v1/simulate-crisis", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ scenario_id: scenarioId }),
@@ -147,7 +148,7 @@ export default function MobileControllerPage() {
     setIsSubmitting(true);
     setFeedbackMsg("Transmitting custom WhatsApp/Voice disruption text...");
     try {
-      const res = await fetch("/api/v1/simulate-crisis", {
+      const res = await apiFetch("/api/v1/simulate-crisis", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ raw_message: customPrompt, source_channel: "MOBILE_CONTROLLER" }),
@@ -175,7 +176,7 @@ export default function MobileControllerPage() {
     setIsSubmitting(true);
     setFeedbackMsg("Resetting factory to clean seed state...");
     try {
-      const res = await fetch("/api/v1/reset", { method: "POST" });
+      const res = await apiFetch("/api/v1/reset", { method: "POST" });
       setFeedbackMsg(res.ok ? "✅ Factory restored to NORMAL operations." : `⚠️ Reset failed (HTTP ${res.status}).`);
       await refreshState();
     } catch {
@@ -192,7 +193,7 @@ export default function MobileControllerPage() {
     setFeedbackMsg(`Approving ${latestRun.recommended_plan_id}...`);
     try {
       // The server executes the plan it computed for this run; no figures are sent from the phone.
-      const res = await fetch("/api/v1/execute-plan", {
+      const res = await apiFetch("/api/v1/execute-plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

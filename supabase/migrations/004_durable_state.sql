@@ -1,9 +1,22 @@
 -- ============================================================================
 -- CascadeZero — Phase 2: durable state (runs, sourcing sessions, receipts, webhook dedup)
--- Apply after 003_factory_model.sql. Safe to re-run.
+-- Apply after 003_factory_model.sql. Safe to re-run below level 8 (refuses to run once 008 is applied).
 -- All tables are service-role only: RLS enabled, NO anon/authenticated policies,
 -- and none are added to the realtime publication.
 -- ============================================================================
+
+-- Level-8 guard: once 008 (member-only RLS) is applied, re-running this file would reopen
+-- anon / USING (true) read policies, so it refuses to run at level 8 or above.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'schema_migrations') THEN
+        IF EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 8) THEN
+            RAISE EXCEPTION 'database is at level 8+; re-running 004 would reopen anon/USING(true) policies — not allowed';
+        END IF;
+    END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS analysis_runs (
     run_id         TEXT PRIMARY KEY,

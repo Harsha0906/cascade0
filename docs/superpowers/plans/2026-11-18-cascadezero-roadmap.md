@@ -157,7 +157,7 @@ renegotiation probability is replaced by the client's actual answer when availab
 Agent's enquiries and the final plan; every component labelled "agent" perceives, decides and
 acts.
 
-## Phase 7 — Identity and multi-tenancy
+## Phase 7 — Identity and multi-tenancy (DONE)
 
 **What changes.** Supabase Auth login on the dashboard; the backend verifies the user's JWT;
 `approved_by` comes from the verified session; every table has `factory_id` and RLS allows a
@@ -193,7 +193,7 @@ ARIA labels and text alongside colour status.
 **Done when.** `docker compose up` runs the whole stack from a clean clone; CI is green on a PR;
 an automated accessibility check reports no critical issues.
 
-## Phase 10 — Telegram channel
+## Phase 10 — Telegram channel (DONE)
 
 **What changes.** A channel adapter interface (`send_text`, `send_buttons`, inbound parsing) with
 WhatsApp and Telegram implementations; Telegram bot for alerts in, plan out, Approve button,
@@ -211,6 +211,8 @@ Telegram with the same tests as the WhatsApp path.
 - **Phase 4 (DONE):** shortfall from data, not the alert. Done: migration 006 adds `items`, `stock_levels`, `inbound_shipments`, `order_lines`, order `priority` and absolute `due_at`; Tally/Excel CSV importers validate row by row and treat each file as a full snapshot; `compute_shortfall` uses stock + inbound before the deadline − higher-priority reservations (capped at the order's demand); precedence is override > inventory > alert text > 422; an alert naming no order is mapped to the most urgent short order. Limited to one planning item per factory.
 - **Phase 5 (DONE):** route/weather risk and learned reliability. Done: blocked routes (with a block cue) slow their vendors and weather cues double shock probability (cap 90%); reliability is a Beta posterior of `vendor_history` plus recorded deliveries (2h grace); executing a plan writes PENDING outcomes; `POST/GET /api/v1/deliveries`; migration 007.
 - **Phase 6 (DONE):** Client Agent. Done: DRAFTED/SENT/ANSWERING/ACCEPTED/REFUSED flow with human approval, auto-draft on sourcing failure, accept extends `due_at` + re-plan + sourcing restart, refuse allows expedite; `/api/v1/client/*`; Ops/CFO relabelled as planning scenarios. Limits: client WhatsApp needs a contact on the order; answers are operator-entered; fresh analyses do not yet read the answer.
+- **Phase 7 (DONE):** identity and multi-tenancy. Done: dashboard login with Supabase Auth; the backend verifies the user's token and `approved_by` is the verified email; `factory_members` roles (owner/approver/viewer, `python -m app.admin add-member`); `factory_id` on every tenant table with member-only RLS (anon has no access); the machine API key is for automation only and cannot approve; WhatsApp/Telegram chats link to user accounts with one-time codes; migration 008 (level 8).
+- **Phase 10 (DONE):** Telegram channel. Done: channel adapter (`send_text`, `send_buttons`, `parse_inbound`) with WhatsApp and Telegram implementations over one shared inbound flow; alert in, plan out, Approve button by linked owners/approvers only; vendor RFQs and replies and client messages over Telegram (`SOURCING_MODE=telegram`, `set-vendor-contact` / `set-client-contact`); webhook or `python -m app.telegram_poll`; the same end-to-end test runs on both channels.
 - **Phase 8 (DONE):** AI quality. Done: `python -m app.evals` (62 disruption + 30 vendor-reply rows, offline regex by default, `--live` for Gemini), narration guard (`template-guarded`), per-node latency/token trace; declines never parse as acceptance.
 - **Phase 6:** forcing the expedite vendor at zero shortfall pays its fee in the objective but not in the reported cost — skip Plan A when shortfall is 0, or report it.
 - **Phase 9:** CBC fallback (`COIN_CMD`, needs a CBC binary on PATH) is untested because HiGHS is always present — add a CI job without HiGHS.

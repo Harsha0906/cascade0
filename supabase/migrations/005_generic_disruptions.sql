@@ -1,7 +1,20 @@
 -- ============================================================================
 -- CascadeZero — Phase 3: generic disruptions + data-driven scenario presets
--- Apply after 004_durable_state.sql. Safe to re-run.
+-- Apply after 004_durable_state.sql. Safe to re-run below level 8 (refuses to run once 008 is applied).
 -- ============================================================================
+
+-- Level-8 guard: once 008 (member-only RLS) is applied, re-running this file would reopen
+-- anon / USING (true) read policies, so it refuses to run at level 8 or above.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'schema_migrations') THEN
+        IF EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 8) THEN
+            RAISE EXCEPTION 'database is at level 8+; re-running 005 would reopen anon/USING(true) policies — not allowed';
+        END IF;
+    END IF;
+END
+$$;
 
 -- Prerequisite guard: refuse to run unless migration 004 is really applied.
 DO $$

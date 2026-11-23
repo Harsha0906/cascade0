@@ -7,9 +7,9 @@ import unittest
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 from tests.factories import small_factory
 
-from fastapi.testclient import TestClient
 
 from app import db, main
 from app.disruption import (
@@ -21,7 +21,7 @@ from app.disruption import (
 from app.factory_model import load_factory_model
 from app.schemas import DisruptionExtraction, LineImpactExtraction
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 ORDERS = ["EV-402", "EV-405"]
 
 
@@ -198,7 +198,7 @@ class GeminiGroundingTests(unittest.TestCase):
 class ApiFinalTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(main.app)
+        cls.client = dev_client(main.app)
 
     def setUp(self):
         self.client.post("/api/v1/reset", headers=KEY)

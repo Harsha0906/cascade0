@@ -6,20 +6,20 @@ import unittest
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
-from fastapi.testclient import TestClient
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 
 from app import db, main, run_store
 from app.agents import sourcing_store
 from app.factory_model import FactoryModel
 from tests.fake_supabase import FailingClient, MissingTableError, StubClient
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 
 
 class FailLoudTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(main.app)
+        cls.client = dev_client(main.app)
 
     def setUp(self):
         self.client.post("/api/v1/reset", headers=KEY)
@@ -84,7 +84,7 @@ class FailLoudTests(unittest.TestCase):
 class RunPersistenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(main.app)
+        cls.client = dev_client(main.app)
 
     def setUp(self):
         self.client.post("/api/v1/reset", headers=KEY)
@@ -126,7 +126,7 @@ class RunPersistenceTests(unittest.TestCase):
 class SourcingPersistenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(main.app)
+        cls.client = dev_client(main.app)
 
     def setUp(self):
         self.client.post("/api/v1/reset", headers=KEY)
@@ -384,7 +384,7 @@ class _UniqueViolation(Exception):
 class WebhookDedupeHealthTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(main.app)
+        cls.client = dev_client(main.app)
         cls._patches = [
             mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: True),
             mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: True),
@@ -409,7 +409,7 @@ class WebhookDedupeHealthTests(unittest.TestCase):
                                 headers={"content-type": "application/json", "x-hub-signature-256": sig})
 
     def test_duplicate_webhook_processed_once(self):
-        body = _meta_text("919800000001", "Truck stuck, 150 casings short, line 2 at 50%", msg_id="wamid.X1")
+        body = _meta_text("919800000000", "Truck stuck, 150 casings short, line 2 at 50%", msg_id="wamid.X1")
         with mock.patch.object(main, "_run_pipeline", wraps=main._run_pipeline) as spy:
             for _ in range(2):
                 r = self._post_signed(body)
@@ -448,7 +448,7 @@ class WebhookDedupeHealthTests(unittest.TestCase):
     def test_healthz_offline_ready(self):
         r = self.client.get("/healthz")
         self.assertEqual((r.status_code, r.json()["storage"], r.json()["ready"]), (200, "offline", True))
-        self.assertEqual(r.json()["required_migration_level"], 7)
+        self.assertEqual(r.json()["required_migration_level"], 8)
 
     def test_healthz_reports_old_migration_level(self):
         with mock.patch("app.db.migration_level", return_value=3):

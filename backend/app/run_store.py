@@ -49,6 +49,8 @@ def get_run(run_id: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
-def latest_run_id() -> Optional[str]:
-    rows = db.fetch_ordered(_TABLE, "created_at", desc=True, limit=1, tiebreak="run_id")
+def latest_run_id(factory_id: Optional[str] = None) -> Optional[str]:
+    """The newest run, of one factory when `factory_id` is given (the API always gives it)."""
+    rows = db.fetch_ordered(_TABLE, "created_at", desc=True, limit=1, tiebreak="run_id",
+                            match={"factory_id": factory_id} if factory_id is not None else None)
     return rows[0]["run_id"] if rows else None

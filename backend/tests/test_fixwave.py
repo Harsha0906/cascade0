@@ -6,13 +6,13 @@ import unittest
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
-from fastapi.testclient import TestClient
+from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 
 from app import db, main, run_store
 from tests.fake_supabase import FailingClient
 from tests.test_persistence import ExecutePlanTxTests, _meta_text
 
-KEY = {"X-API-Key": "test-operator-key"}
+KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 
 
 def _meta_button(sender, button_id, msg_id):
@@ -48,7 +48,7 @@ class _DeleteRecorder:
 class WebhookReleaseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(main.app, raise_server_exceptions=False)
+        cls.client = dev_client(main.app, raise_server_exceptions=False)
         cls._patches = [
             mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: True),
             mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: True),
@@ -128,15 +128,17 @@ class WebhookReleaseTests(unittest.TestCase):
         self.assertEqual(self._post(body).json()["status"], "duplicate")
 
     def test_find_open_rfq_runs_in_threadpool(self):
+        # The shared inbound flow (app/inbound.py) does the vendor lookup off the event loop.
+        from app import inbound
         seen = []
-        real = main.run_in_threadpool
+        real = inbound.run_in_threadpool
 
         async def spy(fn, *a, **k):
             seen.append(getattr(fn, "__name__", ""))
             return await real(fn, *a, **k)
-        with mock.patch.object(main, "run_in_threadpool", spy):
+        with mock.patch.object(inbound, "run_in_threadpool", spy):
             self._post(_meta_text("919800000001", "status", msg_id="wamid.TP"))
-        self.assertIn("find_open_rfq_by_number", seen)
+        self.assertIn("find_open_rfq_by_address", seen)
 
 
 class FixWaveDbTests(unittest.TestCase):

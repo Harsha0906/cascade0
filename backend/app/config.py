@@ -43,11 +43,28 @@ class Settings:
         n.strip().lstrip("+") for n in os.getenv("WA_APPROVER_NUMBERS", "").split(",") if n.strip()
     ]
 
+    # ── Telegram Bot API ──────────────────────────────────────────────────
+    # Bot token (BotFather). Secret: env only, never logged. Unset: nothing is sent to Telegram.
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    # Shared secret Telegram echoes in X-Telegram-Bot-Api-Secret-Token (setWebhook secret_token).
+    # Unset: the Telegram webhook refuses every update (fail closed).
+    TELEGRAM_WEBHOOK_SECRET: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+    # `python -m app.telegram_poll` remembers the next getUpdates offset here (a local file).
+    TELEGRAM_POLL_OFFSET_FILE: str = os.getenv(
+        "TELEGRAM_POLL_OFFSET_FILE",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".telegram_poll_offset"))
+
     # ── Security ──────────────────────────────────────────────────────────
     # "production" makes the API key, webhook secret and explicit CORS origins mandatory.
     CASCADE_ENV: str = os.getenv("CASCADE_ENV", "development").lower()
-    # Shared operator key required on mutating endpoints (sent as X-API-Key).
+    # Machine key (X-API-Key) for automation on /api/v1/ingest/* and /api/v1/simulate-crisis.
+    # The browser never sends it. Unset: no machine access at all (fail closed).
     CASCADE_API_KEY: str = os.getenv("CASCADE_API_KEY", "")
+    # The factory a machine actor acts on (as an approver); defaults to DEFAULT_FACTORY_ID.
+    CASCADE_API_KEY_FACTORY: str = os.getenv("CASCADE_API_KEY_FACTORY", "")
+    # "supabase" (default): users authenticate with a Supabase access token (Authorization: Bearer).
+    # "dev": offline storage only, never in production; X-Dev-User: <email> picks a seeded dev user.
+    AUTH_MODE: str = os.getenv("AUTH_MODE", "").strip().lower() or "supabase"
     ALLOWED_ORIGINS: list[str] = [
         o.strip() for o in os.getenv(
             "ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
@@ -57,6 +74,7 @@ class Settings:
     # ── Sourcing Agent ────────────────────────────────────────────────────
     # "simulated": enquiries are recorded and vendor replies are entered on the dashboard.
     # "whatsapp":  enquiries go to suppliers.whatsapp_number via the Meta Cloud API.
+    # "telegram":  enquiries go to suppliers.telegram_chat_id via the Telegram Bot API.
     SOURCING_MODE: str = os.getenv("SOURCING_MODE", "simulated").lower()
     SOURCING_REPLY_TIMEOUT_MIN: int = int(os.getenv("SOURCING_REPLY_TIMEOUT_MIN", "30"))
     SOURCING_MAX_ROUNDS: int = int(os.getenv("SOURCING_MAX_ROUNDS", "3"))
@@ -85,13 +103,32 @@ class Settings:
         """Prefer the service-role key (bypasses RLS server-side); fall back to anon for local dev."""
         return self.SUPABASE_SERVICE_ROLE_KEY or self.SUPABASE_ANON_KEY
 
+    @property
+    def api_key_factory(self) -> str:
+        return self.CASCADE_API_KEY_FACTORY or self.DEFAULT_FACTORY_ID
+
+    def auth_problems(self) -> list[str]:
+        """Authentication misconfigurations that refuse startup in every environment (fail closed)."""
+        problems = []
+        if self.AUTH_MODE not in ("supabase", "dev"):
+            problems.append(f"AUTH_MODE={self.AUTH_MODE!r} is not one of 'supabase', 'dev'")
+        if self.AUTH_MODE == "dev":
+            if self.is_production:
+                problems.append("AUTH_MODE=dev is not allowed in production")
+            if self.storage_mode != "offline":
+                problems.append("AUTH_MODE=dev is allowed only in offline storage mode (Supabase is configured)")
+        return problems
+
     def security_problems(self) -> list[str]:
         """Configuration gaps that must be fixed before running in production."""
         problems = []
-        if not self.CASCADE_API_KEY:
-            problems.append("CASCADE_API_KEY is not set: mutating endpoints are unauthenticated")
         if not self.META_APP_SECRET:
-            problems.append("META_APP_SECRET is not set: WhatsApp webhook signatures are not verified")
+            if self.storage_mode == "offline":
+                problems.append("META_APP_SECRET is not set: unsigned WhatsApp webhooks are accepted "
+                                "(offline storage only)")
+            else:
+                problems.append("META_APP_SECRET is not set: WhatsApp webhooks are refused (unsigned "
+                                "payloads are refused with live storage)")
         if not self.META_WA_VERIFY_TOKEN:
             problems.append("META_WA_VERIFY_TOKEN is not set: Meta webhook verification handshake will fail")
         if "*" in self.ALLOWED_ORIGINS:

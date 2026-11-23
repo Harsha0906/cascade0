@@ -46,6 +46,7 @@ def save(session: "SourcingSession") -> None:
     payload = json.loads(json.dumps(payload))
     row = {
         "run_id": session.run_id,
+        "factory_id": session.params.get("factory_id") or session.model.factory_id,
         "status": session.status,
         "version": next_version,
         "updated_at": datetime.now(timezone.utc).isoformat(),
