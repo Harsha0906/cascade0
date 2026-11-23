@@ -79,13 +79,34 @@ _NUM_TOKEN_RE = re.compile(
     r"(?:\s*(?P<day>days?)(?![A-Za-z]))?", re.I)
 _LIST_MARKER_RE = re.compile(r"(?m)^\s*\d+[.)]\s+")
 _SMALL_INT_MAX = 10
+# Digits inside an identifier (SUP-HSR-03, EV-402, #A12, Unit-2) are not quantities; "Rs250" is.
+_ID_TOKEN_RE = re.compile(r"(?<![\w#\-])(?!(?:rs|inr)\.?\d)[#A-Za-z][\w#\-]*\d[\w#\-]*", re.I)
+# ISO dates and timestamps in the facts (2026-11-25, 2026-11-25T10:00:00+00:00).
+_ISO_DATE_RE = re.compile(
+    r"(?<!\d)\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
+# Spelled-out numbers cannot be checked against the facts: any of them sends narration to the template.
+_NUMBER_WORD_RE = re.compile(
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|"
+    r"sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+    r"hundreds?|thousands?|millions?|billions?|half|halves|double|twice|triple|dozens?)\b", re.I)
+# Scale and percent words are fine after a digit ("1.8 lakh", "20 percent"), not on their own.
+_SCALE_WORD_RE = re.compile(r"\b(?:lakhs?|lacs?|crores?|percent|per\s+cent)\b", re.I)
+_ENDS_IN_DIGIT_RE = re.compile(r"\d\s*$")
+
+
+def _has_number_words(text: str) -> bool:
+    text = text or ""
+    if _NUMBER_WORD_RE.search(text):
+        return True
+    return any(not _ENDS_IN_DIGIT_RE.search(text[:m.start()]) for m in _SCALE_WORD_RE.finditer(text))
 
 
 def _numbers_in(text: str) -> list:
     """(value, tolerance, kind) for every number written in `text`: lakh/crore scaled, with the
-    tolerance of the printed precision. kind is "pct", "day", "small" (a bare integer 1-10) or ""."""
+    tolerance of the printed precision. kind is "pct", "day", "small" (a bare integer 1-10) or "".
+    Digits inside identifiers are skipped."""
     out = []
-    for m in _NUM_TOKEN_RE.finditer(_LIST_MARKER_RE.sub("", text or "")):
+    for m in _NUM_TOKEN_RE.finditer(_ID_TOKEN_RE.sub(" ", _LIST_MARKER_RE.sub("", text or ""))):
         digits = m.group(1).replace(",", "")
         try:
             value = float(digits)
@@ -102,15 +123,16 @@ def _numbers_in(text: str) -> list:
 
 
 def _fact_numbers(facts: Any) -> list:
-    """Every number in the facts, flattened (numbers inside strings such as ids and rupee
-    amounts count too)."""
+    """Every number in the facts, flattened. Numbers written inside strings (rupee amounts,
+    headlines) count; digits inside ids (EV-402, SUP-HSR-03) and ISO dates/timestamps do not,
+    so they cannot ground an invented small number ("11 trucks" from a November date)."""
     out: list = []
     if isinstance(facts, bool) or facts is None:
         return out
     if isinstance(facts, (int, float)):
         return [float(facts)]
     if isinstance(facts, str):
-        return [v for v, _, _ in _numbers_in(facts)]
+        return [v for v, _, _ in _numbers_in(_ISO_DATE_RE.sub(" ", facts))]
     if isinstance(facts, dict):
         for v in facts.values():
             out += _fact_numbers(v)
@@ -123,7 +145,10 @@ def _fact_numbers(facts: Any) -> list:
 def narration_is_grounded(text: str, facts: Dict[str, Any]) -> bool:
     """True when every number in `text` equals a number in `facts`, allowing rupee formats
     (1.8L, 1,80,000, 1.8 lakh, 0.18 Cr), rounding at the printed precision, a percentage written
-    against a fraction, and days for hours. A bare integer 1-10 must match a fact exactly."""
+    against a fraction, and days for hours. A bare integer 1-10 must match a fact exactly.
+    Spelled-out numbers ("two lakh", "twenty percent", "half") are never grounded."""
+    if _has_number_words(text):
+        return False
     known = _fact_numbers(facts)
     for value, tol, kind in _numbers_in(text):
         candidates = [value] + ([value * 24] if kind == "day" else [])
@@ -545,7 +570,7 @@ def ops_hawk_node(state: CascadeGraphState) -> Dict[str, Any]:
     if not cfo["feasible"]:
         reasons.append("leaves units uncovered")
     if ops is not None and ops["confidence_pct"] - cfo["confidence_pct"] > CONFIDENCE_GAP_TRIGGER_PCT:
-        reasons.append(f"P(on-time) {cfo['confidence_pct']}% vs my {ops['confidence_pct']}%")
+        reasons.append(f"P(on-time) {cfo['confidence_pct']}% vs the speed plan's {ops['confidence_pct']}%")
     challenge = "Cost scenario plan " + "; ".join(reasons) + "."
     msg, mode = _llm_agent_reason(
         "Speed scenario (expedite-first)", "Planning scenario: maximum speed",

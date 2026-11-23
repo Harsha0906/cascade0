@@ -153,5 +153,26 @@ class TraceTimingTests(unittest.TestCase):
             self.assertIn("latency_ms", entry)
 
 
+class I5NarrationGuardWordsAndIds(unittest.TestCase):
+    FACTS = {"total_cost_inr": 180000, "confidence": 94.2, "vendor": "SUP-HSR-03", "order": "EV-402",
+             "eta": "2026-11-25T10:00", "delay_hours": 12}
+
+    def test_review_probes_are_rejected(self):
+        from app.agents.graph import narration_is_grounded as g
+        for text in ("Costs two lakh rupees.", "Saves twenty percent.", "Takes three days.", "half the cost",
+                     "Uses 11 trucks.", "A delay of 2026 hours", "Takes 3 days", "Costs a lakh more.",
+                     "Twice as fast.", "One hundred units.", "Saves ten per cent."):
+            with self.subTest(text=text):
+                self.assertFalse(g(text, self.FACTS))
+
+    def test_grounded_text_with_ids_still_passes(self):
+        from app.agents.graph import narration_is_grounded as g
+        for text in ("Costs ₹1.8L via SUP-HSR-03 for EV-402 at 94.2% confidence.",
+                     "Costs 1.8 lakh after a 12-hour delay.", "Plan B is the cheapest option.",
+                     "Delay of 12 hours on order EV-402."):
+            with self.subTest(text=text):
+                self.assertTrue(g(text, self.FACTS))
+
+
 if __name__ == "__main__":
     unittest.main()
