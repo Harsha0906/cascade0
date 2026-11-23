@@ -39,6 +39,15 @@
   - The response includes the derived parameters and the learned reliability.
 - **Orders:** `GET|POST /api/v1/orders`, `PATCH /api/v1/orders/{order_id}`. Fields: `client`, `required_qty`, `due_at` (ISO) or `hours_remaining`, `sla_penalty_inr`, `partial_delay_penalty_inr`, `priority`, plus an order line for the planning item = `required_qty`.
 - **Read-only lists:** `GET /api/v1/stock` (items, stock levels, open shipments with ETA hours) and `GET /api/v1/shipments`.
+- **Telegram contact invites (deep links):**
+  - **Problem:** Telegram bots cannot message a phone number, and the person must press Start once.
+  - **Endpoints:** `POST /api/v1/suppliers/{id}/telegram-invite` and `POST /api/v1/orders/{order_id}/telegram-invite` (owner/approver). Each returns `{link: "https://t.me/<bot_username>?start=<token>", expires_at}`. `bot_username` comes from env `TELEGRAM_BOT_USERNAME`; if unset → 409 with a clear message.
+  - **Token:** URL-safe random of about 24 chars; only a SHA-256 hash is stored; single-use; 7-day expiry. Stored in a new table `contact_invites(token_hash PK, factory_id, kind 'supplier'|'client', target_id, expires_at, used_at)` (migration 009: service-only, RLS on, no policy, REVOKE ALL from anon/authenticated).
+  - **Inbound:** the Telegram flow handles `/start <token>`:
+    - **Valid:** set `suppliers.telegram_chat_id` (kind supplier) or `orders.client_contact = telegram:<chat_id>` (kind client), scoped to the invite's factory, and reply "You're connected to <factory name> as <supplier name / client of order X>."
+    - **Invalid, used or expired:** a polite refusal.
+  - **Then:** sourcing in `SOURCING_MODE=telegram` and the Client Agent reach them automatically.
+  - **Tests:** a full invite → start → RFQ delivered to that chat flow, plus expired, reused and cross-factory tokens.
 - **CSV import:** `POST /api/v1/ingest/suppliers-csv` and `POST /api/v1/ingest/lines-csv` — row-level errors, like the existing importers.
 - **Team (owner only):**
   - `GET /api/v1/team` lists members (email, role) and linked chats.
@@ -70,7 +79,7 @@
   4. "import your Tally files" (stock, open POs, orders — existing importers) or "add orders by hand".
 
   Then "Done → Home". Every step can be skipped and finished later from the pages.
-- Pages show tables with Add / Edit / Delete (edit hidden for viewers) and API errors verbatim. The Suppliers page shows reliability, with "no history yet" when the prior is 0/0 and no outcomes. The Stock page shows stock, open shipments with ETA, and the import buttons. The Team page shows members, invite by email plus role, and the Link Telegram button.
+- Pages show tables with Add / Edit / Delete (edit hidden for viewers) and API errors verbatim. The Suppliers page shows reliability, with "no history yet" when the prior is 0/0 and no outcomes. The Stock page shows stock, open shipments with ETA, and the import buttons. The Team page shows members, invite by email plus role, and the Link Telegram button. Each row on the Suppliers page, and each order on the Orders page, has a "Telegram invite link" button: it shows the link with a Copy button and says "Send this to them; they tap Start once". A "Connected ✓" badge shows when a chat id is set.
 - Plain language everywhere: "on-time chance", "cheapest safe plan", "expected cost (incl. penalty risk)". No "MILP", "Monte Carlo", "E[cost]" in Home or the data pages (they stay in Advanced).
 
 - [ ] vitest for the validators; tsc 0
