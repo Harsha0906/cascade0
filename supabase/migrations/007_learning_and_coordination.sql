@@ -139,4 +139,19 @@ REVOKE EXECUTE ON FUNCTION execute_plan_tx(JSONB, TEXT, TEXT, JSONB, TEXT[], JSO
 GRANT EXECUTE ON FUNCTION execute_plan_tx(JSONB, TEXT, TEXT, JSONB, TEXT[], JSONB, TEXT, JSONB, JSONB)
     TO service_role;
 
+-- Client Agent coordination (Task 3): one record per root analysis run, shared by the Client
+-- and Sourcing agents. Optimistic concurrency like sourcing_sessions: every save is a
+-- compare-and-set on `version`. Service-role only (RLS on, no anon/authenticated policy).
+CREATE TABLE IF NOT EXISTS order_coordination (
+    root_run_id  TEXT PRIMARY KEY,
+    order_id     TEXT NOT NULL,
+    factory_id   TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    version      INT NOT NULL,
+    payload      JSONB NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_order_coordination_order ON order_coordination (order_id);
+ALTER TABLE order_coordination ENABLE ROW LEVEL SECURITY;
+
 INSERT INTO schema_migrations (version) VALUES (7) ON CONFLICT DO NOTHING;

@@ -345,6 +345,7 @@ REQUIRED_MIGRATION_LEVEL = 7
 _DURABLE_TABLES: tuple[tuple[str, str], ...] = (
     ("analysis_runs", "run_id"),
     ("sourcing_sessions", "run_id"),
+    ("order_coordination", "root_run_id"),
     ("execution_receipts", "root_run_id"),
     ("webhook_events", "message_id"),
 )
@@ -377,6 +378,7 @@ class InMemoryMirror:
         self.sourcing_rfqs: list[dict[str, Any]] = []
         self.analysis_runs: list[dict[str, Any]] = []
         self.sourcing_sessions: list[dict[str, Any]] = []
+        self.order_coordination: list[dict[str, Any]] = []   # Client Agent records (Round A)
         self.execution_receipts: list[dict[str, Any]] = []
         self.webhook_events: list[dict[str, Any]] = []
         self.schema_migrations: list[dict[str, Any]] = [

@@ -19,6 +19,10 @@ Loop for one analysis run:
   4. Stop when the best plan uses only confirmed vendors (or needs none), or after MAX_ROUNDS.
      The result is saved as a new run (`<run_id>-S<round>`) that goes through the normal
      human-approval / execution path.
+  5. Coordination with the Client Agent: a session that ends without full cover hands over to
+     `client.on_sourcing_failed` (it drafts a deadline-extension request, never sends it), and
+     the client's answer comes back through `restart_with_plan`, which starts a new round on the
+     re-planned target (longer deadline, or expedite allowed after a refusal).
 
 What the LLM does here: reads free-text vendor replies (English/Hinglish). Who to contact and
 whether to re-plan is decided by the optimiser, so decisions stay auditable.
@@ -110,6 +114,7 @@ class SourcingSession:
     events: List[str] = field(default_factory=list)
     sourced_run_id: Optional[str] = None
     log_step: int = 20
+    restart_round: int = 0   # round at the last restart_with_plan; MAX_ROUNDS counts from here
     version: int = 0   # optimistic-concurrency counter; 0 = never saved
 
     def to_dict(self) -> Dict[str, Any]:
@@ -126,6 +131,7 @@ class SourcingSession:
             "events": list(self.events),
             "sourced_run_id": self.sourced_run_id,
             "log_step": self.log_step,
+            "restart_round": self.restart_round,
             "version": self.version,
         }
 
@@ -144,6 +150,7 @@ class SourcingSession:
             events=list(d.get("events", [])),
             sourced_run_id=d.get("sourced_run_id"),
             log_step=d.get("log_step", 20),
+            restart_round=d.get("restart_round", 0),
             version=d.get("version", 0),
         )
 
@@ -345,6 +352,7 @@ def _solve(session: SourcingSession):
         client=p["client"],
         vendor_overrides=session.overrides,
         confirmed_vendor_ids=session.confirmed,
+        renegotiation_acceptance=p.get("renegotiation_acceptance"),
     )
 
 
@@ -368,6 +376,9 @@ def _finish(session: SourcingSession, result, status: str, reason: str) -> None:
         "solver_result": result.model_dump(),
         "sourcing_status": status,
     })
+    if isinstance(sourced.get("blast_radius"), dict):
+        # After a client-agreed extension the session plans against the new deadline.
+        sourced["blast_radius"] = {**sourced["blast_radius"], "hours_remaining": session.params["deadline_hours"]}
     run_store.save_run(sourced)
     session.sourced_run_id = sourced_id
     session.status = status
@@ -379,6 +390,34 @@ def _finish(session: SourcingSession, result, status: str, reason: str) -> None:
         f"P(on-time) {winner.confidence_pct}%. Ready for human approval as run {sourced_id}.",
         "finalise_sourced_plan()",
     )
+    if not _fully_covered(status, winner):
+        # Hand over to the Client Agent: it drafts an extension request (sends nothing) unless
+        # a request for this run is already open. Imported here: client imports this module.
+        from app.agents import client
+
+        try:
+            drafted = client.on_sourcing_failed(session.run_id, reason=reason)
+        except client.ClientAgentError as exc:
+            _log(session, f"Client Agent could not draft: {exc}",
+                 f"⚠ Not fully covered, and no extension request could be drafted: {exc}",
+                 "client.on_sourcing_failed()")
+        else:
+            if drafted is not None:
+                _log(session, f"Client Agent drafted a {drafted['extension_hours']}h extension request",
+                     f"📝 Not fully covered → Client Agent drafted a {drafted['extension_hours']}h deadline-"
+                     f"extension request for {drafted['order_id']} (awaiting human approval; nothing sent).",
+                     "client.on_sourcing_failed()")
+
+
+def _fully_covered(status: str, winner) -> bool:
+    """True when the finished plan covers the shortfall in time with confirmed supply (or needs none)."""
+    if status == "COMPLETE_UNCONFIRMED" or not winner.feasible or winner.uncovered_units:
+        return False
+    if winner.strategy_type == "SLA_RENEGOTIATION":
+        return False   # the plan is to ask the client to wait
+    if winner.strategy_type == "NO_ACTION" and winner.confidence_pct < 100.0:
+        return False   # accepting the breach is not cover
+    return True
 
 
 def _advance(session: SourcingSession) -> None:
@@ -403,9 +442,10 @@ def _advance(session: SourcingSession) -> None:
         )
         _finish(session, result, "COMPLETE", reason)
         return
-    if session.round >= settings.SOURCING_MAX_ROUNDS:
+    if session.round - session.restart_round >= settings.SOURCING_MAX_ROUNDS:
         _finish(session, result, "COMPLETE_UNCONFIRMED",
-                f"Stopped after {session.round} rounds; some suppliers in the plan are still unconfirmed.")
+                f"Stopped after {session.round - session.restart_round} rounds; "
+                       f"some suppliers in the plan are still unconfirmed.")
         return
 
     session.round += 1
@@ -545,6 +585,67 @@ def _apply_reply(session: SourcingSession, supplier_id: str, text: str, source: 
     _advance(session)
 
 
+def restart_with_plan(root_run_id: str, playbook: Dict[str, Any], reason: str, *,
+                      params_update: Optional[Dict[str, Any]] = None,
+                      allow_vendor_ids: Tuple[str, ...] = ()) -> Dict[str, Any]:
+    """Start a new sourcing round on `playbook` (re-planned by the Client Agent).
+
+    `params_update` changes the session's planning inputs (a longer `deadline_hours`, the
+    client's `renegotiation_acceptance`); `allow_vendor_ids` lifts earlier declines/timeouts for
+    those vendors so they are asked again. Confirmed offers are kept: RFQs go only to the plan's
+    vendors that have not confirmed. Enquiries still open from the previous round are superseded.
+    Known limitation (as for record_reply): a concurrent-update retry re-sends this round's RFQs.
+    """
+    with _lock:
+        for _ in range(_MAX_ATTEMPTS):
+            session = sourcing_store.load(root_run_id)
+            if session is None:
+                raise SourcingError("No sourcing session for this run.", 404)
+            _apply_restart(session, playbook, reason, params_update or {}, tuple(allow_vendor_ids))
+            try:
+                sourcing_store.save(session)
+            except sourcing_store.ConcurrentUpdateError:
+                continue
+            return view(root_run_id)
+        raise SourcingError("Sourcing session changed concurrently; retry", 409)
+
+
+def _apply_restart(session: SourcingSession, playbook: Dict[str, Any], reason: str,
+                   params_update: Dict[str, Any], allow_vendor_ids: Tuple[str, ...]) -> None:
+    known = {v.supplier_id for v in session.model.vendors}
+    unknown = sorted({a["supplier_id"] for a in playbook.get("vendor_allocations", [])} - known)
+    if unknown:
+        raise SourcingError(f"Plan uses vendors not in this run's factory model: {unknown}", 409)
+    for rfq in session.rfqs:
+        if rfq.status == "SENT":
+            rfq.status = "SUPERSEDED"
+            rfq.replied_at = _now().isoformat()
+            _persist(rfq)
+    session.params.update(params_update)
+    for sid in allow_vendor_ids:
+        if sid not in session.confirmed:
+            session.overrides.pop(sid, None)
+    session.status = "ACTIVE"
+    session.playbook_id = playbook["id"]
+    session.restart_round = session.round
+    session.round += 1   # a new round (and a new sourced run id) even when nothing is asked
+    needs = _unconfirmed_needs(playbook, session)
+    if not needs:
+        _log(session, f"Restart on {playbook['id']}: nothing new to ask",
+             f"🔁 {reason} Re-planned target {playbook['id']} needs no new enquiry.",
+             "restart_with_plan()")
+        _advance(session)   # re-solves with the new inputs; finishes or asks the winner's vendors
+        return
+    sent = [_send_rfq(session, sid, units) for sid, units in needs.items()]
+    names = ", ".join(f"{r.supplier_name.split(' (')[0]} ({r.units_requested}u)" for r in sent)
+    _log(session, f"Round {session.round} (restart on {playbook['id']}): asking {names}",
+         f"🔁 {reason} New target {playbook['id']}: enquiries sent to {names} "
+         f"(needed within {sent[0].needed_within_hours:g}h).",
+         "restart_with_plan() + send_rfq()")
+    if any(r.status == "SEND_FAILED" for r in sent):
+        _advance(session)
+
+
 def find_open_rfq_by_number(number: str) -> Optional[Tuple[str, str]]:
     """Map an inbound WhatsApp sender to (run_id, supplier_id) with an open enquiry, if any."""
     digits = _digits(number)
@@ -591,6 +692,7 @@ def view(run_id: str) -> Dict[str, Any]:
             "rfqs": [asdict(r) for r in session.rfqs],
             "events": list(session.events),
             "sourced_run_id": session.sourced_run_id,
+            "deadline_hours": session.params.get("deadline_hours"),
             "playbooks": sourced["playbooks"] if sourced else [],
             "recommended_plan_id": sourced["recommended_plan_id"] if sourced else None,
         }

@@ -259,6 +259,7 @@ def simulate_monte_carlo(
     delay_hours: int = 0,
     iterations: int = 1000,
     seed: int = 42,
+    renegotiation_acceptance: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Estimate P(plan completes before the deadline).
@@ -269,16 +270,19 @@ def simulate_monte_carlo(
     `model.qa_dispatch_hours`). A plan that leaves units uncovered can never succeed.
 
     For SLA_RENEGOTIATION, success means the client accepts the paid extension,
-    sampled from `renegotiation_acceptance_prob(delay_hours)`.
+    sampled from `renegotiation_acceptance_prob(delay_hours)` — or from
+    `renegotiation_acceptance` when the client's actual answer is known (1.0 accepted, 0.0 refused).
     """
     rng = random.Random(seed)
+    accept_p = (renegotiation_acceptance if renegotiation_acceptance is not None
+                else renegotiation_acceptance_prob(delay_hours))
     vendors = [v for v in model.vendors if units_by_vendor.get(v.supplier_id, 0) > 0]
     successes = 0
     finish_times: List[float] = []
 
     for _ in range(iterations):
         if strategy_type == "SLA_RENEGOTIATION":
-            if rng.random() < renegotiation_acceptance_prob(delay_hours):
+            if rng.random() < accept_p:
                 successes += 1
             continue
         if not fully_covered:
@@ -542,8 +546,16 @@ def _build_plan(
 
 
 def _build_renegotiation_plan(model: FactoryModel, sla_penalty_inr: int, partial_penalty_inr: int,
-                              delay_hours: int, deadline_hours: float) -> PlaybookOption:
-    mc = simulate_monte_carlo(model, "SLA_RENEGOTIATION", {}, 0, deadline_hours, delay_hours=delay_hours)
+                              delay_hours: int, deadline_hours: float,
+                              renegotiation_acceptance: Optional[float] = None) -> PlaybookOption:
+    mc = simulate_monte_carlo(model, "SLA_RENEGOTIATION", {}, 0, deadline_hours, delay_hours=delay_hours,
+                              renegotiation_acceptance=renegotiation_acceptance)
+    if renegotiation_acceptance is None:
+        basis = f"Modelled acceptance probability {mc['confidence_pct']}% (heuristic falls with a {delay_hours}h delay)"
+    else:
+        basis = ("The client ACCEPTED the extension (recorded answer)" if renegotiation_acceptance >= 1.0 else
+                 "The client REFUSED the extension (recorded answer)" if renegotiation_acceptance <= 0.0 else
+                 f"Recorded acceptance probability {mc['confidence_pct']}%")
     p = mc["confidence_pct"] / 100.0
     # Accepted → pay the partial fee. Rejected → full breach penalty.
     expected = int(round(p * partial_penalty_inr + (1 - p) * sla_penalty_inr))
@@ -566,8 +578,7 @@ def _build_renegotiation_plan(model: FactoryModel, sla_penalty_inr: int, partial
         feasible=True,
         description=(
             f"Ask the client for a paid extension (₹{partial_penalty_inr:,} delay fee). "
-            f"Modelled acceptance probability {mc['confidence_pct']}% (heuristic falls with a "
-            f"{delay_hours}h delay); if refused, the full ₹{sla_penalty_inr:,} penalty applies."
+            f"{basis}; if refused, the full ₹{sla_penalty_inr:,} penalty applies."
         ),
     )
 
@@ -638,6 +649,7 @@ def generate_playbooks(
     cfo_min_vendor_reliability_pct: float = 0.0,
     vendor_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     confirmed_vendor_ids: Optional[set] = None,
+    renegotiation_acceptance: Optional[float] = None,
 ) -> SolverResult:
     """
     Build candidate playbooks and rank them by risk-adjusted expected cost:
@@ -651,7 +663,12 @@ def generate_playbooks(
 
     `vendor_overrides` (e.g. offers confirmed by the Sourcing Agent) are applied to the
     model for this run only; `delay_hours` is the upstream delay that caused the shortfall.
+    `renegotiation_acceptance` is the client's actual answer to an extension request when the
+    caller knows it (1.0 accepted, 0.0 refused); None keeps the `renegotiation_acceptance_prob`
+    heuristic. The solver never reads it from the database.
     """
+    if renegotiation_acceptance is not None and not 0.0 <= float(renegotiation_acceptance) <= 1.0:
+        raise SolverInputError("renegotiation_acceptance must be within [0, 1]")
     t_start = time.perf_counter()
     model = model.with_vendor_overrides(vendor_overrides)
     confirmed = set(confirmed_vendor_ids or ())
@@ -674,7 +691,7 @@ def generate_playbooks(
                                          deadline_hours, delay_hours))
     else:
         plans.append(_build_renegotiation_plan(model, sla_penalty_inr, partial_penalty_inr, delay_hours,
-                                               deadline_hours))
+                                               deadline_hours, renegotiation_acceptance))
 
     plans.append(_build_no_action_plan(model, shortfall_units, line_speeds, sla_penalty_inr))
 

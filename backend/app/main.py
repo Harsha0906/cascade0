@@ -18,6 +18,10 @@ CascadeZero — FastAPI server
   POST /api/v1/sourcing/start              Sourcing Agent: send vendor enquiries [API key]
   GET  /api/v1/sourcing/{run_id}           enquiry status + confirmed plan
   POST /api/v1/sourcing/{run_id}/vendor-reply  record a vendor reply           [API key]
+  POST /api/v1/client/draft                Client Agent: draft an extension request [API key]
+  POST /api/v1/client/approve              human sign-off: send it to the client [API key]
+  POST /api/v1/client/answer               record the client's answer (re-plans) [API key]
+  GET  /api/v1/client/{run_id}             the run's extension request / answer
   POST /api/v1/reset                       reset demo data                       [API key]
 
 Security model: mutating endpoints require the shared operator key in `X-API-Key`
@@ -47,6 +51,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import importers, reliability, run_store
+from app.agents import client as client_agent
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
 from app import db
@@ -70,6 +75,9 @@ from app.schemas import (
     LiveHighwayCheckRequest,
     PlcTelemetryRequest,
     SimulateCrisisRequest,
+    ClientAnswerRequest,
+    ClientApproveRequest,
+    ClientDraftRequest,
     SourcingReplyRequest,
     SourcingStartRequest,
 )
@@ -1034,6 +1042,46 @@ def get_sourcing(run_id: str):
 def post_vendor_reply(run_id: str, req: SourcingReplyRequest):
     """Record a vendor's reply typed by an operator (phone call) or, in simulated mode, a simulated vendor."""
     return _sourcing_call(sourcing.record_reply, run_id, req.supplier_id, req.text, f"operator:{req.entered_by}")
+
+
+# ─── 8b. Client Agent (deadline extension; human sign-off before sending) ──
+
+def _client_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except client_agent.ClientAgentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except sourcing.SourcingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except SolverInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except FactoryDataError as exc:
+        raise _factory_503(exc)
+
+
+@app.post("/api/v1/client/draft", dependencies=[Depends(require_api_key)])
+def client_draft(req: ClientDraftRequest):
+    """Draft a deadline-extension request for the run's order. Nothing is sent."""
+    return _client_call(client_agent.draft_extension, req.run_id, req.extension_hours, req.reason)
+
+
+@app.post("/api/v1/client/approve", dependencies=[Depends(require_api_key)])
+def client_approve(req: ClientApproveRequest):
+    """A named person approves the draft; only then is it sent (SOURCING_MODE channel)."""
+    return _client_call(client_agent.approve_extension, req.run_id, req.approved_by)
+
+
+@app.post("/api/v1/client/answer", dependencies=[Depends(require_api_key)])
+def client_answer(req: ClientAnswerRequest):
+    """Record the client's answer: extends the deadline (accepted), re-plans and restarts sourcing."""
+    return _client_call(client_agent.record_client_answer, req.run_id, req.accepted, req.text,
+                        req.new_deadline_hours, f"operator:{req.entered_by}")
+
+
+@app.get("/api/v1/client/{run_id}")
+def get_client(run_id: str):
+    """The run's extension request: draft, sent message, answer and re-plan."""
+    return _client_call(client_agent.view, run_id)
 
 
 # ─── 9. Reset ────────────────────────────────────────────────────────────────

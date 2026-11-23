@@ -1,0 +1,336 @@
+"""Client Agent tests (offline: simulated channel, in-memory DB, pinned clock)."""
+
+import copy
+import unittest
+from datetime import datetime, timedelta, timezone
+from unittest import mock
+
+from tests import _offline_env  # noqa: F401  (must precede app imports)
+from fastapi.testclient import TestClient
+
+from app import db, main, run_store
+from app.agents import client as client_agent
+from app.agents import sourcing, sourcing_store
+from app.config import settings
+from app.deadlines import parse_timestamp
+
+KEY = {"X-API-Key": "test-operator-key"}
+# Pinned clock for the Client Agent (whole hour, so the quoted deadlines are exact).
+PIN = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+
+def _fmt(dt):
+    return dt.strftime("%d %b %Y %H:%M UTC")
+SLOW = "SUP-MYS-05"
+
+
+def _add_slow_vendor():
+    """A cheap BACKUP vendor whose 60h lead time cannot meet the 38h deadline (it can meet 86h)."""
+    row = copy.deepcopy(db.get_supplier("SUP-PNY-02"))
+    row.update(id=SLOW, name="Mysuru Bulk Castings", route="Mysuru Road (140 km)", tier="TIER-3",
+               extra_cost_per_unit_inr=300, lead_time_hours=60, min_lead_hours=50,
+               lead_time_sigma_hours=2.0, max_available_qty=200)
+    db.upsert_row("suppliers", row)
+    db.upsert_row("vendor_history", {
+        "id": 5, "supplier_id": SLOW, "past_orders_count": 20, "on_time_deliveries": 18,
+        "reliability_score_pct": 90.0, "quality_rejection_rate_pct": 1.0,
+        "last_incident_note": "Slow road freight from Mysuru; cheapest casings."})
+
+
+class ClientAgentTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.api = TestClient(main.app)
+
+    def setUp(self):
+        self.api.post("/api/v1/reset", headers=KEY)
+        db.update_rows("orders", "order_id", "EV-402", {"due_at": (PIN + timedelta(hours=38)).isoformat()})
+        p = mock.patch.object(client_agent, "_now", lambda: PIN)
+        p.start()
+        self.addCleanup(p.stop)
+
+    # ── helpers ──
+    def _simulate(self, scenario=1):
+        r = self.api.post("/api/v1/simulate-crisis", json={"scenario_id": scenario}, headers=KEY)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _reply(self, run_id, supplier_id, text):
+        r = self.api.post(f"/api/v1/sourcing/{run_id}/vendor-reply",
+                          json={"supplier_id": supplier_id, "text": text}, headers=KEY)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _fail_sourcing(self, run_id):
+        """Start sourcing on the cost plan and have every vendor decline."""
+        r = self.api.post("/api/v1/sourcing/start", json={"run_id": run_id}, headers=KEY)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual([x["supplier_id"] for x in r.json()["rfqs"]], ["SUP-PNY-02"])
+        self._reply(run_id, "SUP-PNY-02", "NO, out of stock")
+        self._reply(run_id, "SUP-HSR-03", "sorry nahi hoga")
+        s = self._reply(run_id, "SUP-AIR-04", "NO")
+        self.assertEqual(s["status"], "COMPLETE")
+        self.assertEqual(s["recommended_plan_id"], "PLAN_C")
+        return s
+
+    def _client(self, run_id):
+        r = self.api.get(f"/api/v1/client/{run_id}")
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _approve(self, run_id, who="ops-lead@apex"):
+        return self.api.post("/api/v1/client/approve", json={"run_id": run_id, "approved_by": who}, headers=KEY)
+
+    def _answer(self, run_id, accepted, **extra):
+        return self.api.post("/api/v1/client/answer",
+                             json={"run_id": run_id, "accepted": accepted, **extra}, headers=KEY)
+
+    # ── Done-when ──
+    def test_accepted_extension_changes_enquiries_and_final_plan(self):
+        _add_slow_vendor()
+        sim = self._simulate(1)
+        self.assertEqual(sim["recommended_plan_id"], "PLAN_B")
+        run_id = sim["run_id"]
+        before = self._fail_sourcing(run_id)
+        asked_before = {(x["supplier_id"], x["units_requested"]) for x in before["rfqs"]}
+        self.assertNotIn(SLOW, {sid for sid, _ in asked_before})
+
+        # 1. Sourcing failed → the Client Agent drafted an extension request on its own.
+        c = self._client(run_id)
+        self.assertEqual(c["status"], "DRAFTED")
+        self.assertEqual(c["drafted_by"], "sourcing_failure")
+        self.assertEqual(c["extension_hours"], 48)   # the run's upstream delay
+        msg = c["draft_message"]
+        for fact in ("EV-402", "Ather-Grid Mobility Corp", "Chennai Precision Casings Ltd +48h", "₹500,000",
+                     _fmt(PIN + timedelta(hours=38)), _fmt(PIN + timedelta(hours=86))):
+            self.assertIn(fact, msg)
+        self.assertEqual(c["outbox"], [])
+
+        r = self._approve(run_id)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "SENT")
+        self.assertEqual(len(r.json()["outbox"]), 1)
+
+        r = self._answer(run_id, True, text="OK, 48h extension accepted with the delay fee")
+        self.assertEqual(r.status_code, 200, r.text)
+        c = r.json()
+        self.assertEqual(c["status"], "ACCEPTED")
+        # The order's absolute deadline moved by 48h.
+        self.assertEqual(parse_timestamp(db.get_order("EV-402")["due_at"]), PIN + timedelta(hours=86))
+        # 2. The re-plan uses the longer deadline: the slow vendor is now feasible and asked.
+        replan = run_store.get_run(c["replan_run_id"])
+        self.assertEqual(replan["parent_run_id"], run_id)
+        self.assertEqual(replan["solver_result"]["deadline_hours"], 86.0)
+        plan_c = next(p for p in replan["playbooks"] if p["id"] == "PLAN_C")
+        self.assertEqual(plan_c["confidence_pct"], 100.0)   # the actual answer, not the heuristic
+        s = sourcing.view(run_id)
+        self.assertEqual(s["status"], "ACTIVE")
+        open_rfqs = [x for x in s["rfqs"] if x["status"] == "SENT"]
+        self.assertEqual([(x["supplier_id"], x["units_requested"]) for x in open_rfqs], [(SLOW, 150)])
+        self.assertNotIn((SLOW, 150), asked_before)
+        self.assertEqual(open_rfqs[0]["needed_within_hours"], 82.5)
+
+        # 3. The final recommended plan differs from before.
+        s = self._reply(run_id, SLOW, "YES 150 pcs @300 in 60h")
+        self.assertEqual(s["status"], "COMPLETE")
+        self.assertNotEqual(s["recommended_plan_id"], before["recommended_plan_id"])
+        winner = next(p for p in s["playbooks"] if p["id"] == s["recommended_plan_id"])
+        self.assertEqual({a["supplier_id"]: a["units_allocated"] for a in winner["vendor_allocations"]},
+                         {SLOW: 150})
+        self.assertNotEqual(s["sourced_run_id"], before["sourced_run_id"])
+        # The new round ended covered: no second auto-draft; the record stays ACCEPTED.
+        self.assertEqual(self._client(run_id)["status"], "ACCEPTED")
+
+    def test_refused_extension_widens_sourcing_to_the_expedite_vendor(self):
+        sim = self._simulate(1)
+        run_id = sim["run_id"]
+        self._fail_sourcing(run_id)
+        self.assertEqual(self._approve(run_id).status_code, 200)
+        due_before = db.get_order("EV-402")["due_at"]
+        r = self._answer(run_id, False, text="No extension possible")
+        self.assertEqual(r.status_code, 200, r.text)
+        c = r.json()
+        self.assertEqual(c["status"], "REFUSED")
+        self.assertEqual(db.get_order("EV-402")["due_at"], due_before)
+        replan = run_store.get_run(c["replan_run_id"])
+        plan_c = next(p for p in replan["playbooks"] if p["id"] == "PLAN_C")
+        self.assertEqual(plan_c["confidence_pct"], 0.0)
+        self.assertEqual(c["sourcing_target_plan_id"], "PLAN_A")
+        s = sourcing.view(run_id)
+        self.assertEqual(s["status"], "ACTIVE")
+        open_ids = [x["supplier_id"] for x in s["rfqs"] if x["status"] == "SENT"]
+        self.assertIn("SUP-AIR-04", open_ids)
+        self.assertEqual(max(x["round"] for x in s["rfqs"]), 4)
+
+    # ── Review Focus 3 ──
+    def test_answer_before_approval_twice_or_conflicting_is_409(self):
+        sim = self._simulate(1)
+        run_id = sim["run_id"]
+        r = self.api.post("/api/v1/client/draft", json={"run_id": run_id, "extension_hours": 24}, headers=KEY)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._answer(run_id, True).status_code, 409)   # not approved yet
+        self.assertEqual(self._approve(run_id).status_code, 200)
+        self.assertEqual(self._approve(run_id).status_code, 409)        # already sent
+        self.assertEqual(self._answer(run_id, True).status_code, 200)
+        self.assertEqual(self._answer(run_id, True).status_code, 409)   # duplicate
+        self.assertEqual(self._answer(run_id, False).status_code, 409)  # conflicting
+        self.assertEqual(self._client(run_id)["status"], "ACCEPTED")
+        # Only one extension was applied.
+        self.assertEqual(parse_timestamp(db.get_order("EV-402")["due_at"]), PIN + timedelta(hours=62))
+
+    def test_answer_without_any_request_is_409_and_unknown_run_404(self):
+        sim = self._simulate(1)
+        self.assertEqual(self._answer(sim["run_id"], True).status_code, 409)
+        self.assertEqual(self.api.get("/api/v1/client/RUN-NOPE").status_code, 404)
+        r = self.api.post("/api/v1/client/draft", json={"run_id": "RUN-NOPE", "extension_hours": 5}, headers=KEY)
+        self.assertEqual(r.status_code, 404)
+
+    def test_draft_validation_and_api_key(self):
+        sim = self._simulate(1)
+        r = self.api.post("/api/v1/client/draft", json={"run_id": sim["run_id"], "extension_hours": 0}, headers=KEY)
+        self.assertEqual(r.status_code, 422)
+        with self.assertRaises(client_agent.ClientAgentError) as cm:
+            client_agent.draft_extension(sim["run_id"], -3)
+        self.assertEqual(cm.exception.status_code, 422)
+        r = self.api.post("/api/v1/client/draft", json={"run_id": sim["run_id"], "extension_hours": 5})
+        self.assertEqual(r.status_code, 401)
+        r = self.api.post("/api/v1/client/approve", json={"run_id": sim["run_id"], "approved_by": "x"})
+        self.assertEqual(r.status_code, 401)
+        r = self.api.post("/api/v1/client/answer", json={"run_id": sim["run_id"], "accepted": True})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(self._approve(sim["run_id"]).status_code, 404)  # nothing drafted
+
+    def test_new_deadline_hours_counter_offer(self):
+        sim = self._simulate(1)
+        run_id = sim["run_id"]
+        client_agent.draft_extension(run_id, 48)
+        client_agent.approve_extension(run_id, "ops-lead")
+        r = self._answer(run_id, True, new_deadline_hours=20)   # earlier than today's deadline
+        self.assertEqual(r.status_code, 422)
+        r = self._answer(run_id, True, new_deadline_hours=60)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(parse_timestamp(db.get_order("EV-402")["due_at"]), PIN + timedelta(hours=60))
+        self.assertEqual(run_store.get_run(r.json()["replan_run_id"])["solver_result"]["deadline_hours"], 60.0)
+
+    # ── Review Focus 4 ──
+    def test_no_duplicate_draft_when_request_already_open(self):
+        sim = self._simulate(1)
+        run_id = sim["run_id"]
+        client_agent.draft_extension(run_id, 24, reason="operator asked first")
+        version = client_agent.view(run_id)["version"]
+        self._fail_sourcing(run_id)
+        c = self._client(run_id)
+        self.assertEqual((c["drafted_by"], c["extension_hours"], c["version"]), ("operator", 24, version))
+        # Also once sent: still no new draft.
+        client_agent.approve_extension(run_id, "ops-lead")
+        self.assertIsNone(client_agent.on_sourcing_failed(run_id))
+        self.assertEqual(self._client(run_id)["status"], "SENT")
+
+    def test_covered_sourcing_does_not_draft(self):
+        sim = self._simulate(1)
+        self.api.post("/api/v1/sourcing/start", json={"run_id": sim["run_id"]}, headers=KEY)
+        self._reply(sim["run_id"], "SUP-PNY-02", "YES 150 pcs @600 in 4h")
+        self.assertEqual(self.api.get(f"/api/v1/client/{sim['run_id']}").status_code, 404)
+
+    # ── Human sign-off ──
+    def test_no_outbound_message_before_approval(self):
+        sent = mock.Mock(return_value=True)
+        with mock.patch.object(client_agent, "send_whatsapp_text", sent), \
+                mock.patch.object(settings, "SOURCING_MODE", "whatsapp"):
+            sim = self._simulate(1)
+            run_id = sim["run_id"]
+            client_agent.draft_extension(run_id, 24)
+            client_agent.draft_extension(run_id, 36)   # re-draft while DRAFTED is allowed
+            self.assertEqual(client_agent.view(run_id)["extension_hours"], 36)
+            sent.assert_not_called()
+            self.assertEqual(client_agent.view(run_id)["outbox"], [])
+            # WhatsApp mode needs the client's number on the order.
+            with self.assertRaises(client_agent.ClientAgentError) as cm:
+                client_agent.approve_extension(run_id, "ops-lead")
+            self.assertEqual(cm.exception.status_code, 409)
+            self.assertIn("no client contact", str(cm.exception))
+            sent.assert_not_called()
+            self.assertEqual(client_agent.view(run_id)["status"], "DRAFTED")
+            with self.assertRaises(client_agent.ClientAgentError) as cm:
+                client_agent.approve_extension(run_id, "  ")
+            self.assertEqual(cm.exception.status_code, 422)
+            db.update_rows("orders", "order_id", "EV-402", {"client_whatsapp_number": "+91 98450 11111"})
+            c = client_agent.approve_extension(run_id, "ops-lead")
+            self.assertEqual(c["status"], "SENT")
+            sent.assert_called_once()
+            self.assertEqual(sent.call_args[0][0], "919845011111")
+            self.assertIn("EV-402", sent.call_args[0][1])
+
+    def test_whatsapp_send_failure_keeps_draft(self):
+        with mock.patch.object(client_agent, "send_whatsapp_text", lambda *a, **k: False), \
+                mock.patch.object(settings, "SOURCING_MODE", "whatsapp"):
+            sim = self._simulate(1)
+            db.update_rows("orders", "order_id", "EV-402", {"client_whatsapp_number": "919845011111"})
+            client_agent.draft_extension(sim["run_id"], 24)
+            with self.assertRaises(client_agent.ClientAgentError) as cm:
+                client_agent.approve_extension(sim["run_id"], "ops-lead")
+            self.assertEqual(cm.exception.status_code, 502)
+            self.assertEqual(client_agent.view(sim["run_id"])["status"], "DRAFTED")
+
+    def test_sourced_child_run_maps_to_root_record(self):
+        sim = self._simulate(1)
+        s = self._fail_sourcing(sim["run_id"])
+        child = s["sourced_run_id"]
+        self.assertEqual(self._client(child)["root_run_id"], sim["run_id"])
+
+    def test_record_survives_reload_and_uses_optimistic_concurrency(self):
+        sim = self._simulate(1)
+        client_agent.draft_extension(sim["run_id"], 24)
+        rec = client_agent.load(sim["run_id"])
+        stale = copy.deepcopy(rec)
+        client_agent.save(rec)
+        with self.assertRaises(client_agent.ConcurrentUpdateError):
+            client_agent.save(stale)
+        row = db.fetch_by_id("order_coordination", "root_run_id", sim["run_id"])
+        self.assertEqual((row["order_id"], row["factory_id"], row["status"]), ("EV-402", "apex-volt-blr2", "DRAFTED"))
+
+    def test_reset_clears_coordination(self):
+        sim = self._simulate(1)
+        client_agent.draft_extension(sim["run_id"], 24)
+        self.api.post("/api/v1/reset", headers=KEY)
+        self.assertEqual(db.fetch_all("order_coordination"), [])
+
+
+class SolverAnswerTests(unittest.TestCase):
+    def test_known_answer_replaces_heuristic(self):
+        from app.solver import generate_playbooks
+        from tests.factories import small_factory
+        model = small_factory()
+        kw = dict(model=model, shortfall_units=500, delay_hours=10, line_speeds={}, order_id="O",
+                  sla_penalty_inr=1_000_000, partial_penalty_inr=100_000, deadline_hours=30, client="C")
+        by_answer = {}
+        for answer in (None, 1.0, 0.0):
+            res = generate_playbooks(**kw, renegotiation_acceptance=answer)
+            by_answer[answer] = next(p for p in res.playbooks if p.id == "PLAN_C")
+        if by_answer[None].strategy_type != "SLA_RENEGOTIATION":
+            self.skipTest("small_factory safety stock covers the shortfall")
+        self.assertEqual(by_answer[1.0].confidence_pct, 100.0)
+        self.assertEqual(by_answer[1.0].expected_cost_inr, 100_000)
+        self.assertEqual(by_answer[0.0].confidence_pct, 0.0)
+        self.assertEqual(by_answer[0.0].expected_cost_inr, 1_000_000)
+        self.assertNotIn(by_answer[None].confidence_pct, (0.0, 100.0))
+        with self.assertRaises(Exception):
+            generate_playbooks(**kw, renegotiation_acceptance=1.5)
+
+
+class CoordinationSchemaTests(unittest.TestCase):
+    def test_migration_and_schema_define_order_coordination(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[2] / "supabase"
+        for path in (root / "migrations" / "007_learning_and_coordination.sql", root / "schema.sql"):
+            sql = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                self.assertIn("CREATE TABLE IF NOT EXISTS order_coordination", sql)
+                self.assertIn("root_run_id  TEXT PRIMARY KEY", sql)
+                self.assertIn("ALTER TABLE order_coordination ENABLE ROW LEVEL SECURITY", sql)
+        mig = (root / "migrations" / "007_learning_and_coordination.sql").read_text(encoding="utf-8")
+        self.assertLess(mig.index("order_coordination"), mig.index("VALUES (7)"))
+
+
+if __name__ == "__main__":
+    unittest.main()
