@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { Edge, Node } from "@xyflow/react";
 import { subscribeToTable } from "@/lib/supabase";
+import { apiFetch, describeApiError } from "@/lib/session";
 import { buildTwinGraph, type FactoryInfo, type Scenario, type ShortfallParams } from "@/lib/twinGraph";
 import { rootRunId, runViewState, type RunResponse } from "@/lib/runHydration";
 
@@ -264,7 +265,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
   const clientCall = async (path: string, body: Record<string, unknown>, fallback: string): Promise<boolean> => {
     set({ isClientBusy: true, clientError: null });
     try {
-      const res = await fetch(`${API_BASE}${path}`, {
+      const res = await apiFetch(`${API_BASE}${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -288,9 +289,9 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
   let retryAttempt = 0;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const errMsg = async (res: Response, what: string) => {
-    const detail = await res.json().catch(() => ({}));
-    return detail.detail || `${what} unavailable (HTTP ${res.status})`;
+  const errMsg = async (res: Response, what: string, path = "") => {
+    const body = await res.json().catch(() => ({}));
+    return describeApiError(res.status, path, body.detail) || `${what} unavailable (HTTP ${res.status})`;
   };
 
   /** Load /factory and /scenarios independently; schedule bounded retries for whichever failed. */
@@ -301,8 +302,8 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     }
     if (!get().factory) {
       try {
-        const res = await fetch(`${API_BASE}/api/v1/factory`);
-        if (!res.ok) throw new Error(await errMsg(res, "Factory model"));
+        const res = await apiFetch(`${API_BASE}/api/v1/factory`);
+        if (!res.ok) throw new Error(await errMsg(res, "Factory model", "/api/v1/factory"));
         set({ factory: (await res.json()) as FactoryInfo, factoryError: null });
       } catch (err) {
         set({ factoryError: err instanceof Error ? err.message : "Factory model unavailable" });
@@ -310,7 +311,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     }
     if (get().scenarios.length === 0 || get().scenariosError) {
       try {
-        const res = await fetch(`${API_BASE}/api/v1/scenarios`);
+        const res = await apiFetch(`${API_BASE}/api/v1/scenarios`);
         if (!res.ok) throw new Error(await errMsg(res, "Scenario presets"));
         set({ scenarios: (await res.json()) as Scenario[], scenariosError: null });
       } catch (err) {
@@ -328,7 +329,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
   const runSimulation = async (payload: Record<string, unknown>, scenarioId: number | null) => {
     set({ isSimulating: true, activeScenarioId: scenarioId, lastError: null, sourcing: null, clientRecord: null, clientError: null });
     try {
-      const res = await fetch(`${API_BASE}/api/v1/simulate-crisis`, {
+      const res = await apiFetch(`${API_BASE}/api/v1/simulate-crisis`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...payload, source_channel: "WEB_DASHBOARD" }),
@@ -355,15 +356,15 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     if (hydrated || get().activeRunId) return;
     hydrated = true;
     try {
-      const latest = await fetch(`${API_BASE}/api/v1/runs/latest`);
+      const latest = await apiFetch(`${API_BASE}/api/v1/runs/latest`);
       if (!latest.ok) return;
       const { run_id } = (await latest.json()) as { run_id: string | null };
       if (!run_id || get().activeRunId) return;
-      const res = await fetch(`${API_BASE}/api/v1/runs/${encodeURIComponent(run_id)}`);
+      const res = await apiFetch(`${API_BASE}/api/v1/runs/${encodeURIComponent(run_id)}`);
       if (!res.ok || get().activeRunId) return;
       const data = (await res.json()) as RunResponse<PlaybookOption>;
       set({ ...runViewState(data), aiMode: (data.ai_mode as AiMode) || null });
-      const sourcingRes = await fetch(`${API_BASE}/api/v1/sourcing/${encodeURIComponent(rootRunId(data))}`);
+      const sourcingRes = await apiFetch(`${API_BASE}/api/v1/sourcing/${encodeURIComponent(rootRunId(data))}`);
       if (sourcingRes.ok) applySourcing((await sourcingRes.json()) as SourcingState);
       await get().loadClient();
     } catch (err) {
@@ -413,7 +414,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
 
   fetchInitialState: async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/v1/state`);
+      const res = await apiFetch(`${API_BASE}/api/v1/state`);
       if (res.ok) {
         const data = await res.json();
         set({
@@ -497,7 +498,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     set({ isExecuting: true, lastError: null });
     try {
       // The server executes the plan it computed for this run; no costs are sent from the browser.
-      const res = await fetch(`${API_BASE}/api/v1/execute-plan`, {
+      const res = await apiFetch(`${API_BASE}/api/v1/execute-plan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -532,7 +533,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     if (!activeRunId) return;
     set({ isSourcingBusy: true, lastError: null });
     try {
-      const res = await fetch(`${API_BASE}/api/v1/sourcing/start`, {
+      const res = await apiFetch(`${API_BASE}/api/v1/sourcing/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ run_id: activeRunId, playbook_id: selectedPlaybookId }),
@@ -551,7 +552,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     const sourcing = get().sourcing;
     if (!sourcing) return;
     try {
-      const res = await fetch(`${API_BASE}/api/v1/sourcing/${encodeURIComponent(sourcing.run_id)}`);
+      const res = await apiFetch(`${API_BASE}/api/v1/sourcing/${encodeURIComponent(sourcing.run_id)}`);
       if (res.ok) applySourcing(await res.json());
     } catch {
       // keep last known state; the panel shows it
@@ -563,7 +564,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     if (!sourcing || !text.trim()) return;
     set({ isSourcingBusy: true, lastError: null });
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         `${API_BASE}/api/v1/sourcing/${encodeURIComponent(sourcing.run_id)}/vendor-reply`,
         {
           method: "POST",
@@ -585,7 +586,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
     const { activeRunId } = get();
     if (!activeRunId) return;
     try {
-      const res = await fetch(`${API_BASE}/api/v1/client/${encodeURIComponent(activeRunId)}`);
+      const res = await apiFetch(`${API_BASE}/api/v1/client/${encodeURIComponent(activeRunId)}`);
       if (res.ok) set({ clientRecord: await res.json() });
       else if (res.status === 404) set({ clientRecord: null });
     } catch {
@@ -616,7 +617,7 @@ export const useFactoryStore = create<FactoryState>((set, get) => {
 
   resetFactory: async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/v1/reset`, { method: "POST" });
+      const res = await apiFetch(`${API_BASE}/api/v1/reset`, { method: "POST" });
       if (!res.ok) throw new Error(`Reset failed (HTTP ${res.status})`);
       set({
         lastError: null,

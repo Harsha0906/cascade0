@@ -6,7 +6,11 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
 
 export const supabase =
   supabaseUrl && supabaseAnonKey
-    ? createClient(supabaseUrl, supabaseAnonKey, { realtime: { params: { eventsPerSecond: 10 } } })
+    ? createClient(supabaseUrl, supabaseAnonKey, {
+        // The session persists in localStorage; the same client drives Realtime so RLS sees the signed-in member.
+        auth: { persistSession: true, autoRefreshToken: true },
+        realtime: { params: { eventsPerSecond: 10 } },
+      })
     : null;
 
 if (!supabase && typeof window !== "undefined") {
