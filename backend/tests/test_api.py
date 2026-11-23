@@ -116,13 +116,13 @@ class ApiTests(unittest.TestCase):
     def test_meta_pipeline_factory_error_is_not_500(self):
         before = len(self.sent)
         with mock.patch("app.agents.graph.load_factory_model", side_effect=FactoryDataError("bad data")):
-            r = self._meta_text("919000000001", "Flood on NH48, 48h delay, 150 casings short")
+            r = self._meta_text("919800000000", "Flood on NH48, 48h delay, 150 casings short")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["status"], "error")
         self.assertIn("Factory data invalid", r.json()["detail"])
         self.assertGreater(len(self.sent), before)
         sender, text = self.sent[-1][:2]
-        self.assertEqual(sender, "919000000001")
+        self.assertEqual(sender, "919800000000")
         self.assertIn("misconfigured", text)
         self.assertNotIn("bad data", text)  # no internal detail goes to WhatsApp senders
 

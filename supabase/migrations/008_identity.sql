@@ -508,6 +508,16 @@ ALTER TABLE link_codes ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON user_channels FROM anon, authenticated;
 REVOKE ALL ON link_codes FROM anon, authenticated;
 
+-- ============================================================================
+-- Part 4 (Task 6): Telegram contacts. Plain columns on tables that already have member-only
+-- RLS and no write grants for browser roles; nothing here opens access.
+--   suppliers.telegram_chat_id : where a vendor receives RFQs when SOURCING_MODE=telegram
+--   orders.client_contact      : "<channel>:<address>" the Client Agent messages (telegram/whatsapp)
+-- Set both with `python -m app.admin set-vendor-contact` / `set-client-contact`.
+-- ============================================================================
+ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_contact TEXT;
+
 -- ----------------------------------------------------------------------------
 -- >>> Later Round B tasks (Task 3 onward) APPEND their parts HERE, above the version insert. <<<
 -- New tables: ENABLE ROW LEVEL SECURITY, give them a factory_id (NOT NULL) and either a

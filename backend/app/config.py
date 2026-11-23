@@ -49,6 +49,10 @@ class Settings:
     # Shared secret Telegram echoes in X-Telegram-Bot-Api-Secret-Token (setWebhook secret_token).
     # Unset: the Telegram webhook refuses every update (fail closed).
     TELEGRAM_WEBHOOK_SECRET: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+    # `python -m app.telegram_poll` remembers the next getUpdates offset here (a local file).
+    TELEGRAM_POLL_OFFSET_FILE: str = os.getenv(
+        "TELEGRAM_POLL_OFFSET_FILE",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".telegram_poll_offset"))
 
     # ── Security ──────────────────────────────────────────────────────────
     # "production" makes the API key, webhook secret and explicit CORS origins mandatory.
@@ -70,6 +74,7 @@ class Settings:
     # ── Sourcing Agent ────────────────────────────────────────────────────
     # "simulated": enquiries are recorded and vendor replies are entered on the dashboard.
     # "whatsapp":  enquiries go to suppliers.whatsapp_number via the Meta Cloud API.
+    # "telegram":  enquiries go to suppliers.telegram_chat_id via the Telegram Bot API.
     SOURCING_MODE: str = os.getenv("SOURCING_MODE", "simulated").lower()
     SOURCING_REPLY_TIMEOUT_MIN: int = int(os.getenv("SOURCING_REPLY_TIMEOUT_MIN", "30"))
     SOURCING_MAX_ROUNDS: int = int(os.getenv("SOURCING_MAX_ROUNDS", "3"))

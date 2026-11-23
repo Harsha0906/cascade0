@@ -25,7 +25,9 @@ Client Agent drafts a follow-up request (request_number + 1; the earlier request
 
 Human sign-off: nothing reaches the client before `approve_extension(..., approved_by)`.
 Sending uses the Sourcing Agent's channel setting (`SOURCING_MODE`): simulated records the
-message; whatsapp sends it to the order's `client_whatsapp_number` (409 when there is none).
+message; whatsapp sends it to the order's `client_whatsapp_number` (or a `whatsapp:` client_contact),
+telegram to the order's `client_contact` ("telegram:<chat_id>", set with `python -m app.admin
+set-client-contact`); 409 "no client contact" when there is none.
 The message quotes only data (order id, client, deadlines, the disruption headline, the order's
 partial-delay penalty); no number is written by an LLM.
 """
@@ -311,27 +313,41 @@ def approve_extension(run_id: str, approved_by: str) -> Dict[str, Any]:
 
         mode = settings.SOURCING_MODE
         number = ""
-        if mode == "whatsapp":
-            number = sourcing._digits(_order(record["order_id"]).get("client_whatsapp_number") or "")
+        if mode in ("whatsapp", "telegram"):
+            order = _order(record["order_id"])
+            contact_channel, _, contact_address = str(order.get("client_contact") or "").partition(":")
+            if contact_channel.strip().lower() == mode and contact_address.strip():
+                number = contact_address.strip()
+            elif mode == "whatsapp":
+                number = order.get("client_whatsapp_number") or ""
+            if mode == "whatsapp":
+                number = sourcing._digits(number)
             if not number:
                 raise ClientAgentError(
-                    f"no client contact: order {record['order_id']} has no client_whatsapp_number.", 409)
+                    f"no client contact: order {record['order_id']} has no {mode} contact "
+                    f"(python -m app.admin set-client-contact).", 409)
 
         # Claim before sending, so two approvals can never send twice.
         record.update({"status": "APPROVED", "approved_by": approver[:120], "approved_at": _now().isoformat()})
         _save_or_409(record)
 
         try:
-            sent = True if mode != "whatsapp" else bool(send_whatsapp_text(number, record["draft_message"]))
+            if mode == "whatsapp":
+                sent = bool(send_whatsapp_text(number, record["draft_message"]))
+            elif mode == "telegram":
+                sent = bool(sourcing.outbound_channel("telegram").send_text(number, record["draft_message"]))
+            else:
+                sent = True
         except Exception as exc:  # noqa: BLE001 - any send error must release the claim
-            logger.warning("Client WhatsApp send raised: %s", exc)
+            logger.warning("Client %s send raised: %s", mode, type(exc).__name__)
             sent = False
         if not sent:
+            label = "WhatsApp" if mode == "whatsapp" else "Telegram"
             record.update({"status": "DRAFTED", "approved_by": None, "approved_at": None})
-            _log(record, "WhatsApp send failed", "⚠ WhatsApp send to the client failed; the request stays a draft.",
-                 "send_whatsapp_text()")
+            _log(record, f"{label} send failed", f"⚠ {label} send to the client failed; the request stays a draft.",
+                 "send_client_message()")
             _save_or_409(record)
-            raise ClientAgentError("WhatsApp send to the client failed; the request is still a draft.", 502)
+            raise ClientAgentError(f"{label} send to the client failed; the request is still a draft.", 502)
 
         record["status"] = "SENT"
         record.setdefault("outbox", []).append({

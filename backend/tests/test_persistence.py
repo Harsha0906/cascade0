@@ -409,7 +409,7 @@ class WebhookDedupeHealthTests(unittest.TestCase):
                                 headers={"content-type": "application/json", "x-hub-signature-256": sig})
 
     def test_duplicate_webhook_processed_once(self):
-        body = _meta_text("919800000001", "Truck stuck, 150 casings short, line 2 at 50%", msg_id="wamid.X1")
+        body = _meta_text("919800000000", "Truck stuck, 150 casings short, line 2 at 50%", msg_id="wamid.X1")
         with mock.patch.object(main, "_run_pipeline", wraps=main._run_pipeline) as spy:
             for _ in range(2):
                 r = self._post_signed(body)

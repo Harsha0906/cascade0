@@ -2,6 +2,8 @@
 CascadeZero — operator CLI for factory memberships.
 
     python -m app.admin add-member --email E --factory F --role owner|approver|viewer
+    python -m app.admin set-vendor-contact --supplier S --channel telegram|whatsapp --address A
+    python -m app.admin set-client-contact --order O --channel telegram|whatsapp --address A
 
 The user must already exist in Supabase Auth (they sign up on the dashboard first); this looks
 them up with the admin API and upserts their row in `factory_members`. Needs the live Supabase
@@ -11,6 +13,7 @@ service-role configuration (backend/.env); it does nothing in offline mode.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from typing import Any, Optional
 
@@ -72,6 +75,44 @@ def add_member(email: str, factory_id: str, role: str) -> dict[str, Any]:
     return db.upsert_row("factory_members", row, key_columns=("user_id", "factory_id"))
 
 
+CONTACT_CHANNELS = ("telegram", "whatsapp")
+
+
+def _clean_address(channel: str, address: str) -> str:
+    """A Telegram chat id (an integer) or a WhatsApp number (digits, country code, no '+')."""
+    address = (address or "").strip()
+    if channel == "telegram":
+        if not re.fullmatch(r"-?\d{1,20}", address):
+            raise AdminError("A Telegram address is the numeric chat id (the person starts the bot, "
+                             "then send /start and read the id from the bot's getUpdates)")
+        return address
+    digits = re.sub(r"\D", "", address)
+    if not 8 <= len(digits) <= 15:
+        raise AdminError("A WhatsApp address is the number with country code, e.g. 919845011111")
+    return digits
+
+
+def set_vendor_contact(supplier_id: str, channel: str, address: str) -> str:
+    if channel not in CONTACT_CHANNELS:
+        raise AdminError(f"channel must be one of {', '.join(CONTACT_CHANNELS)}")
+    if db.get_supplier(supplier_id) is None:
+        raise AdminError(f"Unknown supplier {supplier_id!r}")
+    address = _clean_address(channel, address)
+    column = "telegram_chat_id" if channel == "telegram" else "whatsapp_number"
+    db.update_rows("suppliers", "id", supplier_id, {column: address})
+    return address
+
+
+def set_client_contact(order_id: str, channel: str, address: str) -> str:
+    if channel not in CONTACT_CHANNELS:
+        raise AdminError(f"channel must be one of {', '.join(CONTACT_CHANNELS)}")
+    if db.get_order(order_id) is None:
+        raise AdminError(f"Unknown order {order_id!r}")
+    address = _clean_address(channel, address)
+    db.update_rows("orders", "order_id", order_id, {"client_contact": f"{channel}:{address}"})
+    return address
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.admin", description="CascadeZero membership admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -79,11 +120,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     add.add_argument("--email", required=True)
     add.add_argument("--factory", required=True)
     add.add_argument("--role", required=True, choices=ROLES)
+    vendor = sub.add_parser("set-vendor-contact", help="where a vendor receives RFQs on a channel")
+    vendor.add_argument("--supplier", required=True)
+    vendor.add_argument("--channel", required=True, choices=CONTACT_CHANNELS)
+    vendor.add_argument("--address", required=True)
+    client = sub.add_parser("set-client-contact", help="where an order's client receives messages")
+    client.add_argument("--order", required=True)
+    client.add_argument("--channel", required=True, choices=CONTACT_CHANNELS)
+    client.add_argument("--address", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "add-member":
             add_member(args.email, args.factory, args.role)
             print(f"{args.email.strip().lower()} is now {args.role} of {args.factory.strip()}")
+        elif args.command == "set-vendor-contact":
+            address = set_vendor_contact(args.supplier.strip(), args.channel, args.address)
+            print(f"supplier {args.supplier.strip()}: {args.channel} address set to {address}")
+        elif args.command == "set-client-contact":
+            address = set_client_contact(args.order.strip(), args.channel, args.address)
+            print(f"order {args.order.strip()}: client contact set to {args.channel}:{address}")
     except (AdminError, db.DatabaseError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

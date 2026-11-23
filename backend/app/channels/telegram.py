@@ -75,6 +75,30 @@ class TelegramChannel:
             body["reply_markup"] = {"inline_keyboard": rows}
         return self._call("sendMessage", body)
 
+    def delete_webhook(self) -> bool:
+        """Polling and a webhook are exclusive: the poller clears the webhook once at start."""
+        return self._call("deleteWebhook", {"drop_pending_updates": False})
+
+    def get_updates(self, offset: Optional[int], timeout: int = 30) -> Optional[list]:
+        """One long-poll `getUpdates`; the list of updates (maybe empty), or None on a failure."""
+        if not self._token:
+            logger.warning("TELEGRAM_BOT_TOKEN not set; getUpdates not called")
+            return None
+        body: Dict[str, Any] = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
+        if offset is not None:
+            body["offset"] = offset
+        try:
+            resp = self._transport.post(f"{API_BASE}/bot{self._token}/getUpdates", json=body,
+                                        timeout=float(timeout + 10))
+            if getattr(resp, "status_code", 0) != 200:
+                logger.error("Telegram getUpdates error %s", getattr(resp, "status_code", 0))
+                return None
+            result = (resp.json() or {}).get("result")
+        except Exception as exc:
+            logger.error("Telegram getUpdates failed: %s", type(exc).__name__)   # the text may hold the token
+            return None
+        return [u for u in result if isinstance(u, dict)] if isinstance(result, list) else None
+
     def answer_callback(self, callback_query_id: str) -> bool:
         return self._call("answerCallbackQuery", {"callback_query_id": callback_query_id})
 

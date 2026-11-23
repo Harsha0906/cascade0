@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS suppliers (
     delay_hours     INTEGER NOT NULL DEFAULT 0,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     factory_id      TEXT NOT NULL,
+    telegram_chat_id TEXT,                  -- vendor RFQ chat (SOURCING_MODE=telegram)
     sourcing_role   TEXT,
     lead_time_sigma_hours FLOAT,
     delay_shock_min_hours FLOAT,
@@ -139,7 +140,8 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     factory_id              TEXT NOT NULL,
     priority                INT NOT NULL DEFAULT 100,
-    due_at                  TIMESTAMPTZ   -- absolute deadline; hours_remaining is display only
+    due_at                  TIMESTAMPTZ,  -- absolute deadline; hours_remaining is display only
+    client_contact          TEXT                    -- '<channel>:<address>' the Client Agent messages
 );
 
 -- ============================================================================

@@ -295,6 +295,13 @@ def _digits(number: str) -> str:
     return re.sub(r"\D", "", number or "")
 
 
+def outbound_channel(name: str):
+    """The channel adapter for outbound vendor/client messages, resolved from app.main at call
+    time (the same factories the webhooks use, so tests patching them cover both directions)."""
+    from app import main
+    return main._whatsapp_channel() if name == "whatsapp" else main._telegram_channel()
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -359,7 +366,8 @@ def _send_rfq(session: SourcingSession, supplier_id: str, units: int) -> RFQ:
     )
     rfq.message = _rfq_text(model, rfq)
 
-    if settings.SOURCING_MODE == "whatsapp":
+    mode = settings.SOURCING_MODE
+    if mode == "whatsapp":
         number = _digits((get_supplier(supplier_id) or {}).get("whatsapp_number", ""))
         if not number:
             rfq.status = "SEND_FAILED"
@@ -374,11 +382,21 @@ def _send_rfq(session: SourcingSession, supplier_id: str, units: int) -> RFQ:
                     settings.SOURCING_RFQ_TEMPLATE_LANG,
                 )
             else:
-                sent = send_whatsapp_text(number, rfq.message)
+                sent = outbound_channel("whatsapp").send_text(number, rfq.message)
             if not sent:
                 rfq.status = "SEND_FAILED"
                 rfq.reply_text = ("WhatsApp send failed (check the token; without an approved template, "
                                   "free text only reaches vendors who messaged us in the last 24h).")
+    elif mode == "telegram":
+        chat_id = str((get_supplier(supplier_id) or {}).get("telegram_chat_id") or "").strip()
+        if not chat_id:
+            rfq.status = "SEND_FAILED"
+            rfq.reply_text = ("No Telegram chat id on file for this vendor "
+                              "(python -m app.admin set-vendor-contact).")
+        elif not outbound_channel("telegram").send_text(chat_id, rfq.message):
+            rfq.status = "SEND_FAILED"
+            rfq.reply_text = ("Telegram send failed (check TELEGRAM_BOT_TOKEN; a vendor must have "
+                              "started the bot first).")
     if rfq.status == "SEND_FAILED":
         session.overrides[supplier_id] = {"max_units": 0}
         rfq.replied_at = _now().isoformat()
@@ -573,7 +591,7 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
         names = ", ".join(f"{r.supplier_name.split(' (')[0]} ({r.units_requested}u)" for r in sent)
         _log(session, f"Round 1 ({settings.SOURCING_MODE}): enquiries sent to {names}",
              f"📨 Checking {pid} with suppliers before approval. Enquiries sent to {names} "
-             f"({'simulated channel — enter replies on the dashboard' if settings.SOURCING_MODE != 'whatsapp' else 'via WhatsApp'}).",
+             f"({'via ' + ('WhatsApp' if settings.SOURCING_MODE == 'whatsapp' else 'Telegram') if settings.SOURCING_MODE in ('whatsapp', 'telegram') else 'simulated channel — enter replies on the dashboard'}).",
              "send_rfq()")
         if any(r.status == "SEND_FAILED" for r in sent):
             _advance(session)
@@ -734,12 +752,26 @@ def find_open_rfq_by_number(number: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+_ADDRESS_COLUMN = {"whatsapp": "whatsapp_number", "telegram": "telegram_chat_id"}
+
+
 def find_open_rfq_by_address(channel: str, address: str) -> Optional[Tuple[str, str]]:
     """Map an inbound chat sender on `channel` to (run_id, supplier_id) with an open enquiry.
-    Vendors have WhatsApp numbers only today; Telegram vendor addresses arrive with the Telegram
-    sourcing outbound (Round B Task 6), so a Telegram sender never matches yet."""
+    WhatsApp compares digits (suppliers.whatsapp_number); Telegram compares the chat id
+    (suppliers.telegram_chat_id)."""
     if channel == "whatsapp":
         return find_open_rfq_by_number(address)
+    column = _ADDRESS_COLUMN.get(channel)
+    wanted = str(address or "").strip()
+    if column is None or not wanted:
+        return None
+    supplier_ids = {s["id"] for s in get_all_suppliers() if str(s.get(column) or "").strip() == wanted}
+    if not supplier_ids:
+        return None
+    for session in sourcing_store.active():
+        for rfq in reversed(session.rfqs):
+            if rfq.supplier_id in supplier_ids and rfq.status == "SENT":
+                return session.run_id, rfq.supplier_id
     return None
 
 
