@@ -64,7 +64,7 @@ def seed_second_factory() -> None:
         })
         db.insert_row("vendor_history", {
             "supplier_id": sid, "past_orders_count": 10, "on_time_deliveries": 9,
-            "reliability_score_pct": float(rel), "quality_rejection_rate_pct": 0.5,
+            "reliability_score_pct": float(rel), "quality_rejection_rate_pct": 0.5, "factory_id": "test-plant",
         })
     for lid, name, ot_units, ot_cost, max_ot in (
         ("L-A", "Line A", 0, 0, 0), ("L-B", "Line B", 20, 5000, 6),
@@ -86,4 +86,4 @@ def seed_second_factory() -> None:
         "factory_id": "test-plant", "item_code": "ITEM-W", "on_hand_qty": 40,
         "as_of": datetime.now(timezone.utc).isoformat(),
     })
-    db.insert_row("order_lines", {"order_id": "WO-77", "item_code": "ITEM-W", "qty": 80})
+    db.insert_row("order_lines", {"order_id": "WO-77", "item_code": "ITEM-W", "qty": 80, "factory_id": "test-plant"})

@@ -746,7 +746,7 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest, actor: Actor = Depends(machine_ac
             existing = db.get_order(order_id)
             if existing is not None and existing.get("factory_id") != factory_id:
                 # Order ids are global keys: never overwrite (or move) another factory's order.
-                raise ValueError(f"order_id {order_id} cannot be used by this factory")
+                raise ValueError(f"order_id {order_id} cannot be used by this factory") from None
             record = {
                 "order_id": order_id,
                 "required_qty": _int_field(row, "required_qty"),
@@ -779,7 +779,10 @@ def ingest_erp_csv(payload: ErpCsvSyncRequest, actor: Actor = Depends(machine_ac
             if existing is None:
                 record["status"] = "ON_TRACK"
                 record["shortfall_units"] = 0
-            upsert_row("orders", record)
+            try:   # conditional write: closes the race between the check above and this write
+                db.upsert_owned("orders", record, ("order_id",))
+            except db.OwnershipConflict:
+                raise ValueError(f"order_id {order_id} cannot be used by this factory") from None
             imported.append(order_id)
         except ValueError as exc:
             errors.append({"line": line_no, "order_id": order_id, "error": str(exc)})
@@ -863,8 +866,12 @@ def ingest_open_purchase_orders(payload: ErpCsvSyncRequest, actor: Actor = Depen
     )
     before = ({s["shipment_id"] for s in db.get_inbound_shipments(factory_id)}
               if result.header_ok else set())
-    for row in result.rows:
-        upsert_row("inbound_shipments", row, key_columns=("shipment_id",))
+    for row in list(result.rows):
+        try:   # conditional write: never overwrites another factory's shipment with this PO number
+            db.upsert_owned("inbound_shipments", row, ("shipment_id",))
+        except db.OwnershipConflict:
+            result.rows.remove(row)
+            result.errors.append({"line": None, "error": f"PO number {row['shipment_id']} belongs to another factory"})
     closed = sorted(before - result.mentioned)
     for sid in closed:
         db.update_rows_where("inbound_shipments", {"shipment_id": sid, "factory_id": factory_id},
@@ -889,10 +896,15 @@ def ingest_sales_order_lines(payload: ErpCsvSyncRequest, actor: Actor = Depends(
     result = importers.parse_sales_order_lines(payload.csv_content, orders, _factory_item_codes(factory_id))
     in_file = sorted({oid for oid, _ in result.mentioned}) if result.header_ok else []
     stale = [l for l in db.get_order_lines(in_file) if (l["order_id"], l["item_code"]) not in result.mentioned]
-    for row in result.rows:
-        upsert_row("order_lines", row, key_columns=("order_id", "item_code"))
+    for row in list(result.rows):
+        try:
+            db.upsert_owned("order_lines", {**row, "factory_id": factory_id}, ("order_id", "item_code"))
+        except db.OwnershipConflict:
+            result.rows.remove(row)
+            result.errors.append({"line": None, "error": f"order {row['order_id']} cannot be used by this factory"})
     for line in stale:
-        db.delete_rows_where("order_lines", {"order_id": line["order_id"], "item_code": line["item_code"]})
+        db.delete_rows_where("order_lines", {"order_id": line["order_id"], "item_code": line["item_code"],
+                                             "factory_id": factory_id})
         result.warnings.append(_snapshot_warning(
             f"order {line['order_id']} line for item {line['item_code']} is not in this file: removed "
             f"(the file replaces all lines of each order it lists)"))

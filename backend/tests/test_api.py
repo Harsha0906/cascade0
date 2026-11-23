@@ -229,14 +229,14 @@ class ApiTests(unittest.TestCase):
     # ── atomic / idempotent execution ──
     def test_execution_is_atomic(self):
         sim = self._simulate(1)
-        real_update = db.update_rows
+        real_update = db.update_rows_where
 
         def fail_on_suppliers(table, *a, **k):
             if table == "suppliers":
                 raise RuntimeError("mid-transaction failure")
             return real_update(table, *a, **k)
 
-        with mock.patch("app.db.update_rows", side_effect=fail_on_suppliers):
+        with mock.patch("app.db.update_rows_where", side_effect=fail_on_suppliers):
             with self.assertRaises(Exception):
                 self.client.post("/api/v1/execute-plan", json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}, headers=KEY)
         self.assertEqual(db.fetch_all("purchase_orders"), [])

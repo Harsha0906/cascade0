@@ -141,6 +141,7 @@ _SEED_VENDOR_HISTORY: list[dict[str, Any]] = [
         "reliability_score_pct": 96.0,
         "quality_rejection_rate_pct": 0.5,
         "last_incident_note": "Vulnerable to NE Monsoon flooding near Vellore/Ambur.",
+        "factory_id": "apex-volt-blr2",
     },
     {
         "id": 2,
@@ -150,6 +151,7 @@ _SEED_VENDOR_HISTORY: list[dict[str, Any]] = [
         "reliability_score_pct": 93.3,
         "quality_rejection_rate_pct": 0.8,
         "last_incident_note": "Consistent 4h delivery via Tumkur Road; max batch 200 units.",
+        "factory_id": "apex-volt-blr2",
     },
     {
         "id": 3,
@@ -159,6 +161,7 @@ _SEED_VENDOR_HISTORY: list[dict[str, Any]] = [
         "reliability_score_pct": 81.8,
         "quality_rejection_rate_pct": 2.1,
         "last_incident_note": "Border toll bottleneck at Attibele during peak hours.",
+        "factory_id": "apex-volt-blr2",
     },
     {
         "id": 4,
@@ -168,6 +171,7 @@ _SEED_VENDOR_HISTORY: list[dict[str, Any]] = [
         "reliability_score_pct": 98.5,
         "quality_rejection_rate_pct": 0.0,
         "last_incident_note": "Guaranteed priority airfreight slot; high flat charter fee.",
+        "factory_id": "apex-volt-blr2",
     },
 ]
 
@@ -315,8 +319,8 @@ _SEED_STOCK_LEVELS: list[dict[str, Any]] = [
 ]
 
 _SEED_ORDER_LINES: list[dict[str, Any]] = [
-    {"order_id": "EV-402", "item_code": "CASING", "qty": 500},
-    {"order_id": "EV-405", "item_code": "CASING", "qty": 300},
+    {"order_id": "EV-402", "item_code": "CASING", "qty": 500, "factory_id": "apex-volt-blr2"},
+    {"order_id": "EV-405", "item_code": "CASING", "qty": 300, "factory_id": "apex-volt-blr2"},
 ]
 
 _SEED_SHIPMENT_ETA_HOURS = 20
@@ -339,7 +343,7 @@ def _seed_inbound_shipments(now: datetime | None = None) -> list[dict[str, Any]]
     }]
 
 
-REQUIRED_MIGRATION_LEVEL = 7
+REQUIRED_MIGRATION_LEVEL = 8
 
 # The only factory with demo seed data (POST /api/v1/reset restores it; other factories -> 409).
 DEMO_FACTORY_ID = "apex-volt-blr2"
@@ -594,6 +598,59 @@ def insert_row(table_name: str, row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+class OwnershipConflict(ValueError):
+    """The row's key already belongs to another factory; nothing was written."""
+
+    def __init__(self, table: str, key: dict[str, Any]) -> None:
+        self.table, self.key = table, dict(key)
+        super().__init__(f"{table} {key} belongs to another factory")
+
+
+def _is_unique_violation(exc: BaseException | None) -> bool:
+    code = str(getattr(exc, "code", "") or "")
+    return code == "23505" or (not code and bool(re.search(r"\b23505\b", _error_text(exc))))
+
+
+def upsert_owned(
+    table_name: str, row: dict[str, Any], key_columns: Sequence[str], owner_column: str = "factory_id",
+) -> dict[str, Any]:
+    """Insert `row`, or update the existing row with the same key ONLY when it has the same owner.
+
+    For tables keyed by a global id (orders.order_id, suppliers.id, inbound_shipments.shipment_id,
+    ...): a plain upsert would overwrite another factory's row that happens to use the same key.
+    Here the write itself is conditional: an UPDATE filtered by key AND owner, else an INSERT (which
+    never overwrites). A key held by another owner raises OwnershipConflict and writes nothing, even
+    when a concurrent writer created it after the caller's own ownership check.
+    """
+    owner = row.get(owner_column)
+    if not owner:
+        raise ValueError(f"upsert_owned needs {owner_column} on the row")
+    key = {c: row[c] for c in key_columns}
+    client = _get_supabase()
+    if client is None:
+        with _conditional_lock:
+            table = _mirror.get_table(table_name)
+            for existing in table:
+                if all(existing.get(c) == v for c, v in key.items()):
+                    if existing.get(owner_column) != owner:
+                        raise OwnershipConflict(table_name, key)
+                    existing.update(row)
+                    return copy.deepcopy(existing)
+            table.append(dict(row))
+            return copy.deepcopy(row)
+    updates = {k: v for k, v in row.items() if k not in key}
+    for _ in range(2):   # second pass: a same-owner row inserted concurrently is then updated
+        updated = update_rows_where(table_name, {**key, owner_column: owner}, updates)
+        if updated:
+            return updated[0]
+        try:
+            return insert_row(table_name, row)
+        except DatabaseError as exc:
+            if not _is_unique_violation(exc.__cause__):
+                raise
+    raise OwnershipConflict(table_name, key)
+
+
 def update_rows(
     table_name: str,
     pk_column: str,
@@ -836,6 +893,7 @@ def execute_plan_tx(
     # NOTE (offline/demo only): rollback restores snapshots of whole _EXECUTION_TABLES, so a
     # concurrent writer that does not hold _execute_lock (e.g. Sourcing's agent_logs) can have
     # its rows erased by a rollback. The live path is a real transaction and has no such issue.
+    factory = po.get("factory_id") or receipt.get("factory_id")
     with _execute_lock:
         mirror = _mirror
         snapshot = {t: copy.deepcopy(mirror.get_table(t)) for t in _EXECUTION_TABLES}
@@ -846,22 +904,26 @@ def execute_plan_tx(
                 "root_run_id": root_run_id,
                 "run_id": receipt.get("run_id", root_run_id),
                 "playbook_id": receipt.get("playbook_id", ""),
-                "factory_id": po.get("factory_id"),
+                "factory_id": factory,
                 "payload": copy.deepcopy(receipt),
             })
-            insert_row("purchase_orders", dict(po))
+            insert_row("purchase_orders", {**po, "factory_id": factory} if factory else dict(po))
             now = datetime.now(timezone.utc).isoformat()
-            if not update_rows("orders", "order_id", order_id, {"status": order_status, "updated_at": now}):
+            # Like the SQL function: updates touch only the executing factory's rows.
+            scope = {"factory_id": factory} if factory else {}
+            if not update_rows_where("orders", {"order_id": order_id, **scope},
+                                     {"status": order_status, "updated_at": now}):
                 raise DatabaseError("update", "orders")  # mirrors the SQL IF NOT FOUND; rolls back below
             for upd in supplier_updates:
-                update_rows("suppliers", "id", upd["supplier_id"], {
+                update_rows_where("suppliers", {"id": upd["supplier_id"], **scope}, {
                     "status": "PO_DRAFTED", "inbound_qty": upd["inbound_qty"], "updated_at": now,
                 })
             for lid in overtime_line_ids:
-                update_rows("production_lines", "line_id", lid, {"status": "OVERTIME_SCHEDULED", "updated_at": now})
+                update_rows_where("production_lines", {"line_id": lid, **scope},
+                                  {"status": "OVERTIME_SCHEDULED", "updated_at": now})
             entries = agent_log if isinstance(agent_log, list) else [agent_log] if agent_log else []
             for entry in entries:
-                insert_row("agent_logs", {"created_at": now, **entry})
+                insert_row("agent_logs", {"created_at": now, **entry, "factory_id": entry.get("factory_id") or factory})
             for o in outcomes:
                 _insert_pending_outcome(o, now)
         except BaseException:
@@ -1182,6 +1244,7 @@ _OWNED_VIA: dict[str, tuple[str, str]] = {
 _UNSCOPED_TABLES = ("webhook_events", "schema_migrations")
 # Live tables cleared by a factory reset through their factory_id column.
 _FACTORY_DYNAMIC_TABLES = (
+    "sourcing_rfqs", "sourcing_sessions",
     "purchase_orders", "agent_logs", "disruption_events", "delivery_outcomes",
     "order_coordination", "execution_receipts", "analysis_runs",
 )
@@ -1216,16 +1279,21 @@ def _reset_mirror_factory(factory_id: str) -> None:
 
 
 def _reset_live_factory(client, factory_id: str) -> None:
-    """Live: delete the factory's dynamic rows (by factory_id, sourcing by its run ids), then
-    upsert the demo seed. Other factories' rows are never touched."""
-    run_ids = [r["run_id"] for r in (client.table("analysis_runs").select("run_id")
-                                     .eq("factory_id", factory_id).execute().data or [])]
-    for i in range(0, len(run_ids), 200):
-        chunk = run_ids[i:i + 200]
-        for tbl in ("sourcing_rfqs", "sourcing_sessions"):
-            client.table(tbl).delete().in_("run_id", chunk).execute()
+    """Live: delete the factory's dynamic rows (by factory_id), then upsert the demo seed.
+    Other factories' rows are never touched."""
     for tbl in _FACTORY_DYNAMIC_TABLES:
         client.table(tbl).delete().eq("factory_id", factory_id).execute()
+
+
+# Seed tables keyed by a global id (not by factory): a seed row is written only where the key is
+# free or already the demo factory's (upsert_owned), never over another factory's row.
+_SEED_GLOBAL_KEYS: dict[str, tuple[str, ...]] = {
+    "suppliers": ("id",),
+    "production_lines": ("line_id",),
+    "orders": ("order_id",),
+    "order_lines": ("order_id", "item_code"),
+    "inbound_shipments": ("shipment_id",),
+}
 
 
 def _upsert_demo_seed(client) -> None:
@@ -1242,7 +1310,13 @@ def _upsert_demo_seed(client) -> None:
         ("inbound_shipments", _seed_inbound_shipments()),
     ):
         for row in seed:
-            client.table(tbl).upsert(row).execute()
+            if tbl in _SEED_GLOBAL_KEYS:
+                try:
+                    upsert_owned(tbl, row, _SEED_GLOBAL_KEYS[tbl])
+                except OwnershipConflict as exc:
+                    logger.warning("Reset skipped seed row %s: %s", exc.key, exc)
+            else:   # factories (the demo factory's own row) or keyed by (factory_id, ...)
+                client.table(tbl).upsert(row).execute()
 
 
 def reset_to_seed(factory_id: str | None = None) -> dict[str, str]:

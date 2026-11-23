@@ -137,7 +137,7 @@ class I3ConfirmedEtaBeatsTheRiskShift(unittest.TestCase):
         session.rfqs.append(RFQ(id="R1", run_id="X", round=1, supplier_id="SUP-HSR-03", supplier_name="Hosur",
                                 units_requested=150, expected_unit_price_inr=600, needed_within_hours=30,
                                 channel="simulated"))
-        with mock.patch.object(sourcing, "_persist", lambda r: None), \
+        with mock.patch.object(sourcing, "_persist", lambda *a: None), \
                 mock.patch.object(sourcing, "_advance", lambda s: None), \
                 mock.patch.object(sourcing, "log_agent_step", lambda **k: None):
             sourcing._apply_reply(session, "SUP-HSR-03", "Yes 150 units in 12 hours", "operator")
@@ -157,7 +157,7 @@ class I3ConfirmedEtaBeatsTheRiskShift(unittest.TestCase):
         session.rfqs.append(RFQ(id="R1", run_id="X", round=1, supplier_id="SUP-PNY-02", supplier_name="Peenya",
                                 units_requested=150, expected_unit_price_inr=600, needed_within_hours=30,
                                 channel="simulated"))
-        with mock.patch.object(sourcing, "_persist", lambda r: None), \
+        with mock.patch.object(sourcing, "_persist", lambda *a: None), \
                 mock.patch.object(sourcing, "_advance", lambda s: None), \
                 mock.patch.object(sourcing, "log_agent_step", lambda **k: None):
             sourcing._apply_reply(session, "SUP-PNY-02", "Yes 150 units in 20 hours", "operator")

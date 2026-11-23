@@ -199,7 +199,7 @@ class ExecuteCreatesPendingOutcomesTests(_Api):
 
     def test_execute_rollback_leaves_no_outcomes(self):
         sim = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 1}, headers=KEY).json()
-        with mock.patch.object(db, "update_rows", return_value=[]):  # order not found -> rolls back
+        with mock.patch.object(db, "update_rows_where", return_value=[]):  # order not found -> rolls back
             with self.assertRaises(db.DatabaseError):
                 main._execute(main.ExecutePlanRequest(run_id=sim["run_id"], playbook_id=sim["recommended_plan_id"]),
                               "dev-owner@example.test")

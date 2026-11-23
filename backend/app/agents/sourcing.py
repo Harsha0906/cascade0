@@ -299,19 +299,23 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _factory_of(session: SourcingSession) -> str:
+    return session.params.get("factory_id") or session.model.factory_id
+
+
 def _log(session: SourcingSession, summary: str, message: str, tool: str) -> None:
     session.events.append(message)
     session.log_step += 1
     log_agent_step(
-        factory_id=session.params.get("factory_id") or session.model.factory_id,
+        factory_id=_factory_of(session),
         run_id=session.run_id, step_order=session.log_step,
         agent_name="Sourcing Agent", agent_role="Vendor Confirmation", badge_color="violet",
         tool_called=tool, tool_output_summary=summary, message=message,
     )
 
 
-def _persist(rfq: RFQ) -> None:
-    row = asdict(rfq)
+def _persist(session: SourcingSession, rfq: RFQ) -> None:
+    row = {**asdict(rfq), "factory_id": _factory_of(session)}
     upsert_row("sourcing_rfqs", row)
 
 
@@ -380,7 +384,7 @@ def _send_rfq(session: SourcingSession, supplier_id: str, units: int) -> RFQ:
         rfq.replied_at = _now().isoformat()
 
     session.rfqs.append(rfq)
-    _persist(rfq)
+    _persist(session, rfq)
     return rfq
 
 
@@ -393,7 +397,7 @@ def _expire_timeouts(session: SourcingSession) -> List[RFQ]:
             rfq.replied_at = _now().isoformat()
             session.overrides[rfq.supplier_id] = {"max_units": 0}
             session.confirmed.discard(rfq.supplier_id)
-            _persist(rfq)
+            _persist(session, rfq)
             expired.append(rfq)
     return expired
 
@@ -639,7 +643,7 @@ def _apply_reply(session: SourcingSession, supplier_id: str, text: str, source: 
             override["unit_cost"] = rfq.offered_unit_price_inr
         session.overrides[supplier_id] = override
         session.confirmed.add(supplier_id)
-    _persist(rfq)
+    _persist(session, rfq)
 
     offer_txt = (
         "declined" if rfq.status == "DECLINED" else
@@ -686,7 +690,7 @@ def _apply_restart(session: SourcingSession, playbook: Dict[str, Any], reason: s
         if rfq.status == "SENT":
             rfq.status = "SUPERSEDED"
             rfq.replied_at = _now().isoformat()
-            _persist(rfq)
+            _persist(session, rfq)
     session.params.update(params_update)
     for sid in allow_vendor_ids:
         if sid not in session.confirmed:

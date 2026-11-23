@@ -448,7 +448,7 @@ class WebhookDedupeHealthTests(unittest.TestCase):
     def test_healthz_offline_ready(self):
         r = self.client.get("/healthz")
         self.assertEqual((r.status_code, r.json()["storage"], r.json()["ready"]), (200, "offline", True))
-        self.assertEqual(r.json()["required_migration_level"], 7)
+        self.assertEqual(r.json()["required_migration_level"], 8)
 
     def test_healthz_reports_old_migration_level(self):
         with mock.patch("app.db.migration_level", return_value=3):
