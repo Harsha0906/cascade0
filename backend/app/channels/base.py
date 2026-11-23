@@ -2,8 +2,8 @@
 CascadeZero — the channel adapter interface.
 
 A channel turns a platform's webhook payload into `InboundMessage`s and sends text and button
-replies. The shared inbound flow (app/inbound.py) only ever talks to this interface, so WhatsApp
-and Telegram behave identically: same commands, same authorisation, same de-duplication.
+replies. The shared inbound flow (app/inbound.py) only ever talks to this interface, so every
+channel behaves identically: same commands, same authorisation, same de-duplication.
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ from typing import Optional, Protocol, Sequence, runtime_checkable
 
 @dataclass(frozen=True)
 class InboundMessage:
-    channel: str              # "whatsapp" | "telegram"
-    sender: str               # the address replies go to (WhatsApp number digits / Telegram chat id)
+    channel: str              # "telegram"
+    sender: str               # the address replies go to (Telegram chat id)
     text: str                 # message text, stripped ("" for a button press)
-    button_id: Optional[str]  # the pressed button's id (WhatsApp button_reply.id / callback_data)
+    button_id: Optional[str]  # the pressed button's id (callback_data)
     message_id: str           # platform id used for de-duplication ("" when the platform sent none)
 
 

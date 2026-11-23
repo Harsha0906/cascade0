@@ -27,8 +27,6 @@ class TenancyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._patches = [
-            mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: True),
-            mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: True),
         ]
         for p in cls._patches:
             p.start()

@@ -165,14 +165,13 @@ cd ../frontend
 npm test        # vitest: digital-twin graph builder and store
 ```
 `python -m app.evals` measures extraction accuracy (see Evals below).
-Offline suite (no Supabase, LLM or WhatsApp calls): solver correctness, infeasibility reporting,
-ranking, Monte Carlo sensitivity, Tally XML well-formedness, API auth, webhook signatures,
-WhatsApp approver allowlist, idempotent execution and CSV import.
+Offline suite (no Supabase, LLM or Telegram calls): solver correctness, infeasibility reporting,
+ranking, Monte Carlo sensitivity, Tally XML well-formedness, API auth, Telegram webhook secret,
+linked-chat approvals, idempotent execution and CSV import.
 
 `python test_step6.py` is a separate **live** smoke test that uses the keys in `.env`. It covers:
 - Legacy Tally CSV Ingestion
 - PLC Overheat Telemetry
-- Phone WhatsApp Webhook Emulation
 - Multi-Agent Audit Trail Verification
 - HITL Tally XML Purchase Order Generation
 - Factory Seed Reset
@@ -181,19 +180,19 @@ WhatsApp approver allowlist, idempotent execution and CSV import.
 
 ## 🧭 Disruption format
 
-An alert (free text via `raw_message`, a WhatsApp message, or a preset) may name **any** line(s), supplier and order of the factory.
+An alert (free text via `raw_message`, a Telegram message, or a preset) may name **any** line(s), supplier and order of the factory.
 Extraction produces a delay, a shortfall, per-line speeds, an affected supplier and an order; `backend/app/disruption.py` maps the references to ids.
 Required: a shortfall, a speed for every named line, and a resolvable supplier when there is a delay. Nothing is invented: the old defaults
 (48h, 50%, 150 units, `EV-402`) are gone, so a message that omits these is rejected.
 Unknown or ambiguous references, a missing shortfall, a line without a speed, a delay with no resolvable supplier and negative numbers return
-**422** (or a WhatsApp reply naming what is missing); nothing is written.
+**422** (or a chat reply naming what is missing); nothing is written.
 
 - `POST /api/v1/simulate-crisis` takes `{scenario_id? | raw_message?, override_delay_hours?, override_shortfall_units?, override_line_speeds?: {line_id: 0..100}, order_id?}`.
   Neither `scenario_id` nor `raw_message` is a 422. `extracted_parameters` in the response has `delay_hours`, `line_impacts` (`line_id`, `name`, `speed_pct`, `temp_celsius`),
   `affected_supplier_id`, `shortfall_units`, `affected_order_id`, `order_selection`, `other_order_shortfalls`, `source` and `overridden_by_preset_or_slider`.
 - `GET /api/v1/scenarios` lists the preset scenarios from the `scenarios` table (migration `005_generic_disruptions.sql`).
 - `GET /api/v1/runs/{run_id}` returns a stored run in the same shape as `simulate-crisis`, plus `root_run_id` and `executed` (404 for an unknown run). On load the dashboard restores `GET /api/v1/runs/latest` this way, with its Sourcing session and Client record, so both panels keep working after a page reload.
-- The WhatsApp status reply lists every non-normal line and every at-risk order. Vendor enquiries to flat-fee vendors ask for "a dedicated delivery ... for a flat fee".
+- The chat status reply lists every non-normal line and every at-risk order. Vendor enquiries to flat-fee vendors ask for "a dedicated delivery ... for a flat fee".
 - MILP variables are named by index, so ids such as `L-B` and `L_B` cannot collide.
 
 ## 📦 Inventory-Based Shortfall
@@ -272,8 +271,8 @@ States: `DRAFTED` → `SENT` → `ANSWERING` (resumable) → `ACCEPTED` | `REFUS
 
 1. **Draft:** `POST /api/v1/client/draft {run_id, extension_hours?, reason?}` writes a request quoting only data (order, client, current and proposed deadlines, the disruption headline, the order's partial-delay penalty); no number is written by an LLM. A request is also drafted automatically when sourcing fails.
 2. **Human sign-off:** nothing reaches the client until `POST /api/v1/client/approve {run_id}` is called by a signed-in approver (recorded as `approved_by`).
-3. **Send:** uses the `SOURCING_MODE` channel. Simulated mode records the message; `whatsapp` sends it to the order's `client_whatsapp_number` and returns **409** when the order has no client contact, so for now a real WhatsApp send needs a contact on the order.
-4. **Answer:** `POST /api/v1/client/answer {run_id, accepted, text?, new_deadline_hours?, entered_by}` is typed in by an operator (answers are not read from WhatsApp yet). **Accepted:** the order's `due_at` is extended, the run is re-planned on the longer deadline and sourcing restarts on the new target. **Refused:** the expedite vendor is allowed again and sourcing restarts on the best feasible plan that uses it. Recording the same answer again resumes an interrupted one; a different answer is a 409.
+3. **Send:** uses the `SOURCING_MODE` channel. Simulated mode records the message; `telegram` sends it to the order's `client_contact` (`telegram:<chat_id>`) and returns **409** when the order has no client contact.
+4. **Answer:** `POST /api/v1/client/answer {run_id, accepted, text?, new_deadline_hours?, entered_by}` is typed in by an operator (answers are not read from the chat yet). **Accepted:** the order's `due_at` is extended, the run is re-planned on the longer deadline and sourcing restarts on the new target. **Refused:** the expedite vendor is allowed again and sourcing restarts on the best feasible plan that uses it. Recording the same answer again resumes an interrupted one; a different answer is a 409.
 5. `GET /api/v1/client/{run_id}` returns the draft, sent message, answer and re-plan (`request_number`, earlier requests in `history`). One open request per root run: a sourcing failure never drafts a second request while one is drafted, sent or being answered.
 6. **After an accepted extension** the deadline already is the extended one, so re-plans no longer offer the renegotiation plan (Plan C). If sourcing then fails again, the Client Agent drafts a follow-up request from the extended deadline (it needs the same human approval). After a refusal nothing more is drafted; the failure is logged for the operator.
 
@@ -310,7 +309,7 @@ python -m app.evals --live          # also scores Gemini (calls the live API; ne
 | Shortfall | Real when computed from inventory (stock, open POs, order lines, order priority) imported from Tally/Excel CSV or the seed; an override or the number in the alert text takes the other precedence paths and is labelled in the UI. Single planning item per factory; no multi-item BOM |
 | Plan ranking | Real: argmin of `cost + (1 − P_on_time) × SLA penalty` |
 | Monte Carlo on-time probability | Real, seeded; distributions are **assumptions** for the demo plant |
-| **Sourcing Agent** | Real agent loop: sends enquiries (not orders) to the vendors in a plan, reads replies (Gemini or regex, English/Hinglish), and re-plans with confirmed capacity/price/ETA, asking the next vendor when one declines, offers less, or times out (max 3 rounds). WhatsApp or simulated channel |
+| **Sourcing Agent** | Real agent loop: sends enquiries (not orders) to the vendors in a plan, reads replies (Gemini or regex, English/Hinglish), and re-plans with confirmed capacity/price/ETA, asking the next vendor when one declines, offers less, or times out (max 3 rounds). Telegram or simulated channel |
 | Speed vs Cost scenarios | Planning scenarios, not agents: each proposal is a solver output (speed = expedite-first, cost = cheapest feasible); the risk check fires on computed risk (weak vendor, infeasibility, confidence gap) and the cost scenario re-solves |
 | Disruption extraction | Gemini (given the factory's line, supplier and order ids) or a regex fallback that only takes cue-bound numbers and never guesses; `backend/app/disruption.py` resolves references to ids. Missing or unresolvable input is rejected, never defaulted. The UI shows which path ran |
 | Digital twin | Built from the factory model (`/api/v1/factory`) and live state (`/api/v1/state`): one node per supplier, line and order. Layout is generic, not geographic |
@@ -318,10 +317,10 @@ python -m app.evals --live          # also scores Gemini (calls the live API; ne
 | Vendor costs, capacities, lead times | Loaded per factory from the database (`suppliers`, `vendor_history`, `production_lines`, `factories`) |
 | Vendor reliability | Learned: Beta posterior from `vendor_history` plus recorded deliveries (`delivery_outcomes`, 2 h grace). Delivery dates are entered through the API; nothing is detected automatically |
 | Route and weather risk | Cue-driven from the alert text: a blocked route adds the delay to its vendors, a weather cue doubles shock probability (cap 90 %). The underlying distributions remain assumptions |
-| Client Agent | Drafts and, after human approval, sends a deadline-extension request; the client's answer is entered by an operator and drives a re-plan. WhatsApp to the client needs a contact on the order |
+| Client Agent | Drafts and, after human approval, sends a deadline-extension request; the client's answer is entered by an operator and drives a re-plan. Telegram to the client needs a contact on the order |
 | PLC telemetry | Simulated, HTTP JSON; `line_id` is required (unknown line returns 404) |
 | Weather | OpenWeatherMap city weather if a key is set; otherwise shown as offline |
-| WhatsApp | Meta Cloud API with HMAC verification; approvals only from allow-listed numbers |
+| Telegram | Bot API; webhook protected by a secret token; approvals only from chats linked to an owner/approver |
 | Analysis runs, sourcing sessions, execution receipts | Stored in Postgres (`analysis_runs`, `sourcing_sessions`, `execution_receipts`); in offline mode in process memory. Approving a run twice returns the original receipt with `already_executed: true`; a different plan for an executed run is a 409 |
 | Execution | Generates **drafts** (Tally XML, notices). Nothing is sent to suppliers automatically |
 
@@ -344,14 +343,14 @@ The planner's vendor numbers are assumptions; the Sourcing Agent replaces them w
 
 1. After an analysis, click **Confirm with suppliers first** (dashboard) or `POST /api/v1/sourcing/start {run_id}`.
 2. The agent sends an enquiry to each vendor in the chosen plan — explicitly *not* a purchase order.
-3. Replies arrive over WhatsApp (`SOURCING_MODE=whatsapp`, vendor numbers in `suppliers.whatsapp_number`), over Telegram (`SOURCING_MODE=telegram`, vendor chat ids in `suppliers.telegram_chat_id`) or are typed on the dashboard (simulated mode, or a reply received by phone).
+3. Replies arrive over Telegram (`SOURCING_MODE=telegram`, vendor chat ids in `suppliers.telegram_chat_id`) or are typed on the dashboard (simulated mode, or a reply received elsewhere).
 4. Each reply becomes a structured offer. Declines and timeouts remove that vendor; partial or re-priced offers update capacity, price and lead time for this run only (a confirmed ETA also caps the vendor's minimum lead time, see Route and Weather Risk).
 5. When no enquiry is outstanding it re-solves. If the best plan needs an unconfirmed vendor, it asks that vendor (next round); otherwise it hands a **confirmed plan** back for human approval (`<run_id>-S<round>`).
 
 Only one PO can ever be created per analysis — the original run and its sourced re-plan share an idempotency key.
 Apply `supabase/migrations/002_sourcing_agent.sql` for vendor numbers and the enquiry audit table, then `supabase/migrations/003_factory_model.sql` (must be applied after 002) for the per-factory model the planner reads.
 
-Known limits: WhatsApp messages are de-duplicated by Meta message id and recorded before processing, so a replayed approval or vendor reply never runs twice. If processing fails unexpectedly after recording (database error or other exception) the id is released and the webhook returns 503/500, so Meta's retry is processed; messages that were handled (including error replies sent to the sender) stay recorded.
+Known limits: Telegram updates are de-duplicated by update id and recorded before processing, so a replayed approval or vendor reply never runs twice. If processing fails unexpectedly after recording (database error or other exception) the id is released and the webhook returns 503/500, so Telegram's retry is processed; messages that were handled (including error replies sent to the sender) stay recorded.
 Sourcing sessions use optimistic concurrency (`version` column; 409 after 3 conflicting retries), but multiple backend workers are not yet supported for sourcing.
 
 ## 👤 Login, Roles and Tenant Isolation
@@ -364,13 +363,15 @@ Sourcing sessions use optimistic concurrency (`version` column; 409 after 3 conf
   python -m app.admin add-member --email user@example.com --factory apex-volt-blr2 --role owner
   ```
 
-  The command needs `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in `backend/.env`. `approved_by` on every purchase order and receipt is the signed-in user's email (`telegram:<email>` / `whatsapp:<email>` for a linked chat), never a request field.
+  The command needs `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in `backend/.env`. `approved_by` on every purchase order and receipt is the signed-in user's email (`telegram:<email>` for a linked chat), never a request field.
 - **Tenant isolation.** Every tenant table has a `factory_id`. Row-Level Security lets a signed-in user read only the rows of factories they are a member of; the browser has no write privileges and anon has none at all. The backend also authorises every route and every run against the run's own factory, so a user of factory A gets a 404 for factory B's runs, plans, sourcing sessions and receipts.
 - **API key for automation only.** `CASCADE_API_KEY` (`X-API-Key`) is a machine key for scripts and PLC telemetry on `/api/v1/ingest/*` and `/api/v1/simulate-crisis`. It is bound to `CASCADE_API_KEY_FACTORY`, cannot approve plans and is never used by the browser.
 
-## 💬 Chat Channels: WhatsApp and Telegram
+## 💬 Chat Channel: Telegram
 
-WhatsApp and Telegram are two implementations of one channel adapter (`backend/app/channels/`: `send_text`, `send_buttons`, `parse_inbound`). The shared flow in `backend/app/inbound.py` gives both channels the same commands (`/link`, `status`, a disruption alert, a vendor reply, the Approve button), the same de-duplication and the same authorisation: a chat can approve only after it is linked to a user, and only when that user is an owner or approver of the run's factory (a chat linked for factory A cannot act on factory B). Chats that are not linked get the `/link` instructions and nothing else. While no WhatsApp chat is linked, the legacy `WA_APPROVER_NUMBERS` fallback applies to the default factory only; linking the first WhatsApp chat ends it.
+Telegram is the chat channel, behind one channel adapter interface (`backend/app/channels/`: `send_text`, `send_buttons`, `parse_inbound`). `SOURCING_MODE` is `simulated` (default; vendor replies are typed on the dashboard) or `telegram`. The shared flow in `backend/app/inbound.py` gives the chat the commands `/link`, `status`, a disruption alert, a vendor reply and the Approve button, with de-duplication and authorisation: a chat can approve only after it is linked to a user, and only when that user is an owner or approver of the run's factory (a chat linked for factory A cannot act on factory B). Chats that are not linked get the `/link` instructions and nothing else.
+
+**WhatsApp was removed.** The Meta Cloud API and Twilio webhooks, `/api/v1/whatsapp/health`, the `WA_APPROVER_NUMBERS` allowlist and all `META_*`, `TWILIO_*` and `WHATSAPP_*` settings are gone; leftover values in an old `.env` are ignored, and a stale `SOURCING_MODE=whatsapp` falls back to `simulated`. The database columns `suppliers.whatsapp_number` and the `whatsapp` value allowed by `user_channels` remain (migrations are not rewritten) but the code no longer reads or writes them.
 
 **Telegram setup (free, no card)**
 
@@ -387,17 +388,17 @@ WhatsApp and Telegram are two implementations of one channel adapter (`backend/a
    python -m app.admin set-client-contact --order EV-402 --channel telegram --address 987654321
    ```
 
-   RFQs go to the vendor chats, a vendor's reply in the chat (for example `YES 150 @600 in 4h`) is matched to the open enquiry, and the Client Agent's approved message goes to the order's `client_contact`. A vendor without a chat id gets a `SEND_FAILED` enquiry; an order without a contact returns 409 "no client contact". `--channel whatsapp` sets the WhatsApp number instead.
+   RFQs go to the vendor chats, a vendor's reply in the chat (for example `YES 150 @600 in 4h`) is matched to the open enquiry, and the Client Agent's approved message goes to the order's `client_contact`. A vendor without a chat id gets a `SEND_FAILED` enquiry; an order without a contact returns 409 "no client contact".
 5. Apply migration `008_identity.sql` (level 8 is required; it adds `user_channels`, `link_codes`, `suppliers.telegram_chat_id` and `orders.client_contact`).
 
 ## 🔐 Security Setup
 
-- Every API route except `/`, `/healthz` and the signed WhatsApp webhook needs a verified actor: a Supabase Auth user (`Authorization: Bearer <access token>`, verified server-side) with a role in the factory (`factory_members`: owner, approver or viewer; add one with `python -m app.admin add-member --email E --factory F --role R` after the user signs up). Reads need any role, changes need owner or approver, `/reset` needs owner. `approved_by` is always the signed-in user's email, never a request field.
+- Every API route except `/`, `/healthz` and the secret-checked Telegram webhook needs a verified actor: a Supabase Auth user (`Authorization: Bearer <access token>`, verified server-side) with a role in the factory (`factory_members`: owner, approver or viewer; add one with `python -m app.admin add-member --email E --factory F --role R` after the user signs up). Reads need any role, changes need owner or approver, `/reset` needs owner. `approved_by` is always the signed-in user's email, never a request field.
 - `CASCADE_API_KEY` (`X-API-Key`) is a machine key for automation on `/api/v1/ingest/*` and `/api/v1/simulate-crisis` only; it acts as an approver of `CASCADE_API_KEY_FACTORY` and cannot approve plans. The browser never sends it.
 - `AUTH_MODE=dev` (offline storage only; refused in production) trusts an `X-Dev-User: <email>` header for seeded dev users; the tests use it.
-- `META_APP_SECRET` verifies WhatsApp webhook signatures; `WA_APPROVER_NUMBERS` lists who may approve. Without it, unsigned webhooks are accepted only with offline (in-memory) storage in development; with Supabase configured they are refused (401). The unsigned Twilio sandbox branch is served only with offline storage (otherwise 404).
+- `TELEGRAM_WEBHOOK_SECRET` must match the `secret_token` given to Telegram's `setWebhook`; without it the Telegram webhook refuses every update. Only chats linked to a user (`/link <code>`) can approve.
 - `ALLOWED_ORIGINS` replaces the old `*` CORS policy.
-- `CASCADE_ENV=production` refuses to start if a required secret is missing, and disables `/reset` and the Twilio sandbox. It also hides `/docs`, `/redoc` and `/openapi.json`.
+- `CASCADE_ENV=production` refuses to start if a required secret is missing, and disables `/reset`. It also hides `/docs`, `/redoc` and `/openapi.json`.
 - A Supabase Auth outage (unreachable, timeout, 5xx, rate limit) is a `503` with `Retry-After: 5`, not a `401`, so clients keep the session; only an auth rejection of the token is a `401`. Verified tokens are cached for at most 60 s and never past their `exp`.
 - Execution uses the plan the server computed for a `run_id`, once per run. Costs are never accepted from the client.
 

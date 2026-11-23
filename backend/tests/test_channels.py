@@ -1,14 +1,12 @@
-"""Round B Task 5: channel adapters (WhatsApp, Telegram) and the shared inbound flow.
+"""Round B Task 5: channel adapter (Telegram) and the shared inbound flow.
 
-Every flow test runs over both channels with fake transports (nothing reaches Meta or Telegram):
+Every flow test runs over the channel with a fake transport (nothing reaches Telegram):
 alert -> plan with an Approve button; Approve by a linked approver -> executed once; unlinked,
 viewer and foreign-factory senders -> refused with nothing executed (Review Focus 3); a duplicate
 update -> processed once (Review Focus 4); a processing failure releases the event.
 """
 
 import contextlib
-import hashlib
-import hmac
 import itertools
 import json
 import re
@@ -24,9 +22,9 @@ from tests.factories import seed_second_factory
 from fastapi.testclient import TestClient
 
 from app import db, inbound, main, run_store
+from app.factory_model import FactoryDataError
 from app.channels.base import InboundMessage
 from app.channels.telegram import TelegramChannel
-from app.channels.whatsapp import WhatsAppChannel
 
 APEX = "apex-volt-blr2"
 TP = "test-plant"
@@ -73,45 +71,6 @@ class _Harness:
         raise NotImplementedError
 
 
-class WhatsAppHarness(_Harness):
-    name = "whatsapp"
-    sender = "919811111111"
-    other_sender = "919822222222"
-
-    def __init__(self):
-        self.log = []
-        self.channel = WhatsAppChannel(
-            send_text=lambda to, text: self.log.append({"to": to, "text": text, "buttons": []}) or True,
-            send_buttons=lambda to, text, buttons, header=None, footer=None: self.log.append(
-                {"to": to, "text": text, "buttons": [b["id"] for b in buttons]}) or True,
-        )
-        self.patch = mock.patch.object(main, "_whatsapp_channel", lambda: self.channel)
-
-    def sent(self):
-        return self.log
-
-    def _post(self, client, msg):
-        msg.setdefault("id", f"wamid.T{next(_ids)}")
-        body = {"object": "whatsapp_business_account",
-                "entry": [{"changes": [{"value": {"messages": [msg]}}]}]}
-        raw = json.dumps(body).encode()
-        sig = "sha256=" + hmac.new(b"test-app-secret", raw, hashlib.sha256).hexdigest()
-        return client.post("/api/v1/webhooks/whatsapp", content=raw,
-                           headers={"content-type": "application/json", "x-hub-signature-256": sig})
-
-    def text(self, client, sender, text, msg_id=None):
-        msg = {"from": sender, "type": "text", "text": {"body": text}}
-        if msg_id:
-            msg["id"] = f"wamid.{msg_id}"
-        return self._post(client, msg)
-
-    def button(self, client, sender, button_id, msg_id=None):
-        msg = {"from": sender, "type": "interactive", "interactive": {"button_reply": {"id": button_id}}}
-        if msg_id:
-            msg["id"] = f"wamid.{msg_id}"
-        return self._post(client, msg)
-
-
 class TelegramHarness(_Harness):
     name = "telegram"
     sender = "5550001"
@@ -148,7 +107,7 @@ class TelegramHarness(_Harness):
             "message": {"message_id": 2, "chat": chat}, "data": button_id}}, msg_id)
 
 
-HARNESSES = (WhatsAppHarness, TelegramHarness)
+HARNESSES = (TelegramHarness,)
 
 
 class _ChannelCase(unittest.TestCase):
@@ -221,6 +180,28 @@ class SharedFlowTests(_ChannelCase):
                 self.assertIn("VIEW_STATUS", last["buttons"])
                 self.assertIn(run_id, last["text"])
 
+    def test_pipeline_factory_error_is_not_500_and_leaks_nothing(self):
+        for h in self.channels():
+            with self.subTest(channel=h.name), self.active(h):
+                self.link(h, DEV_OWNER, h.sender)
+                before = len(h.sent())
+                with mock.patch("app.agents.graph.load_factory_model", side_effect=FactoryDataError("bad data")):
+                    r = h.text(self.webhook, h.sender, ALERT)
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.json()["status"], "error")
+                self.assertGreater(len(h.sent()), before)
+                self.assertIn("misconfigured", h.sent()[-1]["text"])
+                self.assertNotIn("bad data", h.sent()[-1]["text"])   # no internal detail to chat senders
+
+    def test_vendor_reply_factory_error_is_not_500(self):
+        for h in self.channels():
+            with self.subTest(channel=h.name), self.active(h):
+                with mock.patch.object(main.sourcing, "find_open_rfq_by_address", return_value=("run-x", "SUP-X")),                         mock.patch.object(main.sourcing, "record_reply", side_effect=FactoryDataError("bad data")):
+                    r = h.text(self.webhook, "9000002", "ok 100 units at 500")
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.json()["status"], "error")
+                self.assertEqual(r.json()["run_id"], "run-x")
+
     def test_alert_runs_for_the_senders_factory(self):
         for h in self.channels():
             with self.subTest(channel=h.name), self.active(h):
@@ -259,7 +240,7 @@ class SharedFlowTests(_ChannelCase):
     def test_unlinked_sender_is_refused(self):
         for h in self.channels():
             with self.subTest(channel=h.name), self.active(h):
-                self.link(h, DEV_OWNER, h.other_sender)   # a linked chat exists, so no WhatsApp fallback
+                self.link(h, DEV_OWNER, h.other_sender)
                 sim = self.apex_run()
                 with mock.patch.object(main, "_execute") as execute:
                     r = h.button(self.webhook, h.sender, f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}")
@@ -472,59 +453,6 @@ class LinkCodeTests(_ChannelCase):
                 self.assertIsNotNone(db.get_user_channel(h.name, h.sender))
 
 
-class WhatsAppFallbackTests(_ChannelCase):
-    """WA_APPROVER_NUMBERS works only while user_channels has no WhatsApp rows, and only for
-    DEFAULT_FACTORY_ID runs (Task 2 review I1)."""
-
-    def setUp(self):
-        super().setUp()
-        self.h = WhatsAppHarness()
-        self.h.patch.start()
-
-    def tearDown(self):
-        self.h.patch.stop()
-        super().tearDown()
-
-    def test_allowlisted_number_approves_default_factory_run(self):
-        sim = self.apex_run()
-        r = self.h.button(self.webhook, "919800000000", f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}")
-        self.assertEqual(r.json().get("action"), "plan_executed")
-        self.assertEqual(db.get_receipt(sim["run_id"])["approved_by"], "whatsapp:919800000000")
-
-    def test_allowlisted_number_cannot_approve_other_factory_run(self):
-        sim = self.tp_run()
-        with mock.patch.object(main, "_execute") as execute:
-            r = self.h.button(self.webhook, "919800000000", f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}")
-        execute.assert_not_called()
-        self.assertEqual(r.json()["status"], "forbidden")
-        self.assertIsNone(db.get_receipt(sim["run_id"]))
-
-    def test_allowlist_is_off_once_any_whatsapp_chat_is_linked(self):
-        self.link(self.h, DEV_OWNER, self.h.other_sender)
-        sim = self.apex_run()
-        r = self.h.button(self.webhook, "919800000000", f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}")
-        self.assertEqual(r.json()["status"], "forbidden")
-        self.assertIsNone(db.get_receipt(sim["run_id"]))
-
-    def test_telegram_links_do_not_end_the_whatsapp_fallback(self):
-        db.link_user_channel("telegram", "5550009", "00000000-0000-4000-8000-000000000001", APEX)
-        sim = self.apex_run()
-        r = self.h.button(self.webhook, "919800000000", f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}")
-        self.assertEqual(r.json().get("action"), "plan_executed")
-
-    def test_non_allowlisted_number_gets_no_status_or_alert(self):
-        with mock.patch.object(main, "_run_pipeline") as pipeline:
-            for text in (ALERT, "status"):
-                r = self.h.text(self.webhook, "919000000001", text)
-                self.assertEqual(r.json()["status"], "unlinked")
-                self.assertIn("/link", self.h.sent()[-1]["text"])
-        pipeline.assert_not_called()
-
-    def test_fallback_alerts_run_for_the_default_factory(self):
-        r = self.h.text(self.webhook, "919800000000", ALERT)
-        self.assertEqual(run_store.get_run(r.json()["run_id"])["factory_id"], main.settings.DEFAULT_FACTORY_ID)
-
-
 class TelegramWebhookTests(unittest.TestCase):
     def setUp(self):
         db.reset_to_seed()
@@ -622,20 +550,6 @@ class TelegramAdapterTests(unittest.TestCase):
         with self.assertLogs("cascadezero.telegram", level="ERROR") as logs:
             self.assertFalse(tg.send_text("99", "hi"))
         self.assertNotIn("SECRET-TOKEN-123", "\n".join(logs.output))
-
-
-class WhatsAppAdapterTests(unittest.TestCase):
-    def test_parse_text_and_button(self):
-        wa = WhatsAppChannel(send_text=lambda *a: True, send_buttons=lambda *a, **k: True)
-        payload = {"entry": [{"changes": [{"value": {"messages": [
-            {"from": "919811111111", "id": "wamid.1", "type": "text", "text": {"body": " hi "}}]}}]}]}
-        self.assertEqual(wa.parse_inbound(payload), [InboundMessage("whatsapp", "919811111111", "hi", None, "wamid.1")])
-        payload["entry"][0]["changes"][0]["value"]["messages"][0] = {
-            "from": "919811111111", "id": "wamid.2", "type": "interactive",
-            "interactive": {"button_reply": {"id": "VIEW_STATUS"}}}
-        self.assertEqual(wa.parse_inbound(payload),
-                         [InboundMessage("whatsapp", "919811111111", "", "VIEW_STATUS", "wamid.2")])
-
 
 
 class IdentitySqlTests(unittest.TestCase):

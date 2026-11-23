@@ -4,8 +4,6 @@ CascadeZero — FastAPI server
   GET  /api/v1/state                       factory snapshot                      [any role]
   GET  /api/v1/factory                     factory model: vendors + lines        [any role]
   POST /api/v1/simulate-crisis             run the agent graph + solver          [owner/approver, API key]
-  GET  /api/v1/webhooks/whatsapp           Meta verification handshake
-  POST /api/v1/webhooks/whatsapp           Meta (HMAC-verified) / Twilio webhook
   POST /api/v1/telegram/webhook            Telegram Bot API updates (secret-token header)
   POST /api/v1/channels/link-code          one-time code to link a chat to this user [any role]
   POST /api/v1/ingest/plc-telemetry        line telemetry (HTTP JSON, simulated) [owner/approver, API key]
@@ -24,11 +22,10 @@ CascadeZero — FastAPI server
   POST /api/v1/client/approve              human sign-off: send it to the client [owner/approver]
   POST /api/v1/client/answer               record the client's answer (re-plans) [owner/approver]
   GET  /api/v1/client/{run_id}             the run's extension request / answer  [any role]
-  GET  /api/v1/whatsapp/health             WhatsApp configuration check          [owner/approver, API key]
   POST /api/v1/reset                       reset demo data                       [owner]
 
-Security model (app/auth.py): every route except `/`, `/healthz` and the signature-checked
-WhatsApp / secret-checked Telegram webhooks needs a verified actor: a Supabase user (Authorization: Bearer <access token>)
+Security model (app/auth.py): every route except `/`, `/healthz` and the secret-checked
+Telegram webhook needs a verified actor: a Supabase user (Authorization: Bearer <access token>)
 with a role in the factory (`factory_members`), or, on automation endpoints only, the machine
 key in X-API-Key.
 
@@ -43,9 +40,6 @@ the request body. AUTH_MODE=dev (offline storage only, never production) accepts
 from __future__ import annotations
 
 import csv
-import hashlib
-import hmac
-import html
 import io
 import logging
 import math
@@ -73,7 +67,7 @@ from app.auth import (
 from app.agents import client as client_agent
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
-from app.channels import TelegramChannel, WhatsAppChannel
+from app.channels import TelegramChannel
 from app import db
 from app.config import settings
 from app.factory_model import FactoryDataError, load_factory_model
@@ -86,7 +80,6 @@ from app.db import (
     update_rows,
     upsert_row,
 )
-from app.meta_whatsapp import send_whatsapp_interactive_buttons, send_whatsapp_text
 from app.schemas import (
     DeliveryRecordRequest,
     ErpCsvSyncRequest,
@@ -272,7 +265,7 @@ async def _database_error_handler(request: Request, exc: db.DatabaseError):
     )
 
 
-# Sent to WhatsApp senders when factory data is invalid; the detail stays in the server log.
+# Sent to chat senders when factory data is invalid; the detail stays in the server log.
 _MISCONFIGURED_REPLY = "Sorry — the planning service is misconfigured; the operator has been notified."
 
 
@@ -447,116 +440,16 @@ def simulate_crisis(req: SimulateCrisisRequest, actor: Actor = Depends(machine_a
     return _run_response(result)
 
 
-# ─── 3. WhatsApp webhook ─────────────────────────────────────────────────────
-
-def _verify_meta_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
-    if not settings.META_APP_SECRET:
-        # Unsigned payloads only against offline (in-memory) storage in development; with a live
-        # database they are refused, since an approval here would execute without a verified actor.
-        return settings.storage_mode == "offline" and not settings.is_production
-    if not signature_header or not signature_header.startswith("sha256="):
-        return False
-    expected = hmac.new(settings.META_APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature_header.split("=", 1)[1])
-
+# ─── 3. Chat channels ─────────────────────────────────────────────────────────
 
 # The chat flow itself (dedupe, /link, status, vendor replies, alerts, approvals) is shared by
-# every channel: app/inbound.py. These are kept here for the Twilio sandbox and existing callers.
+# every channel: app/inbound.py.
 _status_text = inbound.status_text
 _winner_summary = inbound.winner_summary
 
 
-def _whatsapp_channel() -> WhatsAppChannel:
-    """The WhatsApp adapter. The send helpers are bound late (looked up on this module at call
-    time), so a patched `main.send_whatsapp_text` is what the adapter calls."""
-    return WhatsAppChannel(
-        send_text=lambda to, text: send_whatsapp_text(to, text),
-        send_buttons=lambda to, text, buttons, header=None, footer=None:
-            send_whatsapp_interactive_buttons(to, text, buttons, header, footer),
-    )
-
-
 def _telegram_channel() -> TelegramChannel:
     return TelegramChannel(settings.TELEGRAM_BOT_TOKEN)
-
-
-async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        payload["entry"][0]["changes"][0]["value"]
-    except (KeyError, IndexError, TypeError):
-        return {"status": "ignored"}
-    channel = _whatsapp_channel()
-    messages = channel.parse_inbound(payload)   # delivery/read receipts are logged, yield nothing
-    if not messages:
-        return {"status": "ok"}
-    return await inbound.handle(channel, messages[0])
-
-
-@app.get("/api/v1/webhooks/whatsapp")
-async def verify_meta_webhook(request: Request):
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token") or ""
-    challenge = request.query_params.get("hub.challenge") or ""
-    if (
-        mode == "subscribe"
-        and settings.META_WA_VERIFY_TOKEN
-        and secrets.compare_digest(token, settings.META_WA_VERIFY_TOKEN)
-    ):
-        return Response(content=challenge, media_type="text/plain", status_code=200)
-    logger.warning("Meta webhook verification failed")
-    return Response(content="Verification failed", status_code=403)
-
-
-@app.post("/api/v1/webhooks/whatsapp")
-async def whatsapp_webhook(request: Request):
-    content_type = request.headers.get("content-type", "")
-
-    if "application/json" in content_type:
-        raw = await request.body()
-        if not _verify_meta_signature(raw, request.headers.get("x-hub-signature-256")):
-            logger.warning("Rejected WhatsApp webhook with invalid signature")
-            raise HTTPException(status_code=401, detail="Invalid signature")
-        try:
-            import json
-            payload = json.loads(raw or b"{}")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid JSON")
-        if payload.get("object") != "whatsapp_business_account":
-            return {"status": "ignored"}
-        return await _handle_meta_payload(payload)
-
-    # Twilio sandbox (form-encoded, unsigned). Offline development only: it runs analysis
-    # anonymously (never approves), so it is not served with a live database or in production.
-    if settings.is_production or settings.storage_mode != "offline":
-        raise HTTPException(status_code=404, detail="Not Found")
-    form = await request.form()
-    body_text = str(form.get("Body", "")).strip()
-    sender = str(form.get("From", "")).strip()
-    if not body_text or body_text.lower() in ("hi", "hello", "ping", "test") or "join" in body_text.lower():
-        reply = "✅ CascadeZero connected. Send a disruption alert, e.g. state the delay in hours, the units short, the affected line and order."
-    else:
-        try:
-            result = await run_in_threadpool(_run_pipeline, body_text, "TWILIO_WHATSAPP_SANDBOX")
-            reply = _winner_summary(result) + "\nApprove from the dashboard."
-        except (FactoryDataError, db.DatabaseError) as exc:
-            logger.error("Twilio pipeline failed, factory data/database unavailable: %s", exc)
-            reply = _MISCONFIGURED_REPLY
-        except SolverInputError as exc:
-            reply = f"⚠️ Cannot plan for these inputs: {exc}"
-    logger.info("Twilio reply to %s", sender)
-    twiml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f"<Response><Message><Body>{html.escape(reply)}</Body></Message></Response>"
-    )
-    return Response(content=twiml, media_type="text/xml")
-
-
-@app.get("/api/v1/whatsapp/health", dependencies=[Depends(machine_write_access)])
-def whatsapp_health():
-    """Verify token, phone number, app secret and webhook subscription. Never returns secrets."""
-    from app.whatsapp_health import check_whatsapp_health
-
-    return check_whatsapp_health()
 
 
 # ─── 3b. Telegram webhook and chat linking ─────────────────────────────────────
@@ -584,7 +477,7 @@ async def telegram_webhook(request: Request):
 
 @app.post("/api/v1/channels/link-code")
 def create_channel_link_code(req: Optional[LinkCodeRequest] = None, actor: Actor = Depends(user_actor)):
-    """A one-time code (15 min) that links a WhatsApp/Telegram chat to the signed-in user for one
+    """A one-time code (15 min) that links a Telegram chat to the signed-in user for one
     factory: send `/link <code>` to the bot. Any role may link; approvals still need owner/approver."""
     factory_id = actor.authorize((req or LinkCodeRequest()).factory_id, *ANY_ROLE)
     if not actor.user_id:

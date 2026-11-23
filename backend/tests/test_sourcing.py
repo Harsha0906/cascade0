@@ -69,17 +69,6 @@ class SourcingFlowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.client = dev_client(main.app)
-        cls._patches = [
-            mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: True),
-            mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: True),
-        ]
-        for p in cls._patches:
-            p.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        for p in cls._patches:
-            p.stop()
 
     def setUp(self):
         self.client.post("/api/v1/reset", headers=KEY)
@@ -230,19 +219,6 @@ class SourcingFlowTests(unittest.TestCase):
         sim = self._simulate(2)  # overtime + safety stock wins
         s = self._start(sim["run_id"])
         self.assertEqual(s["status"], "NOTHING_TO_SOURCE")
-
-    def test_whatsapp_reply_from_vendor_is_routed_to_agent(self):
-        update_rows("suppliers", "id", "SUP-PNY-02", {"whatsapp_number": "+91 98450 00001"})
-        sim = self._simulate(1)
-        self._start(sim["run_id"])
-        body = {"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {"messages": [{
-            "from": "919845000001", "type": "text", "text": {"body": "YES 150 pcs @600 in 4h"}}]}}]}]}
-        raw = json.dumps(body).encode()
-        sig = "sha256=" + hmac.new(b"test-app-secret", raw, hashlib.sha256).hexdigest()
-        r = self.client.post("/api/v1/webhooks/whatsapp", content=raw,
-                             headers={"content-type": "application/json", "x-hub-signature-256": sig})
-        self.assertEqual(r.json()["action"], "vendor_reply_recorded")
-        self.assertEqual(sourcing.view(sim["run_id"])["status"], "COMPLETE")
 
 
 if __name__ == "__main__":

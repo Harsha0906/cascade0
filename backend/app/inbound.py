@@ -1,5 +1,5 @@
 """
-CascadeZero — the shared inbound flow for every chat channel (WhatsApp, Telegram).
+CascadeZero — the shared inbound flow for every chat channel (Telegram).
 
 `await handle(channel, msg)` runs one inbound message:
 
@@ -19,13 +19,6 @@ CascadeZero — the shared inbound flow for every chat channel (WhatsApp, Telegr
 Identity: a chat address is linked in `user_channels` (channel, address -> user, factory). The
 user's role comes from `factory_members` on every message, so a removed membership takes effect
 at once. An unlinked sender is told how to `/link`.
-
-WhatsApp fallback (documented, transitional): while `user_channels` has NO WhatsApp rows, the
-only numbers in WA_APPROVER_NUMBERS get an identity (alerts, status and approval for
-DEFAULT_FACTORY_ID runs only; approved_by "whatsapp:<number>"). Every other unlinked sender gets
-the /link reply (vendor replies are matched before identity and still work). Linking the first
-WhatsApp chat switches WhatsApp to linked-only. A linked chat's actor carries only the linked
-factory's membership.
 """
 
 from __future__ import annotations
@@ -130,7 +123,7 @@ def winner_summary(result: Dict[str, Any]) -> str:
 class Identity:
     actor: Actor            # memberships used to authorise against a RUN's factory
     factory_id: str         # the factory alerts and status act on
-    approved_by: str        # "<channel>:<email>" (linked) or "whatsapp:<number>" (fallback)
+    approved_by: str        # "<channel>:<email>"
     may_plan: bool          # may trigger an analysis
     linked: bool
 
@@ -138,12 +131,6 @@ class Identity:
 def _address(channel: Channel, sender: str) -> str:
     normalize = getattr(channel, "normalize_address", None)
     return normalize(sender) if normalize else str(sender)
-
-
-def _is_allowlisted(number: str) -> bool:
-    if not settings.WA_APPROVER_NUMBERS:
-        return False   # no allowlist configured: fallback approvals are disabled, not open
-    return number.lstrip("+") in settings.WA_APPROVER_NUMBERS
 
 
 def identify(channel: Channel, sender: str) -> Optional[Identity]:
@@ -161,12 +148,6 @@ def identify(channel: Channel, sender: str) -> Optional[Identity]:
         actor = Actor("user", link["user_id"], member["email"], {link["factory_id"]: member["role"]})
         return Identity(actor, link["factory_id"], f"{channel.name}:{member['email']}",
                         member["role"] in WRITE_ROLES, True)
-    if channel.name == "whatsapp" and not db.has_user_channels("whatsapp"):
-        if not _is_allowlisted(address):
-            return None   # unlinked and not an approver: no status, no alerts, only /link
-        default = settings.DEFAULT_FACTORY_ID
-        return Identity(Actor("user", None, None, {default: "approver"}), default,
-                        f"whatsapp:{address}", True, False)
     return None
 
 
@@ -315,10 +296,6 @@ async def _approve(channel: Channel, sender: str, button_id: str) -> Dict[str, A
     if identity is None:
         logger.warning("Rejected %s approval from unlinked %s", channel.name, _address(channel, sender))
         await _reply(channel, sender, UNLINKED_TEXT)
-        return {"status": "forbidden"}
-    if not identity.linked and not identity.actor.memberships:
-        logger.warning("Rejected WhatsApp approval from non-allowlisted number %s", sender)
-        await _reply(channel, sender, "⛔ This number is not authorised to approve plans.")
         return {"status": "forbidden"}
     if not run_id or not playbook_id:
         return {"status": "ignored"}

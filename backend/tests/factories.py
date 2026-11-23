@@ -56,7 +56,7 @@ def seed_second_factory() -> None:
             "part_name": "Widget", "inbound_qty": 0, "max_available_qty": max_units,
             "extra_cost_per_unit_inr": unit_cost, "flat_charter_cost_inr": flat,
             "lead_time_hours": lead, "traffic_risk_pct": 5.0, "weather_risk_pct": 0.0,
-            "status": "STANDBY", "delay_hours": 0, "whatsapp_number": "",
+            "status": "STANDBY", "delay_hours": 0,
             "factory_id": "test-plant", "sourcing_role": role,
             "lead_time_sigma_hours": 0.5, "delay_shock_min_hours": 1.0,
             "delay_shock_max_hours": 2.0, "unreliable_delay_min_hours": 1.0,

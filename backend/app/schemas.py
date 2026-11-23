@@ -32,12 +32,12 @@ class LineImpactExtraction(BaseModel):
 class DisruptionExtraction(BaseModel):
     """
     Pydantic schema passed to Gemini `response_schema` for parsing unstructured
-    WhatsApp/Email/SMS messages. Anything not stated stays null/empty: references
+    Telegram/Email/SMS messages. Anything not stated stays null/empty: references
     are resolved against the factory model later, and nothing is invented here.
     """
     source_channel: str = Field(
-        default="WHATSAPP",
-        description="Source of disruption alert, e.g. WHATSAPP, PLC, ERP, HIGHWAY_WEATHER"
+        default="TELEGRAM",
+        description="Source of disruption alert, e.g. TELEGRAM, PLC, ERP, HIGHWAY_WEATHER"
     )
     delay_hours: Optional[int] = Field(
         default=None,

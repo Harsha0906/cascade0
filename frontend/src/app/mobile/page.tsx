@@ -146,7 +146,7 @@ export default function MobileControllerPage() {
   const triggerCustomDisruption = async () => {
     if (!customPrompt.trim()) return;
     setIsSubmitting(true);
-    setFeedbackMsg("Transmitting custom WhatsApp/Voice disruption text...");
+    setFeedbackMsg("Transmitting custom field disruption text...");
     try {
       const res = await apiFetch("/api/v1/simulate-crisis", {
         method: "POST",
@@ -419,14 +419,14 @@ export default function MobileControllerPage() {
           ))}
         </div>
 
-        {/* ─── Section: Custom WhatsApp / Audio Text Disruption ─────────────── */}
+        {/* ─── Section: Custom Field / Audio Text Disruption ─────────────── */}
         <div className="p-5 rounded-[28px] island-card flex flex-col gap-3">
           <div className="flex items-center gap-2.5">
             <div className="p-2 rounded-xl bg-charcoal-900 text-acid">
               <MessageSquare className="w-4 h-4" />
             </div>
             <h3 className="text-xs font-extrabold text-charcoal-900 font-mono uppercase tracking-wider">
-              Simulate WhatsApp / Field Alert
+              Simulate Field Alert
             </h3>
           </div>
           <p className="text-[11px] text-charcoal-600 font-medium leading-snug">

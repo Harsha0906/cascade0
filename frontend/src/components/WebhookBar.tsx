@@ -47,7 +47,7 @@ export function WebhookBar() {
 
         </div>
 
-        {/* ─── Right: Custom WhatsApp Ingestion Input ──────────────────────── */}
+        {/* ─── Right: Custom Alert Input ──────────────────────── */}
         <form onSubmit={handleCustomSubmit} className="flex items-center gap-2 flex-1 sm:flex-initial min-w-[280px]">
           <div className="relative flex-1">
             <MessageSquare className="w-3.5 h-3.5 absolute left-3 top-2.5 text-charcoal-600" />

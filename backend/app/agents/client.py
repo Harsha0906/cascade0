@@ -25,8 +25,7 @@ Client Agent drafts a follow-up request (request_number + 1; the earlier request
 
 Human sign-off: nothing reaches the client before `approve_extension(..., approved_by)`.
 Sending uses the Sourcing Agent's channel setting (`SOURCING_MODE`): simulated records the
-message; whatsapp sends it to the order's `client_whatsapp_number` (or a `whatsapp:` client_contact),
-telegram to the order's `client_contact` ("telegram:<chat_id>", set with `python -m app.admin
+message; telegram sends it to the order's `client_contact` ("telegram:<chat_id>", set with `python -m app.admin
 set-client-contact`); 409 "no client contact" when there is none.
 The message quotes only data (order id, client, deadlines, the disruption headline, the order's
 partial-delay penalty); no number is written by an LLM.
@@ -45,7 +44,6 @@ from app import db, run_store
 from app.agents import sourcing, sourcing_store
 from app.config import settings
 from app.deadlines import deadline_hours, parse_timestamp
-from app.meta_whatsapp import send_whatsapp_text
 from app.solver import SolverInputError, generate_playbooks
 
 logger = logging.getLogger("cascadezero.client_agent")
@@ -313,15 +311,11 @@ def approve_extension(run_id: str, approved_by: str) -> Dict[str, Any]:
 
         mode = settings.SOURCING_MODE
         number = ""
-        if mode in ("whatsapp", "telegram"):
+        if mode == "telegram":
             order = _order(record["order_id"])
             contact_channel, _, contact_address = str(order.get("client_contact") or "").partition(":")
             if contact_channel.strip().lower() == mode and contact_address.strip():
                 number = contact_address.strip()
-            elif mode == "whatsapp":
-                number = order.get("client_whatsapp_number") or ""
-            if mode == "whatsapp":
-                number = sourcing._digits(number)
             if not number:
                 raise ClientAgentError(
                     f"no client contact: order {record['order_id']} has no {mode} contact "
@@ -332,9 +326,7 @@ def approve_extension(run_id: str, approved_by: str) -> Dict[str, Any]:
         _save_or_409(record)
 
         try:
-            if mode == "whatsapp":
-                sent = bool(send_whatsapp_text(number, record["draft_message"]))
-            elif mode == "telegram":
+            if mode == "telegram":
                 sent = bool(sourcing.outbound_channel("telegram").send_text(number, record["draft_message"]))
             else:
                 sent = True
@@ -342,7 +334,7 @@ def approve_extension(run_id: str, approved_by: str) -> Dict[str, Any]:
             logger.warning("Client %s send raised: %s", mode, type(exc).__name__)
             sent = False
         if not sent:
-            label = "WhatsApp" if mode == "whatsapp" else "Telegram"
+            label = "Telegram"
             record.update({"status": "DRAFTED", "approved_by": None, "approved_at": None})
             _log(record, f"{label} send failed", f"⚠ {label} send to the client failed; the request stays a draft.",
                  "send_client_message()")

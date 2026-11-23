@@ -369,57 +369,52 @@ class ExecutePlanTxClassificationTests(unittest.TestCase):
         self.assertEqual(params["p_receipt"]["playbook_id"], "A")
 
 
-def _meta_text(sender, text, msg_id=None):
-    msg = {"from": sender, "type": "text", "text": {"body": text}}
-    if msg_id:
-        msg["id"] = msg_id
-    return {"object": "whatsapp_business_account",
-            "entry": [{"changes": [{"value": {"messages": [msg]}}]}]}
+TG_SECRET = "test-telegram-secret"
+LINKED_CHAT = "7000001"   # linked to the dev owner of apex-volt-blr2 in TelegramWebhookCase
+
+
+def _tg_update(chat, text=None, button=None, update_id=1):
+    c = {"id": int(chat), "type": "private"}
+    if button is not None:
+        return {"update_id": update_id, "callback_query": {
+            "id": f"cq{update_id}", "from": {"id": int(chat)},
+            "message": {"message_id": 2, "chat": c}, "data": button}}
+    return {"update_id": update_id, "message": {"message_id": 1, "chat": c, "from": {"id": int(chat)}, "text": text}}
+
+
+class TelegramWebhookCase(unittest.TestCase):
+    """A client that posts Telegram updates (no outbound: TELEGRAM_BOT_TOKEN is empty) with a
+    chat linked to the dev owner of the default factory."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = dev_client(main.app, raise_server_exceptions=False)
+
+    def setUp(self):
+        self.client.post("/api/v1/reset", headers=KEY)
+        self._secret = mock.patch.object(main.settings, "TELEGRAM_WEBHOOK_SECRET", TG_SECRET)
+        self._secret.start()
+        self.addCleanup(self._secret.stop)
+        db.link_user_channel("telegram", LINKED_CHAT, "00000000-0000-4000-8000-000000000001",
+                             main.settings.DEFAULT_FACTORY_ID)
+
+    def post_update(self, update):
+        return self.client.post("/api/v1/telegram/webhook", json=update,
+                                headers={"X-Telegram-Bot-Api-Secret-Token": TG_SECRET})
 
 
 class _UniqueViolation(Exception):
     code = "23505"
 
 
-class WebhookDedupeHealthTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.client = dev_client(main.app)
-        cls._patches = [
-            mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: True),
-            mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: True),
-        ]
-        for p in cls._patches:
-            p.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        for p in cls._patches:
-            p.stop()
-
-    def setUp(self):
-        self.client.post("/api/v1/reset", headers=KEY)
-
-    def _post_signed(self, body):
-        import hashlib
-        import hmac
-        raw = json.dumps(body).encode()
-        sig = "sha256=" + hmac.new(b"test-app-secret", raw, hashlib.sha256).hexdigest()
-        return self.client.post("/api/v1/webhooks/whatsapp", content=raw,
-                                headers={"content-type": "application/json", "x-hub-signature-256": sig})
-
+class WebhookDedupeHealthTests(TelegramWebhookCase):
     def test_duplicate_webhook_processed_once(self):
-        body = _meta_text("919800000000", "Truck stuck, 150 casings short, line 2 at 50%", msg_id="wamid.X1")
+        body = _tg_update(LINKED_CHAT, "Truck stuck, 150 casings short, line 2 at 50%", update_id=501)
         with mock.patch.object(main, "_run_pipeline", wraps=main._run_pipeline) as spy:
             for _ in range(2):
-                r = self._post_signed(body)
+                r = self.post_update(body)
         self.assertEqual(spy.call_count, 1)
         self.assertEqual(r.json()["status"], "duplicate")
-
-    def test_messages_without_id_are_not_deduped(self):
-        body = _meta_text("919800000001", "status")
-        for _ in range(2):
-            self.assertNotEqual(self._post_signed(body).json()["status"], "duplicate")
 
     def test_record_webhook_event_offline(self):
         self.assertTrue(db.record_webhook_event("wamid.A"))

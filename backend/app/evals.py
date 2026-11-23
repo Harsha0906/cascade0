@@ -16,7 +16,7 @@ compared with the labelled ground truth in `backend/evals/disruptions.jsonl`. Ve
 
 with precision = correct / (correct + wrong + spurious) and recall = correct / (correct + wrong + missed).
 
-Safety: the run is OFFLINE (no Supabase, no WhatsApp, no Gemini) unless `--live` is given, and `--live`
+Safety: the run is OFFLINE (no Supabase, no Telegram, no Gemini) unless `--live` is given, and `--live`
 is required for the gemini path because it calls the live Gemini API. Supabase stays offline even then.
 """
 
@@ -28,9 +28,8 @@ import sys
 # Offline before any app module is imported (python-dotenv never overrides variables already set).
 _ALWAYS_OFFLINE = {
     "SUPABASE_URL": "", "SUPABASE_ANON_KEY": "", "SUPABASE_SERVICE_ROLE_KEY": "",
-    "META_WA_ACCESS_TOKEN": "", "META_WA_PHONE_NUMBER_ID": "",
-    "TWILIO_ACCOUNT_SID": "", "TWILIO_AUTH_TOKEN": "", "OPENWEATHER_API_KEY": "",
-    "SOURCING_MODE": "simulated", "SOURCING_RFQ_TEMPLATE": "",
+    "OPENWEATHER_API_KEY": "", "TELEGRAM_BOT_TOKEN": "",
+    "SOURCING_MODE": "simulated",
 }
 os.environ.update(_ALWAYS_OFFLINE)
 if "--live" not in sys.argv:

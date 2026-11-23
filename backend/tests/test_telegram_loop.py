@@ -1,5 +1,5 @@
 """Telegram vendor/client messaging, the polling worker and the admin contact commands (offline:
-fake transports only; nothing reaches Telegram or WhatsApp)."""
+fake transports only; nothing reaches Telegram)."""
 
 import asyncio
 import io
@@ -18,18 +18,18 @@ from app.agents import client as client_agent
 from app.agents import sourcing
 from app.channels.telegram import TelegramChannel
 from app.config import settings
-from tests.test_channels import (ALERT, TG_SECRET, FakeTelegramTransport, TelegramHarness, WhatsAppHarness,
+from tests.test_channels import (ALERT, TG_SECRET, FakeTelegramTransport, TelegramHarness,
                                  _ChannelCase)
 
-VENDOR_ADDRESS = {"telegram": "7000001", "whatsapp": "919900000001"}
-VENDOR_COLUMN = {"telegram": "telegram_chat_id", "whatsapp": "whatsapp_number"}
+VENDOR_ADDRESS = {"telegram": "7000001"}
+VENDOR_COLUMN = {"telegram": "telegram_chat_id"}
 
 
 class ParityFlowTests(_ChannelCase):
     """alert -> plan -> RFQs to vendor chats -> vendor YES -> approve -> receipt, per channel."""
 
     def test_full_flow_on_each_channel(self):
-        for h in (TelegramHarness(), WhatsAppHarness()):
+        for h in (TelegramHarness(),):
             with self.subTest(channel=h.name), self.active(h), \
                     mock.patch.object(settings, "SOURCING_MODE", h.name):
                 db.update_rows("suppliers", "id", "SUP-PNY-02", {VENDOR_COLUMN[h.name]: VENDOR_ADDRESS[h.name]})
@@ -88,13 +88,13 @@ class ParityFlowTests(_ChannelCase):
             self.assertEqual(sourcing.find_open_rfq_by_address("telegram", "7000001"), (run_id, "SUP-PNY-02"))
             self.assertIsNone(sourcing.find_open_rfq_by_address("telegram", "7000002"))
             self.assertIsNone(sourcing.find_open_rfq_by_address("telegram", ""))
-            self.assertIsNone(sourcing.find_open_rfq_by_address("whatsapp", "7000001"))
+            self.assertIsNone(sourcing.find_open_rfq_by_address("whatsapp", "7000001"))   # no such channel
 
 class SharedVendorAddressTests(_ChannelCase):
     """One vendor address serving two factories: a reply never lands in the wrong one."""
 
     def test_reply_needs_the_ref_when_two_enquiries_are_open(self):
-        for h in (TelegramHarness(), WhatsAppHarness()):
+        for h in (TelegramHarness(),):
             with self.subTest(channel=h.name), self.active(h),                     mock.patch.object(settings, "SOURCING_MODE", h.name):
                 addr = VENDOR_ADDRESS[h.name]
                 col = VENDOR_COLUMN[h.name]
@@ -162,11 +162,11 @@ class ClientTelegramTests(_ChannelCase):
             self.assertEqual(cm.exception.status_code, 502)
             self.assertEqual(client_agent.view(run_id)["status"], "DRAFTED")
 
-    def test_a_whatsapp_contact_is_not_used_in_telegram_mode(self):
+    def test_a_non_telegram_contact_is_not_used_in_telegram_mode(self):
         h = TelegramHarness()
         with self.active(h), mock.patch.object(settings, "SOURCING_MODE", "telegram"):
             run_id, order_id = self._drafted()
-            db.update_rows("orders", "order_id", order_id, {"client_contact": "whatsapp:919845011111"})
+            db.update_rows("orders", "order_id", order_id, {"client_contact": "email:ops@example.test"})
             with self.assertRaises(client_agent.ClientAgentError) as cm:
                 client_agent.approve_extension(run_id, "ops-lead")
             self.assertEqual(cm.exception.status_code, 409)
@@ -291,10 +291,9 @@ class AdminContactTests(unittest.TestCase):
                                  "--channel", "telegram", "--address", "7000001")
         self.assertEqual(code, 0, out)
         self.assertEqual(db.get_supplier("SUP-PNY-02")["telegram_chat_id"], "7000001")
-        code, _, _ = self._run("set-vendor-contact", "--supplier", "SUP-PNY-02",
-                               "--channel", "whatsapp", "--address", "+91 98450 00001")
-        self.assertEqual(code, 0)
-        self.assertEqual(db.get_supplier("SUP-PNY-02")["whatsapp_number"], "919845000001")
+        with self.assertRaises(SystemExit):   # whatsapp was removed: not an accepted channel
+            self._run("set-vendor-contact", "--supplier", "SUP-PNY-02",
+                      "--channel", "whatsapp", "--address", "919845000001")
 
     def test_set_client_contact(self):
         order_id = db.get_all_orders()[0]["order_id"] if hasattr(db, "get_all_orders") else "EV-402"
@@ -307,7 +306,6 @@ class AdminContactTests(unittest.TestCase):
         for argv in (
             ("set-vendor-contact", "--supplier", "NOPE", "--channel", "telegram", "--address", "1"),
             ("set-vendor-contact", "--supplier", "SUP-PNY-02", "--channel", "telegram", "--address", "@vendor"),
-            ("set-vendor-contact", "--supplier", "SUP-PNY-02", "--channel", "whatsapp", "--address", "12"),
             ("set-client-contact", "--order", "NOPE", "--channel", "telegram", "--address", "1"),
         ):
             with self.subTest(argv=argv):

@@ -4,7 +4,7 @@ For offline, repeatable tests run:  python -m unittest discover -s tests -t .
 Tests the complete multi-channel industrial pipeline:
 1. Legacy ERP / Tally CSV Sync (watched folder -> /api/v1/ingest/erp-csv)
 2. Shop-Floor Machine PLC Telemetry (/api/v1/ingest/plc-telemetry)
-3. Physical Phone Twilio WhatsApp Webhook (/api/v1/webhooks/whatsapp -> TwiML XML response)
+3. (removed: WhatsApp webhook)
 4. Full LangGraph 4-Agent Cyclic Debate & PuLP Optimization
 5. HITL Execution & Tally XML PO Generation (/api/v1/execute-plan)
 6. Factory Reset (/api/v1/reset)
@@ -63,29 +63,6 @@ def test_step6_e2e():
     assert res_plc.status_code == 200, f"PLC ingestion failed: {res_plc.text}"
     plc_data = res_plc.json()
     print(f"  ✅ Machine LINE-2 updated in Supabase: {plc_data['temp_celsius']}°C, speed {plc_data['speed_pct']}%, status {plc_data['status']}")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # 3. Test Physical Phone Twilio WhatsApp Webhook Trigger
-    # ─────────────────────────────────────────────────────────────────────────
-    print("\n[TEST 3/6] Simulating Phone WhatsApp Webhook (Form-encoded)...")
-    whatsapp_payload = {
-        "Body": "🚨 Urgent: Supply truck stalled on NH48 Vellore floodwater. Casings delayed 48 hrs.",
-        "From": "whatsapp:+919876543210",
-        "To": "whatsapp:+14155238886",
-    }
-    res_wa = client.post(
-        "/api/v1/webhooks/whatsapp",
-        data=whatsapp_payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    assert res_wa.status_code == 200, f"WhatsApp webhook failed: {res_wa.text}"
-    assert "xml" in res_wa.headers.get("content-type", "").lower()
-    assert "<Response>" in res_wa.text
-    assert "<Message>" in res_wa.text
-    print("  ✅ Twilio TwiML XML Response returned successfully:")
-    # Print preview of TwiML message
-    first_lines = res_wa.text.split("\n")[:8]
-    print("     " + "\n     ".join(first_lines))
 
     # ─────────────────────────────────────────────────────────────────────────
     # 4. Verify Factory State & Multi-Agent Audit Logs
