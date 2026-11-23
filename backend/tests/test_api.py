@@ -422,9 +422,14 @@ class ApiTests(unittest.TestCase):
                 "L-B at 40%, 80 units short on WO-77, 5h delay from Vendor V1", factory_id="test-plant")
             run_store.save_run(result)
             pid = result["recommended_plan_id"]
+            # Executed by test-plant's owner: the run's own factory (Round B Task 2 tenancy).
+            r = self.client.post("/api/v1/execute-plan", json={"run_id": result["run_id"], "playbook_id": pid},
+                                 headers={"X-Dev-User": "other@example.test"})
+            self.assertEqual(r.status_code, 200, r.text)
+            # dev-owner is not a member of test-plant: 404, as for an unknown run.
             r = self.client.post("/api/v1/execute-plan",
                                  json={"run_id": result["run_id"], "playbook_id": pid}, headers=KEY)
-            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.status_code, 404, r.text)
             expected = {"SLA_RENEGOTIATION": "EXTENSION_REQUESTED", "NO_ACTION": "RISK_ACCEPTED"}.get(
                 next(p for p in result["playbooks"] if p["id"] == pid)["strategy_type"], "RECOVERY_IN_PROGRESS")
             self.assertEqual(db.get_order("WO-77")["status"], expected)

@@ -91,6 +91,22 @@ class Actor:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                                 detail="Your role in this factory does not allow this action")
 
+    def authorize(self, requested: Optional[str], *roles: str) -> str:
+        """The factory a request names (or the actor's default) with one of `roles` in it:
+        404 for a non-member, 403 for a member without the role. Returns the factory id."""
+        factory_id = self.factory_for(requested)
+        self.require_role(factory_id, *roles)
+        return factory_id
+
+    def authorize_resource(self, factory_id: Optional[str], *roles: str) -> str:
+        """Authorise against the factory that OWNS an existing resource (a run, an outcome, a
+        line...). A resource without a factory, or of a factory the actor is not a member of,
+        is a 404 (fail closed, no existence leak); a member without the role is a 403."""
+        if not factory_id or factory_id not in self.memberships:
+            raise _not_found()
+        self.require_role(factory_id, *roles)
+        return factory_id
+
     @property
     def approver_name(self) -> str:
         """The verified identity recorded as `approved_by` / `entered_by`."""
@@ -223,20 +239,28 @@ def _dev_auth_enabled() -> bool:
     return settings.AUTH_MODE == "dev" and settings.storage_mode == "offline" and not settings.is_production
 
 
-def require(*roles: str, machine: bool = False):
-    """Dependency: a verified actor holding one of `roles` in the factory it acts on.
-
-    The machine actor (X-API-Key) is refused unless `machine=True` (ingest/simulate endpoints)."""
+def actor_kind(machine: bool = False):
+    """Dependency: a verified actor. The machine actor (X-API-Key) is refused unless
+    `machine=True` (automation endpoints). The FACTORY is authorised by each endpoint against the
+    resource it touches (`Actor.authorize` / `Actor.authorize_resource`), never here."""
     def dependency(actor: Actor = Depends(get_actor)) -> Actor:
         if actor.kind == "machine" and not machine:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                                 detail="The API key is for automation endpoints only; sign in")
-        actor.require_role(actor.factory_for(), *roles)
         return actor
     return dependency
 
 
-read_access = require(*ANY_ROLE)
-write_access = require(*WRITE_ROLES)
-machine_write_access = require(*WRITE_ROLES, machine=True)
-owner_access = require(*OWNER_ONLY)
+user_actor = actor_kind()
+machine_actor = actor_kind(machine=True)
+
+
+def require(*roles: str, machine: bool = False):
+    """Dependency for endpoints that touch NO factory resource (health checks, weather): one of
+    `roles` in the actor's own default factory. Anything factory-scoped uses Actor.authorize*."""
+    kind = actor_kind(machine)
+
+    def dependency(actor: Actor = Depends(kind)) -> Actor:
+        actor.authorize(None, *roles)
+        return actor
+    return dependency

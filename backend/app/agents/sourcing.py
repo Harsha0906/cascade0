@@ -303,6 +303,7 @@ def _log(session: SourcingSession, summary: str, message: str, tool: str) -> Non
     session.events.append(message)
     session.log_step += 1
     log_agent_step(
+        factory_id=session.params.get("factory_id") or session.model.factory_id,
         run_id=session.run_id, step_order=session.log_step,
         agent_name="Sourcing Agent", agent_role="Vendor Confirmation", badge_color="violet",
         tool_called=tool, tool_output_summary=summary, message=message,

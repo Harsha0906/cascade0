@@ -146,6 +146,7 @@ def _log(record: Dict[str, Any], summary: str, message: str, tool: str) -> None:
     record.setdefault("events", []).append(message)
     record["log_step"] = int(record.get("log_step", 40)) + 1
     db.log_agent_step(
+        factory_id=record.get("factory_id"),
         run_id=record["root_run_id"], step_order=record["log_step"],
         agent_name="Client Agent", agent_role="Deadline Negotiation", badge_color="amber",
         tool_called=tool, tool_output_summary=summary, message=message,

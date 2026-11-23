@@ -178,6 +178,8 @@ class SimulateCrisisRequest(BaseModel):
         default=None, description="Line id -> speed % (0-100) overrides"
     )
     order_id: Optional[str] = Field(default=None, max_length=32)
+    factory_id: Optional[str] = Field(default=None, max_length=64,
+                                      description="Factory to act on (default: the caller's own)")
 
     @field_validator("override_line_speeds")
     @classmethod
@@ -201,6 +203,14 @@ class ErpCsvSyncRequest(BaseModel):
     """File upload from legacy Tally or Excel drop folder."""
     filename: str = Field(max_length=255)
     csv_content: str = Field(max_length=2_000_000)
+    factory_id: Optional[str] = Field(default=None, max_length=64,
+                                      description="Factory to act on (default: the caller's own)")
+
+
+class ResetRequest(BaseModel):
+    """POST /api/v1/reset body (optional)."""
+    factory_id: Optional[str] = Field(default=None, max_length=64,
+                                      description="Factory to act on (default: the caller's own)")
 
 
 class LiveHighwayCheckRequest(BaseModel):

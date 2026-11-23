@@ -341,6 +341,9 @@ def _seed_inbound_shipments(now: datetime | None = None) -> list[dict[str, Any]]
 
 REQUIRED_MIGRATION_LEVEL = 7
 
+# The only factory with demo seed data (POST /api/v1/reset restores it; other factories -> 409).
+DEMO_FACTORY_ID = "apex-volt-blr2"
+
 # Dev/test identities (offline mirror only, AUTH_MODE=dev). Live memberships live in Supabase
 # `factory_members` and are managed with `python -m app.admin add-member`.
 _SEED_FACTORY_MEMBERS: list[dict[str, Any]] = [
@@ -482,22 +485,59 @@ def fetch_by_id(table_name: str, pk_column: str, pk_value: str) -> dict[str, Any
     return None
 
 
-def fetch_ordered(
-    table_name: str, order_column: str, *, desc: bool = True, limit: int = 1, tiebreak: str | None = None
-) -> list[dict[str, Any]]:
-    """Fetch up to `limit` rows ordered by a column. Offline mode orders the mirror
-    (ties keep insertion order, so the last inserted row is newest)."""
+def fetch_where(table_name: str, match: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rows matching ALL `match` equalities (the tenant filter: {"factory_id": ...})."""
+    if not match:
+        raise ValueError("fetch_where needs at least one column to match")
     client = _get_supabase()
     if client is not None:
         try:
-            query = client.table(table_name).select("*").order(order_column, desc=desc)
+            query = client.table(table_name).select("*")
+            for column, value in match.items():
+                query = query.eq(column, value)
+            return query.execute().data or []
+        except Exception as exc:
+            raise _fail("fetch_where", table_name, exc) from exc
+    return copy.deepcopy([r for r in _mirror.get_table(table_name)
+                          if all(r.get(c) == v for c, v in match.items())])
+
+
+def fetch_in(table_name: str, column: str, values: Sequence[Any]) -> list[dict[str, Any]]:
+    """Rows whose `column` is one of `values` (none for an empty list)."""
+    wanted = list(values)
+    if not wanted:
+        return []
+    client = _get_supabase()
+    if client is not None:
+        try:
+            return client.table(table_name).select("*").in_(column, wanted).execute().data or []
+        except Exception as exc:
+            raise _fail("fetch_in", table_name, exc) from exc
+    return copy.deepcopy([r for r in _mirror.get_table(table_name) if r.get(column) in wanted])
+
+
+def fetch_ordered(
+    table_name: str, order_column: str, *, desc: bool = True, limit: int = 1, tiebreak: str | None = None,
+    match: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch up to `limit` rows (matching ALL `match` equalities) ordered by a column. Offline
+    mode orders the mirror (ties keep insertion order, so the last inserted row is newest)."""
+    match = match or {}
+    client = _get_supabase()
+    if client is not None:
+        try:
+            query = client.table(table_name).select("*")
+            for column, value in match.items():
+                query = query.eq(column, value)
+            query = query.order(order_column, desc=desc)
             if tiebreak:
                 query = query.order(tiebreak, desc=desc)
             response = query.limit(limit).execute()
             return response.data or []
         except Exception as exc:
             raise _fail("fetch_ordered", table_name, exc) from exc
-    rows = sorted(_mirror.get_table(table_name), key=lambda r: r.get(order_column) or "")
+    rows = [r for r in _mirror.get_table(table_name) if all(r.get(c) == v for c, v in match.items())]
+    rows = sorted(rows, key=lambda r: r.get(order_column) or "")
     if desc:
         rows.reverse()
     return copy.deepcopy(rows[:limit])
@@ -806,6 +846,7 @@ def execute_plan_tx(
                 "root_run_id": root_run_id,
                 "run_id": receipt.get("run_id", root_run_id),
                 "playbook_id": receipt.get("playbook_id", ""),
+                "factory_id": po.get("factory_id"),
                 "payload": copy.deepcopy(receipt),
             })
             insert_row("purchase_orders", dict(po))
@@ -1002,12 +1043,15 @@ def get_vendor_history(supplier_id: str) -> dict[str, Any] | None:
     return None
 
 
-def get_delivery_outcomes(status: str | None = None, supplier_id: str | None = None) -> list[dict[str, Any]]:
-    """Delivery outcomes (optionally one status / one supplier), oldest first."""
+def get_delivery_outcomes(status: str | None = None, supplier_id: str | None = None,
+                          factory_id: str | None = None) -> list[dict[str, Any]]:
+    """Delivery outcomes (optionally one status / one supplier / one factory), oldest first."""
     client = _get_supabase()
     if client is not None:
         try:
             query = client.table("delivery_outcomes").select("*")
+            if factory_id is not None:
+                query = query.eq("factory_id", factory_id)
             if status is not None:
                 query = query.eq("status", status)
             if supplier_id is not None:
@@ -1017,7 +1061,8 @@ def get_delivery_outcomes(status: str | None = None, supplier_id: str | None = N
             raise _fail("get_delivery_outcomes", "delivery_outcomes", exc) from exc
     rows = [r for r in _mirror.delivery_outcomes
             if (status is None or r["status"] == status)
-            and (supplier_id is None or r["supplier_id"] == supplier_id)]
+            and (supplier_id is None or r["supplier_id"] == supplier_id)
+            and (factory_id is None or r.get("factory_id") == factory_id)]
     return copy.deepcopy(sorted(rows, key=lambda r: r["id"]))
 
 
@@ -1059,10 +1104,13 @@ def log_agent_step(
     tool_called: str = "",
     tool_output_summary: str = "",
     message: str = "",
+    factory_id: str | None = None,
 ) -> dict[str, Any]:
-    """Insert an agent log entry for realtime streaming to the terminal."""
+    """Insert an agent log entry for realtime streaming to the terminal. `factory_id` scopes the
+    entry to its tenant (GET /api/v1/state shows a factory only its own logs)."""
     row = {
         "run_id": run_id,
+        "factory_id": factory_id,
         "step_order": step_order,
         "agent_name": agent_name,
         "agent_role": agent_role,
@@ -1099,64 +1147,141 @@ def save_purchase_order(po: dict[str, Any]) -> dict[str, Any]:
     return upsert_row("purchase_orders", po)
 
 
-def get_full_state() -> dict[str, Any]:
+def get_full_state(factory_id: str) -> dict[str, Any]:
     """
-    Return the complete factory state snapshot — used by /api/v1/state
-    and by the frontend Zustand store for initial hydration.
+    The snapshot of ONE factory, used by /api/v1/state and by the frontend store for initial
+    hydration. Every table is filtered by the factory: suppliers, lines, orders, events, agent
+    logs and purchase orders by their factory_id column; vendor_history through the factory's
+    supplier ids. A row without a factory_id belongs to no tenant and is never shown.
     """
+    if not factory_id:
+        raise ValueError("get_full_state needs a factory_id")
+    now = datetime.now(timezone.utc)
+    suppliers = fetch_where("suppliers", {"factory_id": factory_id})
     return {
-        "factory_name": default_factory_name(),
-        "suppliers": get_all_suppliers(),
-        "vendor_history": fetch_all("vendor_history"),
-        "production_lines": get_all_production_lines(),
-        "orders": get_all_orders(),
-        "disruption_events": fetch_all("disruption_events"),
-        "agent_logs": fetch_all("agent_logs"),
-        "purchase_orders": fetch_all("purchase_orders"),
+        "factory_name": (get_factory_row(factory_id) or {}).get("name") or factory_id,
+        "suppliers": suppliers,
+        "vendor_history": fetch_in("vendor_history", "supplier_id", [r["id"] for r in suppliers]),
+        "production_lines": fetch_where("production_lines", {"factory_id": factory_id}),
+        "orders": [_live_hours(o, now) for o in fetch_where("orders", {"factory_id": factory_id})],
+        "disruption_events": fetch_where("disruption_events", {"factory_id": factory_id}),
+        "agent_logs": fetch_where("agent_logs", {"factory_id": factory_id}),
+        "purchase_orders": fetch_where("purchase_orders", {"factory_id": factory_id}),
     }
 
 
-def reset_to_seed() -> dict[str, str]:
+# Tables a factory owns through another table rather than a factory_id column.
+_OWNED_VIA: dict[str, tuple[str, str]] = {
+    "vendor_history": ("supplier_id", "supplier"),
+    "order_lines": ("order_id", "order"),
+    "sourcing_sessions": ("run_id", "run"),
+    "sourcing_rfqs": ("run_id", "run"),
+}
+# Not owned by any factory; a factory reset leaves them alone (webhook ids stay recorded so a
+# reset can never re-open another tenant's processed message to a replay).
+_UNSCOPED_TABLES = ("webhook_events", "schema_migrations")
+# Live tables cleared by a factory reset through their factory_id column.
+_FACTORY_DYNAMIC_TABLES = (
+    "purchase_orders", "agent_logs", "disruption_events", "delivery_outcomes",
+    "order_coordination", "execution_receipts", "analysis_runs",
+)
+
+
+def _row_owner(table: str, row: dict[str, Any], owners: dict[str, dict[str, Any]]) -> Any:
+    if table == "factories":
+        return row.get("id")
+    if table in _OWNED_VIA:
+        column, kind = _OWNED_VIA[table]
+        return owners[kind].get(row.get(column))
+    return row.get("factory_id")
+
+
+def _reset_mirror_factory(factory_id: str) -> None:
+    """Offline: the factory's rows go back to the seed; every other factory's rows are kept."""
+    global _mirror
+    old, new = _mirror, InMemoryMirror()
+    owners: dict[str, dict[str, Any]] = {"supplier": {}, "order": {}, "run": {}}
+    for m in (old, new):
+        owners["supplier"].update({r.get("id"): r.get("factory_id") for r in m.suppliers})
+        owners["order"].update({r.get("order_id"): r.get("factory_id") for r in m.orders})
+        owners["run"].update({r.get("run_id"): r.get("factory_id") for r in m.analysis_runs})
+    for table in list(vars(new)):
+        if table in _UNSCOPED_TABLES:
+            setattr(new, table, old.get_table(table))
+            continue
+        seed = [r for r in new.get_table(table) if _row_owner(table, r, owners) == factory_id]
+        others = [r for r in old.get_table(table) if _row_owner(table, r, owners) not in (None, factory_id)]
+        setattr(new, table, seed + others)
+    _mirror = new
+
+
+def _reset_live_factory(client, factory_id: str) -> None:
+    """Live: delete the factory's dynamic rows (by factory_id, sourcing by its run ids), then
+    upsert the demo seed. Other factories' rows are never touched."""
+    run_ids = [r["run_id"] for r in (client.table("analysis_runs").select("run_id")
+                                     .eq("factory_id", factory_id).execute().data or [])]
+    for i in range(0, len(run_ids), 200):
+        chunk = run_ids[i:i + 200]
+        for tbl in ("sourcing_rfqs", "sourcing_sessions"):
+            client.table(tbl).delete().in_("run_id", chunk).execute()
+    for tbl in _FACTORY_DYNAMIC_TABLES:
+        client.table(tbl).delete().eq("factory_id", factory_id).execute()
+
+
+def _upsert_demo_seed(client) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for tbl, seed in (
+        ("factories", _SEED_FACTORIES),
+        ("suppliers", _SEED_SUPPLIERS),
+        ("production_lines", _SEED_PRODUCTION_LINES),
+        ("orders", _seed_orders()),
+        ("scenarios", _SEED_SCENARIOS),
+        ("items", _SEED_ITEMS),
+        ("stock_levels", [{**r, "as_of": now_iso} for r in _SEED_STOCK_LEVELS]),
+        ("order_lines", _SEED_ORDER_LINES),
+        ("inbound_shipments", _seed_inbound_shipments()),
+    ):
+        for row in seed:
+            client.table(tbl).upsert(row).execute()
+
+
+def reset_to_seed(factory_id: str | None = None) -> dict[str, str]:
     """
-    Reset all tables back to the original seed data state.
-    Used by the /api/v1/reset endpoint.
+    Reset to the demo seed data.
+
+    With `factory_id` (POST /api/v1/reset): only that factory, which must be DEMO_FACTORY_ID;
+    every other factory's rows are kept. Without it (tests, local tooling): everything.
     """
+    if factory_id is not None and factory_id != DEMO_FACTORY_ID:
+        raise ValueError(f"no demo seed for factory {factory_id}")
     global _mirror
     client = _get_supabase()
     if client is None:
-        _mirror = InMemoryMirror()
+        if factory_id is None:
+            _mirror = InMemoryMirror()
+        else:
+            _reset_mirror_factory(factory_id)
         return {"success": True, "status": "reset_complete", "factory": default_factory_name()}
 
     try:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        # Clear dynamic tables
-        client.table("purchase_orders").delete().neq("po_number", "___none___").execute()
-        for tbl in ("agent_logs", "disruption_events"):  # SERIAL integer id
-            client.table(tbl).delete().gte("id", 0).execute()
-        try:
-            client.table("sourcing_rfqs").delete().neq("id", "").execute()
-        except Exception as exc:
-            logger.warning("Could not clear sourcing_rfqs: %s", exc)
-        for tbl, pk in _DURABLE_TABLES:
-            client.table(tbl).delete().neq(pk, "___impossible___").execute()
-        client.table("delivery_outcomes").delete().gte("id", 0).execute()  # BIGSERIAL id
-
-        for tbl, seed in (
-            ("factories", _SEED_FACTORIES),
-            ("suppliers", _SEED_SUPPLIERS),
-            ("production_lines", _SEED_PRODUCTION_LINES),
-            ("orders", _seed_orders()),
-            ("scenarios", _SEED_SCENARIOS),
-            ("items", _SEED_ITEMS),
-            ("stock_levels", [{**r, "as_of": now_iso} for r in _SEED_STOCK_LEVELS]),
-            ("order_lines", _SEED_ORDER_LINES),
-            ("inbound_shipments", _seed_inbound_shipments()),
-        ):
-            for row in seed:
-                client.table(tbl).upsert(row).execute()
+        if factory_id is not None:
+            _reset_live_factory(client, factory_id)
+        else:
+            # Clear dynamic tables
+            client.table("purchase_orders").delete().neq("po_number", "___none___").execute()
+            for tbl in ("agent_logs", "disruption_events"):  # SERIAL integer id
+                client.table(tbl).delete().gte("id", 0).execute()
+            try:
+                client.table("sourcing_rfqs").delete().neq("id", "").execute()
+            except Exception as exc:
+                logger.warning("Could not clear sourcing_rfqs: %s", exc)
+            for tbl, pk in _DURABLE_TABLES:
+                client.table(tbl).delete().neq(pk, "___impossible___").execute()
+            client.table("delivery_outcomes").delete().gte("id", 0).execute()  # BIGSERIAL id
+        _upsert_demo_seed(client)
     except Exception as exc:
         raise _fail("reset", "all", exc) from exc
-    logger.info("Supabase tables reset to seed data")
+    logger.info("Supabase tables reset to seed data (%s)", factory_id or "all factories")
     return {"success": True, "status": "reset_complete", "factory": default_factory_name()}
 
 
@@ -1175,7 +1300,7 @@ if __name__ == "__main__":
     print("  CASCADEZERO -- Database Layer Verification")
     print("=" * 70)
 
-    state = get_full_state()
+    state = get_full_state(settings.DEFAULT_FACTORY_ID)
     print(f"\n[FACTORY] {state['factory_name']}")
 
     print(f"\n[SUPPLIERS] ({len(state['suppliers'])} rows):")
