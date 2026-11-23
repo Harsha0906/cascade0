@@ -35,6 +35,30 @@ CREATE TABLE IF NOT EXISTS factory_members (
 CREATE INDEX IF NOT EXISTS idx_factory_members_factory ON factory_members (factory_id);
 
 -- ============================================================================
+-- TABLE 0c: user_channels / link_codes (chat identities, migration 008 Part 3; service-only)
+-- A WhatsApp number / Telegram chat is linked to a user + factory by a one-time code.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS user_channels (
+    channel     TEXT NOT NULL CHECK (channel IN ('whatsapp', 'telegram')),
+    address     TEXT NOT NULL,              -- WhatsApp number (digits) / Telegram chat id
+    user_id     UUID NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
+    factory_id  TEXT NOT NULL REFERENCES factories (id) ON DELETE CASCADE,
+    linked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (channel, address)
+);
+CREATE INDEX IF NOT EXISTS idx_user_channels_user ON user_channels (user_id);
+CREATE INDEX IF NOT EXISTS idx_user_channels_factory ON user_channels (factory_id);
+
+CREATE TABLE IF NOT EXISTS link_codes (
+    code        TEXT PRIMARY KEY,           -- sha256(code), never the code itself
+    user_id     UUID NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
+    factory_id  TEXT NOT NULL REFERENCES factories (id) ON DELETE CASCADE,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    used_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes (expires_at);
+
+-- ============================================================================
 -- TABLE 1: suppliers
 -- Tracks inbound logistics suppliers across tiers and emergency channels
 -- ============================================================================
@@ -327,7 +351,8 @@ ON CONFLICT (factory_id, scenario_id) DO NOTHING;
 -- ROW-LEVEL SECURITY (end state; migrations 001-008 converge to the same)
 -- anon: no policy and no privileges. authenticated: SELECT only, filtered to the factories the
 -- user is a member of (RLS also filters Realtime). No INSERT/UPDATE/DELETE policies: the backend
--- writes with the service role. order_coordination is service-only (RLS on, no policy). The
+-- writes with the service role. order_coordination, user_channels and link_codes are
+-- service-only (RLS on, no policy). The
 -- tables of 002/004 (sourcing_rfqs, analysis_runs, ...) get theirs from those migrations and 008.
 -- ============================================================================
 ALTER TABLE factories ENABLE ROW LEVEL SECURITY;
@@ -346,6 +371,8 @@ ALTER TABLE inbound_shipments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE order_lines ENABLE ROW LEVEL SECURITY;
 ALTER TABLE delivery_outcomes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE order_coordination ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_channels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE link_codes ENABLE ROW LEVEL SECURITY;
 
 -- A signed-in member reads only their own memberships.
 DROP POLICY IF EXISTS factory_members_self_read ON factory_members;
@@ -439,6 +466,8 @@ REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON delivery_outcomes FROM authenticated;
 REVOKE ALL ON factory_members FROM anon;
 REVOKE INSERT, UPDATE, DELETE ON factory_members FROM authenticated;
 REVOKE ALL ON order_coordination FROM anon, authenticated;
+REVOKE ALL ON user_channels FROM anon, authenticated;
+REVOKE ALL ON link_codes FROM anon, authenticated;
 
 -- ============================================================================
 -- SUPABASE REALTIME: Enable postgres_changes on all 7 tables

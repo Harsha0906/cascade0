@@ -128,15 +128,17 @@ class WebhookReleaseTests(unittest.TestCase):
         self.assertEqual(self._post(body).json()["status"], "duplicate")
 
     def test_find_open_rfq_runs_in_threadpool(self):
+        # The shared inbound flow (app/inbound.py) does the vendor lookup off the event loop.
+        from app import inbound
         seen = []
-        real = main.run_in_threadpool
+        real = inbound.run_in_threadpool
 
         async def spy(fn, *a, **k):
             seen.append(getattr(fn, "__name__", ""))
             return await real(fn, *a, **k)
-        with mock.patch.object(main, "run_in_threadpool", spy):
+        with mock.patch.object(inbound, "run_in_threadpool", spy):
             self._post(_meta_text("919800000001", "status", msg_id="wamid.TP"))
-        self.assertIn("find_open_rfq_by_number", seen)
+        self.assertIn("find_open_rfq_by_address", seen)
 
 
 class FixWaveDbTests(unittest.TestCase):

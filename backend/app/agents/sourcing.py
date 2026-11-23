@@ -734,6 +734,15 @@ def find_open_rfq_by_number(number: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def find_open_rfq_by_address(channel: str, address: str) -> Optional[Tuple[str, str]]:
+    """Map an inbound chat sender on `channel` to (run_id, supplier_id) with an open enquiry.
+    Vendors have WhatsApp numbers only today; Telegram vendor addresses arrive with the Telegram
+    sourcing outbound (Round B Task 6), so a Telegram sender never matches yet."""
+    if channel == "whatsapp":
+        return find_open_rfq_by_number(address)
+    return None
+
+
 def view(run_id: str) -> Dict[str, Any]:
     with _lock:
         for attempt in range(_MAX_ATTEMPTS):

@@ -207,6 +207,12 @@ class ErpCsvSyncRequest(BaseModel):
                                       description="Factory to act on (default: the caller's own)")
 
 
+class LinkCodeRequest(BaseModel):
+    """POST /api/v1/channels/link-code body (optional)."""
+    factory_id: Optional[str] = Field(default=None, max_length=64,
+                                      description="Factory the chat will act on (default: the caller's own)")
+
+
 class ResetRequest(BaseModel):
     """POST /api/v1/reset body (optional)."""
     factory_id: Optional[str] = Field(default=None, max_length=64,

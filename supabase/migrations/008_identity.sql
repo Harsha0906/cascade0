@@ -5,6 +5,7 @@
 -- Part 1 (Task 1): factory_members — which Supabase Auth user holds which role in which factory.
 -- Part 2 (Task 3): factory_id on every tenant table and member-only Row-Level Security (anon reads
 --                  nothing; a signed-in member reads only their factories' rows).
+-- Part 3 (Task 5): user_channels and link_codes (chat identities; service-only).
 -- ============================================================================
 
 -- Prerequisite guard: refuse to run unless migration 007 is really applied.
@@ -476,6 +477,37 @@ REVOKE EXECUTE ON FUNCTION execute_plan_tx(JSONB, TEXT, TEXT, JSONB, TEXT[], JSO
 GRANT EXECUTE ON FUNCTION execute_plan_tx(JSONB, TEXT, TEXT, JSONB, TEXT[], JSONB, TEXT, JSONB, JSONB)
     TO service_role;
 
+-- ============================================================================
+-- Part 3 (Task 5): chat identities. A WhatsApp number / Telegram chat is linked to a Supabase
+-- user and one factory with a one-time code (`/link <code>`); approvals from a chat need that
+-- user's owner/approver role in the RUN's factory. Both tables are service-only: RLS on, no
+-- policy at all, no privileges for the browser roles. Codes are stored as SHA-256 hashes.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS user_channels (
+    channel     TEXT NOT NULL CHECK (channel IN ('whatsapp', 'telegram')),
+    address     TEXT NOT NULL,              -- WhatsApp number (digits) / Telegram chat id
+    user_id     UUID NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
+    factory_id  TEXT NOT NULL REFERENCES factories (id) ON DELETE CASCADE,
+    linked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (channel, address)
+);
+CREATE INDEX IF NOT EXISTS idx_user_channels_user ON user_channels (user_id);
+CREATE INDEX IF NOT EXISTS idx_user_channels_factory ON user_channels (factory_id);
+
+CREATE TABLE IF NOT EXISTS link_codes (
+    code        TEXT PRIMARY KEY,           -- sha256(code), never the code itself
+    user_id     UUID NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
+    factory_id  TEXT NOT NULL REFERENCES factories (id) ON DELETE CASCADE,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    used_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes (expires_at);
+
+ALTER TABLE user_channels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE link_codes ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON user_channels FROM anon, authenticated;
+REVOKE ALL ON link_codes FROM anon, authenticated;
+
 -- ----------------------------------------------------------------------------
 -- >>> Later Round B tasks (Task 3 onward) APPEND their parts HERE, above the version insert. <<<
 -- New tables: ENABLE ROW LEVEL SECURITY, give them a factory_id (NOT NULL) and either a
@@ -501,7 +533,7 @@ BEGIN
     SELECT string_agg(c.relname, ', ') INTO bad
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = 'public' AND c.relkind = 'r' AND NOT c.relrowsecurity
-       AND c.relname = ANY (ARRAY['factories', 'factory_members', 'suppliers', 'vendor_history', 'production_lines', 'orders', 'disruption_events', 'agent_logs', 'purchase_orders', 'sourcing_rfqs', 'scenarios', 'items', 'stock_levels', 'inbound_shipments', 'order_lines', 'delivery_outcomes', 'analysis_runs', 'sourcing_sessions', 'execution_receipts', 'webhook_events', 'schema_migrations', 'order_coordination']);
+       AND c.relname = ANY (ARRAY['factories', 'factory_members', 'suppliers', 'vendor_history', 'production_lines', 'orders', 'disruption_events', 'agent_logs', 'purchase_orders', 'sourcing_rfqs', 'scenarios', 'items', 'stock_levels', 'inbound_shipments', 'order_lines', 'delivery_outcomes', 'analysis_runs', 'sourcing_sessions', 'execution_receipts', 'webhook_events', 'schema_migrations', 'order_coordination', 'user_channels', 'link_codes']);
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'RLS check failed: row level security disabled on: %', bad;
     END IF;

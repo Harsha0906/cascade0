@@ -6,6 +6,8 @@ CascadeZero — FastAPI server
   POST /api/v1/simulate-crisis             run the agent graph + solver          [owner/approver, API key]
   GET  /api/v1/webhooks/whatsapp           Meta verification handshake
   POST /api/v1/webhooks/whatsapp           Meta (HMAC-verified) / Twilio webhook
+  POST /api/v1/telegram/webhook            Telegram Bot API updates (secret-token header)
+  POST /api/v1/channels/link-code          one-time code to link a chat to this user [any role]
   POST /api/v1/ingest/plc-telemetry        line telemetry (HTTP JSON, simulated) [owner/approver, API key]
   POST /api/v1/ingest/erp-csv              Tally/Excel CSV order upsert          [owner/approver, API key]
   POST /api/v1/ingest/stock-summary        Tally stock summary CSV               [owner/approver, API key]
@@ -26,7 +28,7 @@ CascadeZero — FastAPI server
   POST /api/v1/reset                       reset demo data                       [owner]
 
 Security model (app/auth.py): every route except `/`, `/healthz` and the signature-checked
-WhatsApp webhook needs a verified actor: a Supabase user (Authorization: Bearer <access token>)
+WhatsApp / secret-checked Telegram webhooks needs a verified actor: a Supabase user (Authorization: Bearer <access token>)
 with a role in the factory (`factory_members`), or, on automation endpoints only, the machine
 key in X-API-Key.
 
@@ -58,7 +60,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import importers, reliability, run_store
+from app import importers, inbound, reliability, run_store
 from app.auth import (
     ANY_ROLE,
     OWNER_ONLY,
@@ -71,6 +73,7 @@ from app.auth import (
 from app.agents import client as client_agent
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
+from app.channels import TelegramChannel, WhatsAppChannel
 from app import db
 from app.config import settings
 from app.factory_model import FactoryDataError, load_factory_model
@@ -90,6 +93,7 @@ from app.schemas import (
     ResetRequest,
     ExecutePlanRequest,
     ExecutionReceiptResponse,
+    LinkCodeRequest,
     LiveHighwayCheckRequest,
     PlcTelemetryRequest,
     SimulateCrisisRequest,
@@ -456,163 +460,36 @@ def _verify_meta_signature(raw_body: bytes, signature_header: Optional[str]) -> 
     return hmac.compare_digest(expected, signature_header.split("=", 1)[1])
 
 
-def _is_approver(number: str) -> bool:
-    if not settings.WA_APPROVER_NUMBERS:
-        # No allowlist configured: approvals over WhatsApp are disabled rather than open to anyone.
-        return False
-    return number.lstrip("+") in settings.WA_APPROVER_NUMBERS
+# The chat flow itself (dedupe, /link, status, vendor replies, alerts, approvals) is shared by
+# every channel: app/inbound.py. These are kept here for the Twilio sandbox and existing callers.
+_status_text = inbound.status_text
+_winner_summary = inbound.winner_summary
 
 
-def _status_text() -> str:
-    state = get_full_state(settings.DEFAULT_FACTORY_ID)
-    lines = [
-        f"• {l.get('name', l['line_id'])}: {l.get('status', '?')} "
-        f"({l.get('speed_pct', '?')}% speed, {l.get('temp_celsius', '?')}°C)"
-        for l in state["production_lines"] if l.get("status") != "NORMAL"
-    ]
-    orders = [
-        f"• Order #{o['order_id']} ({o.get('client', '')}): {o['status']}, "
-        f"SLA penalty exposure ₹{o.get('sla_penalty_inr', 0):,}"
-        for o in state["orders"] if o.get("status") != "ON_TRACK"
-    ]
-    if not lines and not orders:
-        return "🏭 *PLANT STATUS*\nAll lines normal; all orders on track."
-    return "🏭 *PLANT STATUS*\n" + "\n".join(lines + orders)
-
-
-def _winner_summary(result: Dict[str, Any]) -> str:
-    winner = next(p for p in result["playbooks"] if p["id"] == result["recommended_plan_id"])
-    penalty = result.get("blast_radius", {}).get("sla_penalty_inr", 0)
-    mode = result.get("ai_mode", {}).get("overall", "fallback")
-    return (
-        f"🚨 *CASCADEZERO RECOVERY PLAN* ({result['run_id']})\n"
-        f"• Order #{result['order_id']} — ₹{penalty:,} SLA exposure\n"
-        f"• Shortfall: {result['shortfall_units']} {result['factory_model'].stock_item_name} (+{result['delay_hours']}h delay)\n\n"
-        f"⚖️ *Recommended: {winner['id']}* — {winner['name']}\n"
-        f"• Cost: ₹{winner['total_mitigation_cost_inr']:,}\n"
-        f"• Modelled P(on-time): {winner['confidence_pct']}%\n"
-        f"• Expected cost incl. risk: ₹{winner['expected_cost_inr']:,}\n"
-        f"_Numbers from MILP + Monte Carlo; narration mode: {mode}._"
+def _whatsapp_channel() -> WhatsAppChannel:
+    """The WhatsApp adapter. The send helpers are bound late (looked up on this module at call
+    time), so a patched `main.send_whatsapp_text` is what the adapter calls."""
+    return WhatsAppChannel(
+        send_text=lambda to, text: send_whatsapp_text(to, text),
+        send_buttons=lambda to, text, buttons, header=None, footer=None:
+            send_whatsapp_interactive_buttons(to, text, buttons, header, footer),
     )
+
+
+def _telegram_channel() -> TelegramChannel:
+    return TelegramChannel(settings.TELEGRAM_BOT_TOKEN)
 
 
 async def _handle_meta_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        changes = payload["entry"][0]["changes"][0]["value"]
+        payload["entry"][0]["changes"][0]["value"]
     except (KeyError, IndexError, TypeError):
         return {"status": "ignored"}
-    messages = changes.get("messages", [])
+    channel = _whatsapp_channel()
+    messages = channel.parse_inbound(payload)   # delivery/read receipts are logged, yield nothing
     if not messages:
-        # Delivery/read receipts. Log failures so undelivered replies are visible.
-        for st in changes.get("statuses", []):
-            errors = st.get("errors") or []
-            if st.get("status") == "failed" or errors:
-                for e in errors or [{}]:
-                    logger.error("WhatsApp delivery FAILED to %s: code %s %s — %s",
-                                 st.get("recipient_id"), e.get("code"), e.get("title"),
-                                 (e.get("error_data") or {}).get("details", e.get("message", "")))
-            else:
-                logger.info("WhatsApp message %s to %s", st.get("status"), st.get("recipient_id"))
         return {"status": "ok"}
-
-    msg = messages[0]
-    sender = msg.get("from", "")
-
-    # De-duplicate Meta retries/redeliveries. The id is recorded before processing so a replayed
-    # approval or vendor reply can never run twice. If processing then fails unexpectedly (database
-    # error or any other exception) the id is released again and the error re-raised (503/500), so
-    # Meta's retry is processed rather than dropped as a duplicate. Handled outcomes (replies already
-    # sent, including error replies) keep the id recorded.
-    message_id = msg.get("id")
-    if message_id and not await run_in_threadpool(db.record_webhook_event, str(message_id)):
-        logger.info("Duplicate WhatsApp message %s ignored", message_id)
-        return {"status": "duplicate"}
-
-    try:
-        return await _process_meta_message(msg, sender)
-    except Exception:
-        if message_id:
-            try:
-                await run_in_threadpool(db.release_webhook_event, str(message_id))
-            except Exception:
-                logger.exception("Could not release webhook event %s after a processing failure", message_id)
-        raise
-
-
-async def _process_meta_message(msg: Dict[str, Any], sender: str) -> Dict[str, Any]:
-    if msg.get("type") == "interactive":
-        button_id = msg.get("interactive", {}).get("button_reply", {}).get("id", "")
-        if button_id.startswith("APPROVE:"):
-            run_id, _, playbook_id = button_id[len("APPROVE:"):].partition(":")
-            if not _is_approver(sender):
-                logger.warning("Rejected WhatsApp approval from non-allowlisted number %s", sender)
-                await run_in_threadpool(send_whatsapp_text, sender, "⛔ This number is not authorised to approve plans.")
-                return {"status": "forbidden"}
-            try:
-                receipt = await run_in_threadpool(
-                    _execute, ExecutePlanRequest(run_id=run_id, playbook_id=playbook_id), f"whatsapp:{sender}"
-                )
-            except HTTPException as exc:
-                await run_in_threadpool(send_whatsapp_text, sender, f"⚠️ Could not execute: {exc.detail}")
-                return {"status": "error", "detail": exc.detail}
-            await run_in_threadpool(
-                send_whatsapp_text, sender,
-                f"✅ *APPROVED* {receipt.playbook_id} for run {receipt.run_id}\n"
-                f"• Draft PO: {receipt.po_number}\n• Cost: ₹{receipt.total_cost_inr:,}\n"
-                f"• Modelled P(on-time): {receipt.confidence_pct}%\n"
-                f"Drafts generated; send POs/notices through your normal channels.",
-            )
-            return {"status": "success", "action": "plan_executed"}
-        if button_id == "VIEW_STATUS":
-            await run_in_threadpool(send_whatsapp_text, sender, await run_in_threadpool(_status_text))
-            return {"status": "success", "action": "status_sent"}
-        return {"status": "ignored"}
-
-    body_text = msg.get("text", {}).get("body", "").strip()
-    if not body_text:
-        return {"status": "ignored"}
-
-    open_rfq = await run_in_threadpool(sourcing.find_open_rfq_by_number, sender)
-    if open_rfq:
-        run_id, supplier_id = open_rfq
-        try:
-            await run_in_threadpool(sourcing.record_reply, run_id, supplier_id, body_text, f"whatsapp:{sender}")
-        except (FactoryDataError, db.DatabaseError, sourcing.SourcingError) as exc:
-            logger.error("Vendor reply from %s could not be processed: %s", sender, exc)
-            await run_in_threadpool(
-                send_whatsapp_text, sender,
-                "⚠️ We could not process your reply right now. Please contact the plant team directly.",
-            )
-            return {"status": "error", "detail": str(exc), "run_id": run_id}
-        await run_in_threadpool(send_whatsapp_text, sender, "🙏 Thank you — your reply has been recorded. This is not yet a purchase order.")
-        return {"status": "success", "action": "vendor_reply_recorded", "run_id": run_id}
-    if body_text.lower() in ("status", "plant", "check"):
-        await run_in_threadpool(send_whatsapp_text, sender, await run_in_threadpool(_status_text))
-        return {"status": "ok"}
-
-    try:
-        result = await run_in_threadpool(_run_pipeline, body_text, "META_WHATSAPP_CLOUD_API")
-    except (FactoryDataError, db.DatabaseError) as exc:
-        logger.error("WhatsApp pipeline failed, factory data/database unavailable: %s", exc)
-        await run_in_threadpool(send_whatsapp_text, sender, _MISCONFIGURED_REPLY)
-        return {"status": "error", "detail": "Factory data invalid (details in server log)"}
-    except SolverInputError as exc:
-        logger.warning("WhatsApp pipeline rejected inputs: %s", exc)
-        await run_in_threadpool(send_whatsapp_text, sender, f"⚠️ Cannot plan for these inputs: {exc}")
-        return {"status": "error", "detail": str(exc)}
-    winner_id = result["recommended_plan_id"]
-    await run_in_threadpool(
-        send_whatsapp_interactive_buttons,
-        sender,
-        _winner_summary(result),
-        [
-            {"id": f"APPROVE:{result['run_id']}:{winner_id}", "title": f"Approve {winner_id}"},
-            {"id": "VIEW_STATUS", "title": "Plant status"},
-        ],
-        "Disruption detected",
-        "Approval requires an authorised number",
-    )
-    return {"status": "success", "run_id": result["run_id"]}
+    return await inbound.handle(channel, messages[0])
 
 
 @app.get("/api/v1/webhooks/whatsapp")
@@ -680,6 +557,39 @@ def whatsapp_health():
     from app.whatsapp_health import check_whatsapp_health
 
     return check_whatsapp_health()
+
+
+# ─── 3b. Telegram webhook and chat linking ─────────────────────────────────────
+
+@app.post("/api/v1/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Telegram Bot API updates. Telegram echoes the setWebhook `secret_token` in
+    X-Telegram-Bot-Api-Secret-Token; without TELEGRAM_WEBHOOK_SECRET every update is refused."""
+    expected = settings.TELEGRAM_WEBHOOK_SECRET
+    given = request.headers.get("x-telegram-bot-api-secret-token") or ""
+    if not expected or not secrets.compare_digest(given.encode(), expected.encode()):
+        logger.warning("Rejected Telegram webhook with a missing or wrong secret token")
+        raise HTTPException(status_code=401, detail="Invalid secret token")
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    channel = _telegram_channel()
+    # parse_inbound answers a button's callback query (a Bot API call): off the event loop.
+    messages = await run_in_threadpool(channel.parse_inbound, payload)
+    if not messages:
+        return {"status": "ignored"}
+    return await inbound.handle(channel, messages[0])
+
+
+@app.post("/api/v1/channels/link-code")
+def create_channel_link_code(req: Optional[LinkCodeRequest] = None, actor: Actor = Depends(user_actor)):
+    """A one-time code (15 min) that links a WhatsApp/Telegram chat to the signed-in user for one
+    factory: send `/link <code>` to the bot. Any role may link; approvals still need owner/approver."""
+    factory_id = actor.authorize((req or LinkCodeRequest()).factory_id, *ANY_ROLE)
+    if not actor.user_id:
+        raise HTTPException(status_code=403, detail="Linking a chat needs a signed-in user")
+    return inbound.create_link_code(actor.user_id, factory_id)
 
 
 # ─── 4. Telemetry (simulated PLC over HTTP) ──────────────────────────────────

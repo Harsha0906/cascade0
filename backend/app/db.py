@@ -400,6 +400,9 @@ class InMemoryMirror:
         self.execution_receipts: list[dict[str, Any]] = []
         self.webhook_events: list[dict[str, Any]] = []
         self.factory_members: list[dict[str, Any]] = copy.deepcopy(_SEED_FACTORY_MEMBERS)
+        # Chat identities (Round B Task 5): (channel, address) -> user + factory; one-time codes.
+        self.user_channels: list[dict[str, Any]] = []
+        self.link_codes: list[dict[str, Any]] = []
         self.schema_migrations: list[dict[str, Any]] = [
             {"version": v} for v in range(1, REQUIRED_MIGRATION_LEVEL + 1)
         ]
@@ -971,6 +974,91 @@ def get_dev_user(email: str) -> tuple[str, dict[str, str]] | None:
     return rows[0]["user_id"], {r["factory_id"]: r["role"] for r in rows}
 
 
+def get_member(user_id: str, factory_id: str) -> dict[str, Any] | None:
+    """{role, email} of a user's membership in one factory (live `factory_members`, else the
+    mirror), or None when the user is not a member."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            rows = (client.table("factory_members").select("role,email")
+                    .eq("user_id", user_id).eq("factory_id", factory_id).execute().data or [])
+        except Exception as exc:
+            raise _fail("get_member", "factory_members", exc) from exc
+    else:
+        rows = [r for r in _mirror.factory_members
+                if r.get("user_id") == user_id and r.get("factory_id") == factory_id]
+    return {"role": rows[0]["role"], "email": rows[0].get("email")} if rows else None
+
+
+# ─── Chat identities (Round B Task 5): user_channels and one-time link codes ─────────────
+# Both tables are service-only (RLS on, no policy). A chat address is bound to a user + factory
+# by `/link <code>`; codes are stored as their SHA-256 hash, are single-use and expire.
+
+def get_user_channel(channel: str, address: str) -> dict[str, Any] | None:
+    """The {channel, address, user_id, factory_id} link of a chat address, or None."""
+    rows = fetch_where("user_channels", {"channel": channel, "address": address})
+    return rows[0] if rows else None
+
+
+def has_user_channels(channel: str) -> bool:
+    """True when at least one address of `channel` is linked (ends the WhatsApp allowlist fallback)."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            return bool(client.table("user_channels").select("address").eq("channel", channel)
+                        .limit(1).execute().data)
+        except Exception as exc:
+            raise _fail("has_user_channels", "user_channels", exc) from exc
+    return any(r.get("channel") == channel for r in _mirror.user_channels)
+
+
+def link_user_channel(channel: str, address: str, user_id: str, factory_id: str) -> dict[str, Any]:
+    """Bind a chat address to a user + factory (re-linking an address replaces its owner)."""
+    row = {"channel": channel, "address": address, "user_id": user_id, "factory_id": factory_id,
+           "linked_at": datetime.now(timezone.utc).isoformat()}
+    return upsert_row("user_channels", row, key_columns=("channel", "address"))
+
+
+def create_link_code(code_hash: str, user_id: str, factory_id: str, expires_at: str) -> None:
+    insert_row("link_codes", {"code": code_hash, "user_id": user_id, "factory_id": factory_id,
+                              "expires_at": expires_at, "used_at": None})
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def consume_link_code(code_hash: str) -> dict[str, Any] | None:
+    """Atomically mark an unused, unexpired code as used and return its row; None for an unknown,
+    used or expired code. One conditional UPDATE live, so two chats racing on one code cannot both
+    win."""
+    now = datetime.now(timezone.utc)
+    client = _get_supabase()
+    if client is not None:
+        try:
+            rows = (client.table("link_codes").update({"used_at": now.isoformat()})
+                    .eq("code", code_hash).is_("used_at", "null").gt("expires_at", now.isoformat())
+                    .execute().data or [])
+        except Exception as exc:
+            raise _fail("consume", "link_codes", exc) from exc
+        return rows[0] if rows else None
+    with _conditional_lock:
+        for row in _mirror.link_codes:
+            if row.get("code") != code_hash or row.get("used_at") is not None:
+                continue
+            expires = _parse_ts(row.get("expires_at"))
+            if expires is None or expires <= now:
+                return None
+            row["used_at"] = now.isoformat()
+            return copy.deepcopy(row)
+    return None
+
+
 def get_receipt(root_run_id: str) -> dict[str, Any] | None:
     """Stored execution receipt payload for a root run, or None."""
     row = fetch_by_id("execution_receipts", "root_run_id", root_run_id)
@@ -1241,7 +1329,8 @@ _OWNED_VIA: dict[str, tuple[str, str]] = {
 }
 # Not owned by any factory; a factory reset leaves them alone (webhook ids stay recorded so a
 # reset can never re-open another tenant's processed message to a replay).
-_UNSCOPED_TABLES = ("webhook_events", "schema_migrations")
+# Kept as they are by a factory reset: unscoped tables and identity (chat links, link codes).
+_UNSCOPED_TABLES = ("webhook_events", "schema_migrations", "user_channels", "link_codes")
 # Live tables cleared by a factory reset through their factory_id column.
 _FACTORY_DYNAMIC_TABLES = (
     "sourcing_rfqs", "sourcing_sessions",

@@ -1,5 +1,5 @@
 """
-Force the tests to run fully offline: no Supabase, no Gemini, no WhatsApp, no weather API.
+Force the tests to run fully offline: no Supabase, no Gemini, no WhatsApp, no Telegram, no weather API.
 Import this before anything from `app`. Empty env vars win over backend/.env because
 python-dotenv never overrides variables that are already set.
 """
@@ -21,6 +21,9 @@ OFFLINE = {
     "META_APP_SECRET": "test-app-secret",
     "META_WA_VERIFY_TOKEN": "test-verify-token",
     "WA_APPROVER_NUMBERS": "919800000000",
+    # Telegram: never the real bot token from backend/.env; tests use fake transports.
+    "TELEGRAM_BOT_TOKEN": "",
+    "TELEGRAM_WEBHOOK_SECRET": "",
     "META_APP_ID": "",
     "SOURCING_MODE": "simulated",
     "SOURCING_RFQ_TEMPLATE": "",
