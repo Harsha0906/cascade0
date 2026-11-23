@@ -13,7 +13,10 @@ and coordinates the answer with the Sourcing Agent through one durable record pe
     act       → draft the request (DRAFTED), send it only after a named human approves it (SENT),
                 extend the order's due_at, re-plan, and restart sourcing on the new target
 
-Status: DRAFTED → (APPROVED, transient while sending) → SENT → ACCEPTED | REFUSED.
+Status: DRAFTED → (APPROVED, transient while sending) → SENT → (ANSWERING, resumable) →
+ACCEPTED | REFUSED. A failed send returns to DRAFTED; a failed answer step stays ANSWERING
+and is resumed by recording the same answer again.
+Lock order: sourcing → client is allowed; client → sourcing is forbidden (see the answer section).
 One negotiation per root run: once a request exists, a sourcing failure never drafts another.
 
 Human sign-off: nothing reaches the client before `approve_extension(..., approved_by)`.
@@ -267,7 +270,11 @@ def approve_extension(run_id: str, approved_by: str) -> Dict[str, Any]:
         record.update({"status": "APPROVED", "approved_by": approver[:120], "approved_at": _now().isoformat()})
         _save_or_409(record)
 
-        sent = True if mode != "whatsapp" else bool(send_whatsapp_text(number, record["draft_message"]))
+        try:
+            sent = True if mode != "whatsapp" else bool(send_whatsapp_text(number, record["draft_message"]))
+        except Exception as exc:  # noqa: BLE001 - any send error must release the claim
+            logger.warning("Client WhatsApp send raised: %s", exc)
+            sent = False
         if not sent:
             record.update({"status": "DRAFTED", "approved_by": None, "approved_at": None})
             _log(record, "WhatsApp send failed", "⚠ WhatsApp send to the client failed; the request stays a draft.",
@@ -288,28 +295,108 @@ def approve_extension(run_id: str, approved_by: str) -> Dict[str, Any]:
 
 
 # ─── Answer → extend, re-plan, restart sourcing ──────────────────────────────
+#
+# Lock order: sourcing._lock → client._lock is allowed (Sourcing's _finish calls
+# on_sourcing_failed while holding its lock); client._lock → sourcing._lock is FORBIDDEN.
+# record_client_answer therefore takes client._lock only around load/save of the record and
+# calls restart_with_plan with no Client Agent lock held; compare-and-set on `version`
+# guarantees correctness (one claim wins), the lock only serialises in-process access.
+#
+# The answer is resumable: it is first claimed as ANSWERING (answer, target due_at and
+# re-plan deadline stored), then the idempotent steps run (due_at set absolutely, `<root>-C`
+# upserted, sourcing restarted once — marked by `client_answer_ref` in the session params),
+# then the record becomes ACCEPTED/REFUSED with replan_run_id. A failed step leaves
+# ANSWERING; calling again with the SAME answer resumes, a different answer is 409.
+
+
+def _refusal_target(playbooks, expedite_id: Optional[str]):
+    """After a refusal: PLAN_A if feasible, else the cheapest feasible plan that uses the
+    EXPEDITE vendor, else ClientAgentError 409."""
+    if expedite_id is None:
+        raise ClientAgentError("The client refused and this factory has no EXPEDITE vendor to fall back on.", 409)
+    plan_a = next((p for p in playbooks if p.id == "PLAN_A"), None)
+    if plan_a is not None and plan_a.feasible:
+        return plan_a
+    with_expedite = [p for p in playbooks if p.feasible
+                     and any(a.supplier_id == expedite_id for a in p.vendor_allocations)]
+    if not with_expedite:
+        raise ClientAgentError(
+            f"The client refused, and no feasible plan uses the expedite vendor {expedite_id} "
+            f"before the current deadline; re-plan manually.", 409)
+    return min(with_expedite, key=lambda p: p.expected_cost_inr)
+
+
+def _answer_ref(root_id: str, accepted: bool) -> str:
+    return f"{root_id}:{'ACCEPTED' if accepted else 'REFUSED'}"
+
+
+def _replan(root_id: str, root: Dict[str, Any], accepted: bool, hours: float):
+    """Pure: re-plan on the run's stored (risk-adjusted) model with the answered deadline.
+    Returns (result, target playbook, vendor ids to allow again)."""
+    model = root["factory_model"]
+    br = root.get("blast_radius") or {}
+    session = sourcing_store.load(root_id)
+    overrides = {k: dict(v) for k, v in (session.overrides if session else {}).items()}
+    confirmed = set(session.confirmed) if session else set()
+    expedite_id = model.expedite_vendor_id
+    widen: tuple = ()
+    if not accepted and expedite_id is not None:
+        widen = (expedite_id,)   # refusal: the expedite vendor is allowed (asked) again
+        if expedite_id not in confirmed:
+            overrides.pop(expedite_id, None)
+    try:
+        result = generate_playbooks(
+            model=model,
+            shortfall_units=root["shortfall_units"],
+            delay_hours=root["delay_hours"],
+            line_speeds=root["line_speeds"],
+            order_id=root["order_id"],
+            sla_penalty_inr=int(br["sla_penalty_inr"]),
+            partial_penalty_inr=int(br["partial_delay_penalty_inr"]),
+            deadline_hours=hours,
+            client=br["client"],
+            vendor_overrides=overrides,
+            confirmed_vendor_ids=confirmed,
+            renegotiation_acceptance=1.0 if accepted else 0.0,
+        )
+    except SolverInputError as exc:
+        raise ClientAgentError(f"Cannot re-plan: {exc}", 409)
+    except KeyError as exc:
+        raise ClientAgentError(f"Run {root_id} lacks {exc} needed to re-plan; run the analysis again.", 409)
+    winner = next(p for p in result.playbooks if p.recommended)
+    target = winner if accepted else _refusal_target(result.playbooks, expedite_id)
+    return result, target, widen
+
 
 def record_client_answer(run_id: str, accepted: bool, text: str = "",
                          new_deadline_hours: Optional[int] = None,
                          entered_by: str = "operator") -> Dict[str, Any]:
     if not isinstance(accepted, bool):
         raise ClientAgentError("accepted must be true or false.", 422)
+    root_id, root = _root(run_id)
+
+    # Phase 1 (record lock only): check the state; a resumable ANSWERING keeps its stored values.
     with _lock:
-        root_id, root = _root(run_id)
         record = load(root_id)
         if record is None:
             raise ClientAgentError("No extension request has been sent for this run.", 409)
-        if record["status"] in ("ACCEPTED", "REFUSED"):
-            same = (record["status"] == "ACCEPTED") == accepted
+        status = record["status"]
+        stored = record.get("answer") or {}
+        resumable = status == "ANSWERING" or (status in ("ACCEPTED", "REFUSED") and not record.get("replan_run_id"))
+        if status in ("ANSWERING", "ACCEPTED", "REFUSED"):
+            same = bool(stored.get("accepted")) == accepted
+            if not same:
+                raise ClientAgentError(
+                    f"The client's answer is already recorded ({'ACCEPTED' if stored.get('accepted') else 'REFUSED'}); "
+                    "a conflicting answer cannot replace it.", 409)
+            if not resumable:
+                raise ClientAgentError(f"The client's answer is already recorded ({status}); duplicate answer.", 409)
+        elif status != "SENT":
             raise ClientAgentError(
-                f"The client's answer is already recorded ({record['status']})"
-                + ("; duplicate answer." if same else "; a conflicting answer cannot replace it."), 409)
-        if record["status"] != "SENT":
-            raise ClientAgentError(
-                f"The request has not been sent (status {record['status']}); approve it before recording an answer.",
-                409)
+                f"The request has not been sent (status {status}); approve it before recording an answer.", 409)
 
-        now = _now()
+    now = _now()
+    if not resumable:
         order = _order(record["order_id"])
         if accepted:
             if new_deadline_hours is not None:
@@ -328,81 +415,67 @@ def record_client_answer(run_id: str, accepted: bool, text: str = "",
             new_due = None
             hours = deadline_hours(order, now)
         hours = round(hours, 2)
+    else:
+        new_due = parse_timestamp(stored["target_due_at"]) if stored.get("target_due_at") else None
+        hours = float(stored["deadline_hours"])
 
-        # Re-plan on the run's stored (risk-adjusted) model: same shortfall / line speeds, the
-        # answered deadline, the vendors' recorded answers, and the client's actual answer.
-        model = root["factory_model"]
-        br = root.get("blast_radius") or {}
-        session = sourcing_store.load(root_id)
-        overrides = {k: dict(v) for k, v in (session.overrides if session else {}).items()}
-        confirmed = set(session.confirmed) if session else set()
-        expedite_id = model.expedite_vendor_id
-        widen = ()
-        if not accepted and expedite_id is not None:
-            widen = (expedite_id,)   # refusal: the expedite vendor is allowed (asked) again
-            if expedite_id not in confirmed:
-                overrides.pop(expedite_id, None)
-        acceptance = 1.0 if accepted else 0.0
-        try:
-            result = generate_playbooks(
-                model=model,
-                shortfall_units=root["shortfall_units"],
-                delay_hours=root["delay_hours"],
-                line_speeds=root["line_speeds"],
-                order_id=root["order_id"],
-                sla_penalty_inr=int(br["sla_penalty_inr"]),
-                partial_penalty_inr=int(br["partial_delay_penalty_inr"]),
-                deadline_hours=hours,
-                client=br["client"],
-                vendor_overrides=overrides,
-                confirmed_vendor_ids=confirmed,
-                renegotiation_acceptance=acceptance,
-            )
-        except SolverInputError as exc:
-            raise ClientAgentError(f"Cannot re-plan: {exc}", 409)
-        except KeyError as exc:
-            raise ClientAgentError(f"Run {root_id} lacks {exc} needed to re-plan; run the analysis again.", 409)
-        winner = next(p for p in result.playbooks if p.recommended)
-        target = winner
-        if not accepted:
-            target = next((p for p in result.playbooks if p.id == "PLAN_A"), winner)
+    # Pure re-plan (no lock held): solver input problems are reported before anything is claimed.
+    result, target, widen = _replan(root_id, root, accepted, hours)
 
-        # Claim the answer first: a duplicate or conflicting answer is rejected from here on.
-        record["status"] = "ACCEPTED" if accepted else "REFUSED"
-        record["answer"] = {"accepted": accepted, "text": (text or "")[:1000], "entered_by": entered_by[:120],
-                            "new_deadline_hours": new_deadline_hours, "recorded_at": now.isoformat()}
-        _save_or_409(record)
+    if not resumable:
+        # Phase 2: claim the answer (compare-and-set). From here a different answer is 409.
+        with _lock:
+            record["status"] = "ANSWERING"
+            record["answer"] = {
+                "accepted": accepted, "text": (text or "")[:1000], "entered_by": entered_by[:120],
+                "new_deadline_hours": new_deadline_hours, "recorded_at": now.isoformat(),
+                "target_due_at": new_due.isoformat() if new_due else None, "deadline_hours": hours,
+            }
+            _save_or_409(record)
 
-        if accepted:
-            db.update_rows("orders", "order_id", record["order_id"], {
-                "due_at": new_due.isoformat(), "hours_remaining": round(hours, 1),
-                "updated_at": now.isoformat(),
-            })
-        replan_id = f"{root_id}-C"
-        replan = dict(root)
-        replan.update({
-            "run_id": replan_id,
-            "parent_run_id": root_id,
-            "playbooks": [p.model_dump() for p in result.playbooks],
-            "recommended_plan_id": result.recommended_plan_id,
-            "solver_result": result.model_dump(),
-            "blast_radius": {**br, "hours_remaining": hours},
-            "client_answer": record["status"],
+    # Phase 3: idempotent side effects, no Client Agent lock held (sourcing takes its own lock).
+    if new_due is not None:
+        db.update_rows("orders", "order_id", record["order_id"], {
+            "due_at": new_due.isoformat(), "hours_remaining": round((new_due - now).total_seconds() / 3600.0, 1),
+            "updated_at": now.isoformat(),
         })
-        run_store.save_run(replan)
+    br = root.get("blast_radius") or {}
+    replan_id = f"{root_id}-C"
+    replan = dict(root)
+    replan.update({
+        "run_id": replan_id,
+        "parent_run_id": root_id,
+        "playbooks": [p.model_dump() for p in result.playbooks],
+        "recommended_plan_id": result.recommended_plan_id,
+        "solver_result": result.model_dump(),
+        "blast_radius": {**br, "hours_remaining": hours},
+        "client_answer": "ACCEPTED" if accepted else "REFUSED",
+    })
+    run_store.save_run(replan)
 
-        restarted = False
-        if session is not None:
+    ref = _answer_ref(root_id, accepted)
+    session = sourcing_store.load(root_id)
+    restarted = False
+    if session is not None:
+        restarted = True
+        if session.params.get("client_answer_ref") != ref:   # not restarted for this answer yet
             why = (f"Client accepted the extension: deadline now {hours:g}h." if accepted else
                    "Client refused the extension: expedite allowed again.")
             sourcing.restart_with_plan(
                 root_id, target.model_dump(), why,
-                params_update={"deadline_hours": hours, "renegotiation_acceptance": acceptance},
+                params_update={"deadline_hours": hours, "renegotiation_acceptance": 1.0 if accepted else 0.0,
+                               "client_answer_ref": ref},
                 allow_vendor_ids=widen,
             )
-            restarted = True
 
+    # Phase 4: finalise (reload: the version moved if anything else touched the record).
+    final = "ACCEPTED" if accepted else "REFUSED"
+    with _lock:
+        record = load(root_id)
+        if record["status"] == final and record.get("replan_run_id"):
+            return _public(record, run_id)   # a concurrent resume finished first
         record.update({
+            "status": final,
             "new_due_at": new_due.isoformat() if new_due else None,
             "replan_deadline_hours": hours,
             "replan_run_id": replan_id,
@@ -411,7 +484,7 @@ def record_client_answer(run_id: str, accepted: bool, text: str = "",
             "sourcing_restarted": restarted,
         })
         _log(record,
-             f"{record['status']}: re-planned at {hours:g}h → {result.recommended_plan_id}; sourcing target {target.id}",
+             f"{final}: re-planned at {hours:g}h → {result.recommended_plan_id}; sourcing target {target.id}",
              (f"✅ {record['client']} accepted: #{record['order_id']} now due {_fmt(new_due)}. " if accepted else
               f"❌ {record['client']} refused the extension. ")
              + f"Re-planned ({result.recommended_plan_id} recommended); "

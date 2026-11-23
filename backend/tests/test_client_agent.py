@@ -295,6 +295,153 @@ class ClientAgentTests(unittest.TestCase):
         self.api.post("/api/v1/reset", headers=KEY)
         self.assertEqual(db.fetch_all("order_coordination"), [])
 
+    # ── Fix round 1 ──
+    def test_answer_resumes_after_a_failed_side_effect(self):
+        sim = self._simulate(1)
+        run_id = sim["run_id"]
+        self._fail_sourcing(run_id)
+        self.assertEqual(self._approve(run_id).status_code, 200)
+        real = sourcing.restart_with_plan
+        calls = {"n": 0}
+
+        def flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise db.DatabaseError("update", "sourcing_sessions")
+            return real(*a, **k)
+
+        with mock.patch.object(sourcing, "restart_with_plan", flaky):
+            r = self._answer(run_id, True)
+            self.assertEqual(r.status_code, 503, r.text)
+            rec = client_agent.view(run_id)
+            self.assertEqual(rec["status"], "ANSWERING")
+            self.assertTrue(rec["answer"]["accepted"])
+            self.assertEqual(self._answer(run_id, False).status_code, 409)   # different answer
+            r = self._answer(run_id, True)                                     # same answer resumes
+            self.assertEqual(r.status_code, 200, r.text)
+        c = r.json()
+        self.assertEqual(c["status"], "ACCEPTED")
+        self.assertEqual(c["replan_run_id"], f"{run_id}-C")
+        self.assertTrue(c["sourcing_restarted"])
+        self.assertEqual(parse_timestamp(db.get_order("EV-402")["due_at"]), PIN + timedelta(hours=86))
+        s = sourcing.view(run_id)
+        self.assertEqual(s["deadline_hours"], 86.0)                    # restarted on the new deadline
+        self.assertEqual(s["sourced_run_id"], f"{run_id}-S4")          # exactly one restart round
+        self.assertEqual(self._answer(run_id, True).status_code, 409)   # finished: duplicate
+
+    def test_resume_does_not_restart_sourcing_twice(self):
+        sim = self._simulate(1)
+        run_id = sim["run_id"]
+        self._fail_sourcing(run_id)
+        client_agent.approve_extension(run_id, "ops-lead")
+        real_save = client_agent.save
+        state = {"fail": True}
+
+        def save_fails_on_finalize(record):
+            if state["fail"] and record["status"] == "ACCEPTED":
+                state["fail"] = False
+                raise db.DatabaseError("update", "order_coordination")
+            return real_save(record)
+
+        with mock.patch.object(client_agent, "save", save_fails_on_finalize):
+            with self.assertRaises(db.DatabaseError):
+                client_agent.record_client_answer(run_id, True)
+        rounds_before = sourcing_store.load(run_id).round
+        c = client_agent.record_client_answer(run_id, True)
+        self.assertEqual(c["status"], "ACCEPTED")
+        self.assertEqual(sourcing_store.load(run_id).round, rounds_before)   # no second restart
+        self.assertEqual(parse_timestamp(db.get_order("EV-402")["due_at"]), PIN + timedelta(hours=86))
+
+    def test_answer_and_sourcing_reply_concurrently_do_not_deadlock(self):
+        import threading
+        sim_a = self._simulate(1)
+        run_a = sim_a["run_id"]
+        self._fail_sourcing(run_a)
+        client_agent.approve_extension(run_a, "ops-lead")
+        sim_b = self._simulate(1)
+        run_b = sim_b["run_id"]
+        self.api.post("/api/v1/sourcing/start", json={"run_id": run_b}, headers=KEY)
+        self._reply(run_b, "SUP-PNY-02", "NO")
+        self._reply(run_b, "SUP-HSR-03", "NO")
+
+        a_planning, b_in_sourcing = threading.Event(), threading.Event()
+        real_plan, real_apply = client_agent.generate_playbooks, sourcing._apply_reply
+
+        def plan(*a, **k):            # thread A, inside the answer
+            a_planning.set()
+            b_in_sourcing.wait(2)
+            return real_plan(*a, **k)
+
+        def apply(*a, **k):           # thread B, holding the sourcing lock
+            a_planning.wait(2)
+            b_in_sourcing.set()
+            return real_apply(*a, **k)   # finishes uncovered → Client Agent hook
+
+        errors = []
+
+        def run(fn, *args):
+            try:
+                fn(*args)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with mock.patch.object(client_agent, "generate_playbooks", plan), \
+                mock.patch.object(sourcing, "_apply_reply", apply):
+            ta = threading.Thread(target=run, args=(client_agent.record_client_answer, run_a, True), daemon=True)
+            tb = threading.Thread(target=run, args=(sourcing.record_reply, run_b, "SUP-AIR-04", "NO"), daemon=True)
+            ta.start()
+            tb.start()
+            ta.join(10)
+            tb.join(10)
+        self.assertFalse(ta.is_alive() or tb.is_alive(), "deadlock between Client and Sourcing agents")
+        self.assertEqual(errors, [])
+        self.assertEqual(client_agent.view(run_a)["status"], "ACCEPTED")
+        self.assertEqual(client_agent.view(run_b)["status"], "DRAFTED")
+
+    def test_send_exception_reverts_to_draft(self):
+        def boom(*a, **k):
+            raise RuntimeError("socket closed")
+        with mock.patch.object(client_agent, "send_whatsapp_text", boom), \
+                mock.patch.object(settings, "SOURCING_MODE", "whatsapp"):
+            sim = self._simulate(1)
+            db.update_rows("orders", "order_id", "EV-402", {"client_whatsapp_number": "919845011111"})
+            client_agent.draft_extension(sim["run_id"], 24)
+            with self.assertRaises(client_agent.ClientAgentError) as cm:
+                client_agent.approve_extension(sim["run_id"], "ops-lead")
+            self.assertEqual(cm.exception.status_code, 502)
+            self.assertEqual(client_agent.view(sim["run_id"])["status"], "DRAFTED")
+
+    def test_refusal_without_feasible_expedite_plan_is_409(self):
+        import dataclasses
+        sim = self._simulate(1)
+        run_id = sim["run_id"]
+        run = run_store.get_run(run_id)
+        model = run["factory_model"]
+        slow_air = [dataclasses.replace(v, lead_hours=200.0, min_lead_hours=190.0)
+                    if v.supplier_id == "SUP-AIR-04" else v for v in model.vendors]
+        run["factory_model"] = dataclasses.replace(model, vendors=tuple(slow_air))
+        run_store.save_run(run)
+        client_agent.draft_extension(run_id, 24)
+        client_agent.approve_extension(run_id, "ops-lead")
+        r = self._answer(run_id, False)
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("expedite", r.json()["detail"])
+        self.assertEqual(client_agent.view(run_id)["status"], "SENT")   # nothing claimed
+
+    def test_refusal_target_falls_back_to_cheapest_feasible_plan_with_expedite(self):
+        from types import SimpleNamespace as NS
+
+        def plan(pid, feasible, cost, vendors):
+            return NS(id=pid, feasible=feasible, expected_cost_inr=cost,
+                      vendor_allocations=[NS(supplier_id=v) for v in vendors])
+        plans = [plan("PLAN_A", False, 10, ["AIR"]), plan("PLAN_B", True, 50, ["AIR", "PNY"]),
+                 plan("PLAN_C", True, 5, []), plan("PLAN_X", True, 70, ["AIR"])]
+        self.assertEqual(client_agent._refusal_target(plans, "AIR").id, "PLAN_B")
+        plans[0].feasible = True
+        self.assertEqual(client_agent._refusal_target(plans, "AIR").id, "PLAN_A")
+        with self.assertRaises(client_agent.ClientAgentError):
+            client_agent._refusal_target(plans, None)
+
 
 class SolverAnswerTests(unittest.TestCase):
     def test_known_answer_replaces_heuristic(self):
