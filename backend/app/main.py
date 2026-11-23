@@ -62,6 +62,7 @@ from fastapi.responses import JSONResponse
 
 from app import importers, inbound, reliability, run_store, setup_api
 from app.auth import (
+    ChooseFactory,
     ANY_ROLE,
     OWNER_ONLY,
     WRITE_ROLES,
@@ -263,6 +264,11 @@ def _startup_migration_check() -> None:
 @app.get("/api/v1/state")
 def get_state(factory_id: Optional[str] = None, actor: Actor = Depends(user_actor)):
     return get_full_state(actor.authorize(factory_id, *ANY_ROLE))
+
+
+@app.exception_handler(ChooseFactory)
+async def _choose_factory_handler(request, exc):
+    return JSONResponse(status_code=409, content={"detail": exc.detail, "factories": exc.factories})
 
 
 @app.exception_handler(db.DatabaseError)

@@ -64,6 +64,14 @@ def _not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Factory not found")
 
 
+class ChooseFactory(HTTPException):
+    """409 for a multi-factory user who named none: the body lists the choices."""
+
+    def __init__(self, factories: list) -> None:
+        super().__init__(status_code=status.HTTP_409_CONFLICT, detail="choose a factory")
+        self.factories = factories
+
+
 @dataclass(frozen=True)
 class Actor:
     kind: Literal["user", "machine"]
@@ -84,7 +92,16 @@ class Actor:
             return next(iter(self.memberships))
         if settings.DEFAULT_FACTORY_ID in self.memberships:
             return settings.DEFAULT_FACTORY_ID
-        raise _not_found()
+        if not self.memberships:
+            raise _not_found()
+        raise ChooseFactory(self.factory_list())
+
+    def factory_list(self) -> list:
+        out = []
+        for fid, role in self.memberships.items():
+            row = db.get_factory_row(fid) or {}
+            out.append({"factory_id": fid, "name": row.get("name") or fid, "role": role})
+        return sorted(out, key=lambda f: f["factory_id"])
 
     def require_role(self, factory_id: str, *roles: str) -> None:
         if self.memberships.get(factory_id) not in roles:

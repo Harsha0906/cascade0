@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { callApi } from "@/lib/api";
+import { CHOOSE_FACTORY_EVENT, getSelectedFactory, setSelectedFactory } from "@/lib/session";
 import { useFactoryStore } from "@/store/useFactoryStore";
 import { ShellProvider, type ShellInfo } from "./ShellContext";
 import { CrisisSandboxModal } from "./CrisisSandboxModal";
@@ -41,15 +42,49 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const { fetchInitialState, initRealtimeSubscriptions, isReceiptModalOpen, closeReceiptModal, statusMode } = useFactoryStore();
   const [info, setInfo] = useState<ShellInfo | null>(null);
   const [error, setError] = useState("");
+  const [factories, setFactories] = useState<{ factory_id: string; name: string; role: string }[]>([]);
+  const [picking, setPicking] = useState(false);
+
+  useEffect(() => {
+    const open = () => setPicking(true);
+    window.addEventListener(CHOOSE_FACTORY_EVENT, open);
+    return () => window.removeEventListener(CHOOSE_FACTORY_EVENT, open);
+  }, []);
+
+  const choose = (id: string) => {
+    setSelectedFactory(id);
+    window.location.assign("/");
+  };
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
+      const mine = await callApi<{ factories: { factory_id: string; name: string; role: string }[] }>("/api/v1/my/factories");
+      if (cancelled) return;
+      if (mine.ok) {
+        const list = mine.data?.factories ?? [];
+        if (list.length === 0) {
+          router.replace("/setup");
+          return;
+        }
+        setFactories(list);
+        const stored = getSelectedFactory();
+        if (stored && !list.some((f) => f.factory_id === stored)) setSelectedFactory(null);
+        if (list.length === 1) setSelectedFactory(list[0].factory_id);
+        else if (!list.some((f) => f.factory_id === getSelectedFactory())) {
+          setPicking(true);
+          return;
+        }
+      }
       const [s, session] = await Promise.all([
         callApi("/api/v1/factory/settings"),
         supabase ? supabase.auth.getSession() : Promise.resolve(null),
       ]);
       if (cancelled) return;
+      if (s.status === 409) {
+        setPicking(true);
+        return;
+      }
       if (s.status === 404) {
         router.replace("/setup");
         return;
@@ -82,7 +117,25 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     window.location.assign("/login");
   };
 
+  const picker = picking && factories.length > 0 && (
+    <div role="dialog" aria-label="Choose a factory" className="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4">
+      <div className="w-full max-w-sm rounded-2xl bg-paper p-5">
+        <h2 className="font-display text-xl font-extrabold">Which factory?</h2>
+        <ul className="mt-3 space-y-2">
+          {factories.map((f) => (
+            <li key={f.factory_id}>
+              <button onClick={() => choose(f.factory_id)} className="w-full rounded-xl border border-rule px-4 py-3 text-left font-semibold hover:bg-ground">
+                {f.name} <span className="text-sm font-normal text-charcoal-600">({f.role})</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+
   if (!info) {
+    if (picker) return <div className="app-root min-h-screen">{picker}</div>;
     return (
       <div className="app-root min-h-screen grid place-items-center px-4">
         {error ? <div className="max-w-md"><Banner>{error}</Banner></div> : <Loading label="Opening your factory…" />}
@@ -129,7 +182,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="flex min-w-0 flex-1 flex-col pb-20 md:pb-0">
           <header className="flex items-center justify-between gap-3 border-b border-rule bg-paper px-4 py-3 md:px-8">
             <div className="min-w-0">
-              <p className="truncate font-display text-base font-bold">{info.factoryName}</p>
+              {factories.length > 1 ? (
+                <select
+                  aria-label="Switch factory"
+                  value={info.factoryId}
+                  onChange={(e) => choose(e.target.value)}
+                  className="max-w-full truncate rounded-lg border border-rule bg-paper py-1 pl-2 pr-6 font-display text-base font-bold"
+                >
+                  {factories.map((f) => <option key={f.factory_id} value={f.factory_id}>{f.name}</option>)}
+                </select>
+              ) : (
+                <p className="truncate font-display text-base font-bold">{info.factoryName}</p>
+              )}
             </div>
             <div className="flex items-center gap-3 text-sm">
               {info.email && <span className="hidden sm:inline max-w-[220px] truncate text-charcoal-600" title={info.email}>{info.email}</span>}
@@ -145,6 +209,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           {[...NAV, ADVANCED].map((n) => link(n, true))}
         </nav>
       </div>
+      {picker}
       <CrisisSandboxModal />
       <ExecutionModal isOpen={isReceiptModalOpen} onClose={closeReceiptModal} />
     </ShellProvider>

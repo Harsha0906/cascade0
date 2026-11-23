@@ -7,7 +7,7 @@ from tests import _offline_env  # noqa: F401  (must precede app imports)
 from tests._offline_env import DEV_OWNER, DEV_VIEWER, OTHER_OWNER, dev_client
 from tests.test_channels import TelegramHarness, _ChannelCase
 
-from app import db, main
+from app import db, main, setup_api as setup_api_mod
 from app.config import settings
 from app.factory_model import load_factory_model
 
@@ -268,3 +268,63 @@ class InviteTests(_ChannelCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoundSFinalFixTests(SetupCase):
+    def test_multi_factory_409_picker_and_my_factories(self):
+        self.make_factory()          # DEV_VIEWER is now in apex (viewer) + NEW (owner): apex is the default
+        r = self.c.get("/api/v1/my/factories")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual({f["factory_id"]: f["role"] for f in r.json()["factories"]},
+                         {settings.DEFAULT_FACTORY_ID: "viewer", NEW: "owner"})
+        self.assertTrue(all(f["name"] for f in r.json()["factories"]))
+        # two memberships, none the default -> 409 with the list
+        db.delete_rows_where("factory_members", {"user_id": db.get_dev_user(DEV_VIEWER)[0],
+                                                 "factory_id": settings.DEFAULT_FACTORY_ID})
+        r = self.c.get("/api/v1/lines")
+        self.assertEqual(r.status_code, 200)    # single membership again: fine
+        self.other.post("/api/v1/factories", json=dict(FACTORY, name="Second Works"))
+        r = self.other.get("/api/v1/lines")
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(r.json()["detail"], "choose a factory")
+        self.assertEqual({f["factory_id"] for f in r.json()["factories"]}, {"test-plant", "second-works"})
+        self.assertEqual(self.other.get("/api/v1/lines?factory_id=second-works").status_code, 200)
+
+    def test_delete_last_line_or_primary_supplier_is_409(self):
+        self.populate()
+        lines = self.c.get("/api/v1/lines" + Q).json()["lines"]
+        self.assertEqual(self.c.delete(f"/api/v1/lines/{lines[0]['line_id']}").status_code, 200)
+        r = self.c.delete(f"/api/v1/lines/{lines[1]['line_id']}")
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(len(self.c.get("/api/v1/lines" + Q).json()["lines"]), 1)
+        sups = self.c.get("/api/v1/suppliers" + Q).json()["suppliers"]
+        primary = next(s for s in sups if s["sourcing_role"] == "PRIMARY")
+        r = self.c.delete(f"/api/v1/suppliers/{primary['id']}")
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(len(self.c.get("/api/v1/suppliers" + Q).json()["suppliers"]), len(sups))
+
+    def test_order_id_in_other_factory_is_generic_422(self):
+        self.make_factory()
+        r = self.c.post("/api/v1/orders" + Q, json={"order_id": "EV-402", "client": "C", "required_qty": 5,
+                        "hours_remaining": 48, "sla_penalty_inr": 1, "partial_delay_penalty_inr": 1, "priority": 1})
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertIn("order id not available", r.text)
+
+    def test_factory_creation_capped_at_five(self):
+        for i in range(5):
+            r = self.c.post("/api/v1/factories", json=dict(FACTORY, name=f"Cap {i}"))
+            self.assertEqual(r.status_code, 201, r.text)
+        r = self.c.post("/api/v1/factories", json=dict(FACTORY, name="Cap 6"))
+        self.assertEqual(r.status_code, 409, r.text)
+
+    def test_settings_rollback_restores_item_name(self):
+        self.make_factory()
+
+        def flaky(fid):
+            raise setup_api_mod.FactoryDataError("boom")
+        with mock.patch.object(setup_api_mod, "_model_ok", return_value=True), \
+                mock.patch.object(setup_api_mod, "load_factory_model", side_effect=flaky):
+            r = self.c.patch("/api/v1/factory/settings" + Q, json={"stock_item_name": "Gadget"})
+        self.assertEqual(r.status_code, 422, r.text)
+        item = db.fetch_where("items", {"factory_id": NEW, "item_code": "PART"})[0]
+        self.assertEqual(item["name"], "Widget")

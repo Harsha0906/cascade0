@@ -276,6 +276,20 @@ def _guard(factory_id: str, was_ok: bool, undo) -> None:
             raise _422(f"Rejected: the factory data would no longer load: {exc}") from None
 
 
+def _delete_guarded(fid: str, noun: str, delete, restore) -> None:
+    """Run `delete()`; if the factory model then no longer loads (and did before), `restore()`
+    and answer 409 with the reason, leaving everything as it was."""
+    was_ok = _model_ok(fid)
+    delete()
+    try:
+        load_factory_model(fid)
+    except FactoryDataError as exc:
+        if was_ok:
+            restore()
+            raise HTTPException(status_code=409, detail=f"Cannot delete this {noun}: the factory would no "
+                                f"longer work without it ({exc})") from None
+
+
 def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:63].strip("-")
 
@@ -301,11 +315,22 @@ def _settings_view(row: Dict[str, Any], role: Optional[str] = None) -> Dict[str,
 
 # ─── Factory ─────────────────────────────────────────────────────────────────
 
+MAX_FACTORIES_PER_USER = 5
+
+
+@router.get("/my/factories")
+def my_factories(actor: Actor = Depends(user_actor)):
+    return {"factories": actor.factory_list()}
+
+
 @router.post("/factories", status_code=201)
 def create_factory(body: FactoryCreate, actor: Actor = Depends(user_actor)):
     """Any signed-in user may create a factory; they become its owner (no membership needed first)."""
     if not actor.user_id or not actor.email:
         raise HTTPException(status_code=403, detail="Creating a factory needs a signed-in user with an email")
+    owned = [f for f, r in db.get_memberships(actor.user_id).items() if r == "owner"]
+    if len(owned) >= MAX_FACTORIES_PER_USER:
+        raise HTTPException(status_code=409, detail=f"You can own at most {MAX_FACTORIES_PER_USER} factories")
     factory_id = body.id if body.id is not None else _slug(body.name)
     if not _SLUG_RE.match(factory_id or ""):
         raise _422("id: use lowercase letters, digits and '-' (give an id, or a name with letters or digits)")
@@ -350,7 +375,12 @@ def patch_factory_settings(body: FactoryPatch, factory_id: Optional[str] = None,
     if "stock_item_name" in updates:
         db.update_rows_where("items", {"factory_id": fid, "item_code": before.get("stock_item_code")},
                              {"name": updates["stock_item_name"]})
-    _guard(fid, was_ok, lambda: db.update_rows("factories", "id", fid, {k: before.get(k) for k in updates}))
+    def undo():
+        db.update_rows("factories", "id", fid, {k: before.get(k) for k in updates})
+        if "stock_item_name" in updates:
+            db.update_rows_where("items", {"factory_id": fid, "item_code": before.get("stock_item_code")},
+                                 {"name": before.get("stock_item_name")})
+    _guard(fid, was_ok, undo)
     return _settings_view(_factory_row(fid), actor.memberships[fid])
 
 
@@ -442,7 +472,13 @@ def delete_line(line_id: str, actor: Actor = Depends(user_actor)):
     if runs:
         raise HTTPException(status_code=409, detail=f"Line {line_id} is used by an open run "
                             f"({', '.join(runs[:3])}); approve or abandon it first")
-    db.delete_rows_where("production_lines", {"line_id": line_id, "factory_id": row["factory_id"]})
+    fid = row["factory_id"]
+    if len(db.fetch_where("production_lines", {"factory_id": fid})) <= 1:
+        raise HTTPException(status_code=409, detail="Cannot delete the last production line: "
+                            "the factory needs at least one")
+    _delete_guarded(fid, "line",
+                    lambda: db.delete_rows_where("production_lines", {"line_id": line_id, "factory_id": fid}),
+                    lambda: db.upsert_row("production_lines", row, key_columns=("line_id",)))
     return {"deleted": line_id}
 
 
@@ -598,6 +634,8 @@ def _update_supplier(fid: str, current: Dict[str, Any], data: Dict[str, Any]) ->
     def undo():
         db.update_rows_where("suppliers", {"id": current["id"], "factory_id": fid},
                              {k: current.get(k) for k in updates})
+        if old_history is None and ("past_orders" in data or "on_time" in data):
+            db.delete_rows_where("vendor_history", {"supplier_id": current["id"]})
         if old_history is not None:
             db.update_rows_where("vendor_history", {"supplier_id": current["id"]},
                                  {"past_orders_count": old_history.get("past_orders_count"),
@@ -644,8 +682,22 @@ def delete_supplier(supplier_id: str, actor: Actor = Depends(user_actor)):
     fid = row["factory_id"]
     if any(s.get("supplier_id") == supplier_id for s in db.get_inbound_shipments(fid)):
         raise HTTPException(status_code=409, detail="This supplier has open inbound shipments; close them first")
-    db.delete_rows_where("vendor_history", {"supplier_id": supplier_id})
-    db.delete_rows_where("suppliers", {"id": supplier_id, "factory_id": fid})
+    mine = db.fetch_where("suppliers", {"factory_id": fid})
+    if len(mine) <= 1 or (row.get("sourcing_role") == "PRIMARY"
+                          and sum(1 for r in mine if r.get("sourcing_role") == "PRIMARY") <= 1):
+        raise HTTPException(status_code=409, detail="Cannot delete the primary (or only) supplier: "
+                            "the factory needs one to plan around")
+    hist = _history(supplier_id)
+
+    def delete():
+        db.delete_rows_where("vendor_history", {"supplier_id": supplier_id})
+        db.delete_rows_where("suppliers", {"id": supplier_id, "factory_id": fid})
+
+    def restore():
+        db.upsert_row("suppliers", row, key_columns=("id",))
+        if hist is not None:
+            db.upsert_row("vendor_history", hist, key_columns=("supplier_id",))
+    _delete_guarded(fid, "supplier", delete, restore)
     return {"deleted": supplier_id}
 
 
@@ -691,7 +743,10 @@ def create_order(body: OrderIn, factory_id: Optional[str] = None, actor: Actor =
     fid = _factory_of(actor, factory_id, *WRITE_ROLES)
     due = _deadline(body.due_at, body.hours_remaining)
     order_id = body.order_id or f"ORD-{secrets.token_hex(3).upper()}"
-    if db.get_order(order_id) is not None:
+    existing = db.get_order(order_id)
+    if existing is not None:
+        if existing.get("factory_id") != fid:      # no existence leak across factories
+            raise _422("order id not available")
         raise HTTPException(status_code=409, detail=f"Order id {order_id!r} is already used")
     code = _factory_row(fid).get("stock_item_code")
     row = {"order_id": order_id, "factory_id": fid, "client": body.client, "required_qty": body.required_qty,
@@ -701,7 +756,7 @@ def create_order(body: OrderIn, factory_id: Optional[str] = None, actor: Actor =
     try:
         db.upsert_owned("orders", row, ("order_id",))
     except db.OwnershipConflict:
-        raise HTTPException(status_code=409, detail=f"Order id {order_id!r} is already used") from None
+        raise _422("order id not available") from None
     db.upsert_row("order_lines", {"order_id": order_id, "item_code": code, "qty": body.required_qty,
                                   "factory_id": fid}, key_columns=("order_id", "item_code"))
     return _order_view(db.get_order(order_id) or row)

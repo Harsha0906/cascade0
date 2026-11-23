@@ -160,6 +160,11 @@ export default function SetupPage() {
         const { data } = await supabase.auth.getSession();
         if (!data.session) return window.location.assign("/login");
       }
+      const mine = await callApi<{ factories: unknown[] }>("/api/v1/my/factories");
+      if (mine.ok && (mine.data?.factories.length ?? 0) > 0) {
+        router.replace("/");   // already in a factory: never create another here; the shell offers the picker
+        return;
+      }
       const exists = await refreshSettings();
       if (exists) {
         setStep(1);
@@ -169,7 +174,7 @@ export default function SetupPage() {
       setCanDemo(demo.ok && demo.data?.role === "owner");
       setLoading(false);
     })();
-  }, []);
+  }, [router]);
 
   const goto = (n: number) => {
     setStep(n);

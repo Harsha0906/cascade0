@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import { setSelectedFactory } from "@/lib/session";
 import { callApi } from "@/lib/api";
 import {
   RISK_PROFILES,
@@ -222,7 +223,10 @@ export function FactoryForm({ initial, onDone, onCancel, label }: { initial?: an
       production_hours_in_window: parseNum(v.production_hours_in_window),
     };
     if (initial) return callApi("/api/v1/factory/settings", "PATCH", body);
-    return callApi("/api/v1/factories", "POST", { ...body, id: slugify(v.name) || undefined, stock_item_code: v.stock_item_code.trim() });
+    return callApi("/api/v1/factories", "POST", { ...body, id: slugify(v.name) || undefined, stock_item_code: v.stock_item_code.trim() }).then((r) => {
+      if (r.ok && r.data?.id) setSelectedFactory(r.data.id);
+      return r;
+    });
   }, onDone);
   return (
     <form onSubmit={submit} className="space-y-4" noValidate>
