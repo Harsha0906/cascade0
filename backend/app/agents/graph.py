@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -35,6 +37,8 @@ from langgraph.graph import END, StateGraph
 from app.config import settings
 from app.agents.tools import (
     extract_disruption_entities,
+    last_extraction_stats,
+    usage_tokens,
     query_blast_radius_sql,
     run_pulp_milp_and_monte_carlo,
 )
@@ -64,7 +68,77 @@ NARRATION_COOLDOWN_S = 60.0           # after a failure, use templates for this 
 _narration_down_until = 0.0
 
 
+# ─── Narration guard: no number that is not in the computed facts ─────────────
+
+_SCALES = {"l": 1e5, "lakh": 1e5, "lakhs": 1e5, "lac": 1e5, "lacs": 1e5,
+           "cr": 1e7, "crore": 1e7, "crores": 1e7}
+_NUM_TOKEN_RE = re.compile(
+    r"(?<![\w.])(\d[\d,]*(?:\.\d+)?)"                      # 1,80,000 / 1.8 / 94.2
+    r"(?:\s*(?P<scale>lakhs?|lacs?|crores?|Cr|L)(?![A-Za-z]))?"
+    r"(?P<pct>\s*%)?"
+    r"(?:\s*(?P<day>days?)(?![A-Za-z]))?", re.I)
+_LIST_MARKER_RE = re.compile(r"(?m)^\s*\d+[.)]\s+")
+_SMALL_INT_MAX = 10
+
+
+def _numbers_in(text: str) -> list:
+    """(value, tolerance, kind) for every number written in `text`: lakh/crore scaled, with the
+    tolerance of the printed precision. kind is "pct", "day", "small" (a bare integer 1-10) or ""."""
+    out = []
+    for m in _NUM_TOKEN_RE.finditer(_LIST_MARKER_RE.sub("", text or "")):
+        digits = m.group(1).replace(",", "")
+        try:
+            value = float(digits)
+        except ValueError:
+            continue
+        places = len(digits.split(".")[1]) if "." in digits else 0
+        scale = _SCALES.get((m.group("scale") or "").lower(), 1.0)
+        tol = 0.5 * 10 ** -places * scale
+        kind = "pct" if m.group("pct") else "day" if m.group("day") else ""
+        if not kind and scale == 1.0 and places == 0 and 1 <= value <= _SMALL_INT_MAX:
+            kind = "small"
+        out.append((value * scale, tol, kind))
+    return out
+
+
+def _fact_numbers(facts: Any) -> list:
+    """Every number in the facts, flattened (numbers inside strings such as ids and rupee
+    amounts count too)."""
+    out: list = []
+    if isinstance(facts, bool) or facts is None:
+        return out
+    if isinstance(facts, (int, float)):
+        return [float(facts)]
+    if isinstance(facts, str):
+        return [v for v, _, _ in _numbers_in(facts)]
+    if isinstance(facts, dict):
+        for v in facts.values():
+            out += _fact_numbers(v)
+    elif isinstance(facts, (list, tuple, set)):
+        for v in facts:
+            out += _fact_numbers(v)
+    return out
+
+
+def narration_is_grounded(text: str, facts: Dict[str, Any]) -> bool:
+    """True when every number in `text` equals a number in `facts`, allowing rupee formats
+    (1.8L, 1,80,000, 1.8 lakh, 0.18 Cr), rounding at the printed precision, a percentage written
+    against a fraction, and days for hours. A bare integer 1-10 must match a fact exactly."""
+    known = _fact_numbers(facts)
+    for value, tol, kind in _numbers_in(text):
+        candidates = [value] + ([value * 24] if kind == "day" else [])
+        limit = 1e-9 if kind == "small" else tol
+        ok = any(abs(c - t) <= limit
+                 for c in candidates for f in known for t in ([f] + ([f * 100] if kind == "pct" else [])))
+        if not ok:
+            return False
+    return True
+
+
 # ─── LLM narration (optional) ────────────────────────────────────────────────
+
+_call_stats = threading.local()   # the latest narration call of this thread, read once by _trace
+
 
 def _get_genai_client():
     global _genai_client
@@ -84,11 +158,15 @@ def _llm_agent_reason(
 ) -> Tuple[str, str]:
     """
     Ask Gemini to narrate a decision that has already been computed.
-    Returns (text, mode) where mode is "gemini" or "template".
+    Returns (text, mode): "gemini", "template", or "template-guarded" when Gemini wrote a number
+    that is not in the computed facts (the template is used instead). The call's latency and token
+    counts are kept for the next `_trace`.
     """
     global _gemini_failure_logged, _narration_down_until
+    _call_stats.last = None
     if not settings.has_gemini or time.monotonic() < _narration_down_until:
         return fallback_message, "template"
+    started = time.perf_counter()
     try:
         prompt = (
             f"You are {agent_name} ({agent_role}) in a factory crisis-response workflow.\n"
@@ -99,19 +177,37 @@ def _llm_agent_reason(
             f"present in COMPUTED FACTS. Do not invent figures."
         )
         resp = _get_genai_client().models.generate_content(model=settings.GEMINI_MODEL, contents=prompt)
+        _call_stats.last = {"latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                            **usage_tokens(resp)}
         if resp.text and len(resp.text.strip()) > 15:
-            return resp.text.strip(), "gemini"
+            text = resp.text.strip()
+            if not narration_is_grounded(text, context):
+                logger.warning("Gemini narration for %s quoted a number not in the computed facts; "
+                               "using the template", agent_name)
+                return fallback_message, "template-guarded"
+            return text, "gemini"
     except Exception as exc:
         # One slow or failed call should not make every remaining step wait for its own timeout.
         _narration_down_until = time.monotonic() + NARRATION_COOLDOWN_S
+        _call_stats.last = {"latency_ms": round((time.perf_counter() - started) * 1000, 1)}
         if not _gemini_failure_logged:
             logger.warning("Gemini narration unavailable (%s) — using templated narration", exc)
             _gemini_failure_logged = True
     return fallback_message, "template"
 
 
-def _trace(state: Dict[str, Any], node: str, mode: str) -> List[Dict[str, str]]:
-    return list(state.get("llm_trace", [])) + [{"node": node, "mode": mode}]
+def _trace(state: Dict[str, Any], node: str, mode: str,
+           stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Append a trace entry. latency_ms (and token counts when Gemini reported usage) come from the
+    narration call just made by this thread, or from `stats`; a step that made no call has 0 ms."""
+    if stats is None:
+        stats = getattr(_call_stats, "last", None) or {}
+        _call_stats.last = None
+    entry: Dict[str, Any] = {"node": node, "mode": mode, "latency_ms": float(stats.get("latency_ms", 0.0))}
+    for key in ("input_tokens", "output_tokens"):
+        if key in stats:
+            entry[key] = stats[key]
+    return list(state.get("llm_trace", [])) + [entry]
 
 
 # ─── Proposal helpers (numbers come from the solver) ─────────────────────────
@@ -184,7 +280,7 @@ class CascadeGraphState(TypedDict, total=False):
     playbooks: List[Dict[str, Any]]
     recommended_plan_id: str
 
-    llm_trace: List[Dict[str, str]]
+    llm_trace: List[Dict[str, Any]]
 
 
 
@@ -256,7 +352,9 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
     run_id = state["run_id"]
     model = load_factory_model(state.get("factory_id"))   # FactoryDataError propagates (-> 503 in main)
     order_ids = [o["order_id"] for o in get_all_orders() if o.get("factory_id") == model.factory_id]
+    t0 = time.perf_counter()
     extraction, source = extract_disruption_entities(state["raw_message"], model, order_ids)
+    extraction_stats = {**last_extraction_stats(), "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
     # Explicit overrides (scenario presets / sliders) win over extraction, and we say so.
     # None means "not overridden"; an explicit 0 is a real value and must win.
@@ -355,8 +453,9 @@ def detective_node(state: CascadeGraphState) -> Dict[str, Any]:
         tool_called="query_blast_radius_sql()", tool_output_summary=summary, message=msg,
     )
 
-    trace = [{"node": "detective_extraction", "mode": "gemini" if source.startswith("gemini") else "regex-fallback"}]
-    trace.append({"node": "detective", "mode": mode})
+    trace = _trace({}, "detective_extraction", "gemini" if source.startswith("gemini") else "regex-fallback",
+                   stats=extraction_stats)
+    trace = _trace({"llm_trace": trace}, "detective", mode)
     return {
         "factory_id": model.factory_id,
         "factory_model": planning_model,
@@ -626,8 +725,10 @@ def build_cascade_graph():
 cascade_graph = build_cascade_graph()
 
 
-def summarize_ai_mode(trace: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Collapse the per-node trace into what the UI should disclose."""
+def summarize_ai_mode(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collapse the per-node trace into what the UI should disclose. Only "gemini" entries are
+    LLM output: "template", "template-guarded" (Gemini quoted a number not in the facts, so the
+    template was used) and "regex-fallback" are not."""
     modes = {t["mode"] for t in trace}
     llm_modes = {"gemini"}
     if modes and modes <= llm_modes:
@@ -640,6 +741,9 @@ def summarize_ai_mode(trace: List[Dict[str, str]]) -> Dict[str, Any]:
         "overall": overall,
         "model": settings.GEMINI_MODEL if overall != "fallback" else None,
         "trace": trace,
+        "total_latency_ms": round(sum(t.get("latency_ms", 0.0) for t in trace), 1),
+        "input_tokens": sum(t.get("input_tokens", 0) for t in trace),
+        "output_tokens": sum(t.get("output_tokens", 0) for t in trace),
         "note": (
             "All numbers come from the MILP solver and Monte Carlo simulation. "
             + ("Narration and extraction used Gemini." if overall == "llm" else

@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence
 
@@ -433,6 +435,26 @@ def _ground_numbers(extraction: DisruptionExtraction, raw_text: str,
     })
 
 
+_call_stats = threading.local()   # latency/tokens of this thread's latest Gemini extraction call
+
+
+def usage_tokens(resp: Any) -> dict:
+    """input_tokens/output_tokens from a Gemini response's usage_metadata, when it reports them."""
+    um = getattr(resp, "usage_metadata", None)
+    out = {}
+    for key, attr in (("input_tokens", "prompt_token_count"), ("output_tokens", "candidates_token_count")):
+        v = getattr(um, attr, None) if um is not None else None
+        if isinstance(v, int) and not isinstance(v, bool):
+            out[key] = v
+    return out
+
+
+def last_extraction_stats() -> dict:
+    """Latency (ms) and token counts of this thread's latest Gemini extraction call ({} when the
+    regex path ran, or Gemini failed before answering)."""
+    return dict(getattr(_call_stats, "last", None) or {})
+
+
 def extract_disruption_entities(
     raw_text: str, model: FactoryModel, order_ids: Sequence[str]
 ) -> tuple[DisruptionExtraction, str]:
@@ -447,7 +469,9 @@ def extract_disruption_entities(
     if not (raw_text or "").strip():
         return DisruptionExtraction(), "structured-overrides"
 
+    _call_stats.last = {}
     if settings.has_gemini:
+        started = time.perf_counter()
         try:
             from google import genai
 
@@ -463,6 +487,9 @@ def extract_disruption_entities(
                     "response_schema": DisruptionExtraction,
                 },
             )
+            _call_stats.last = {"latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                                **usage_tokens(response)}
+            logger.info("Gemini extraction: %s", _call_stats.last)
             if response.text:
                 data = json.loads(response.text)
                 extraction = _ground_numbers(DisruptionExtraction(**data), raw_text, model)

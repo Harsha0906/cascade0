@@ -37,6 +37,7 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -161,7 +162,7 @@ _DECLINE = re.compile(
     r"\b(no|nope|nahi|nahin|nai|not\s+available|unavailable|cannot|can't|cant|unable|sorry|"
     r"out\s+of\s+stock|regret|not\s+possible|mushkil)\b", re.I)
 _ACCEPT = re.compile(r"\b(yes|yeah|ok|okay|haan|han|ha|ji|confirm(?:ed)?|done|sure|can\s+do|available|possible)\b", re.I)
-_PRICE = re.compile(r"(?:₹|rs\.?|inr|@|rate\s*(?:is|:)?)\s*([\d,]+)", re.I)
+_PRICE = re.compile(r"(?:₹|(?<![a-z])rs\.?|(?<![a-z])inr|@|rate\s*(?:is|:)?)\s*(\d(?:[\d,]*\d)?)", re.I)
 _ETA_H = re.compile(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours|ghante|ghanta)\b", re.I)
 _ETA_D = re.compile(r"(\d+)\s*(?:day|days|din)\b", re.I)
 _UNITS = re.compile(r"(\d[\d,]*)\s*(?:units?|pcs|pieces|nos|casings|qty|piece)\b", re.I)
@@ -218,11 +219,15 @@ def parse_vendor_reply(text: str, rfq: RFQ, item: str = "units") -> Tuple[Vendor
                 "If they refuse, declined = true and available_units = 0. Leave price/eta empty if not "
                 "stated. Do not invent numbers."
             )
+            started = time.perf_counter()
             resp = client.models.generate_content(
                 model=settings.GEMINI_MODEL,
                 contents=prompt,
                 config={"response_mime_type": "application/json", "response_schema": VendorOffer},
             )
+            from app.agents.tools import usage_tokens
+            logger.info("Gemini reply parsing: %s", {
+                "latency_ms": round((time.perf_counter() - started) * 1000, 1), **usage_tokens(resp)})
             if resp.text:
                 return VendorOffer(**json.loads(resp.text)), f"gemini:{settings.GEMINI_MODEL}"
         except Exception as exc:
