@@ -53,7 +53,7 @@ class FactoryModelTests(unittest.TestCase):
         p = m.vendor("SUP-PNY-02")
         self.assertEqual((p.max_units, p.unit_cost, p.lead_hours, p.lead_sigma, p.delay_shock_pct,
                           p.delay_shock_range, p.reliability_pct, p.min_lead_hours),
-                         (200, 600, 4.0, 0.45, 6.0, (1.0, 2.5), 93.3, 2.0))
+                         (200, 600, 4.0, 0.45, 6.0, (1.0, 2.5), 88.2, 2.0))
         self.assertEqual(m.vendor("SUP-AIR-04").flat_cost, 600_000)
         self.assertEqual(m.expedite_vendor_id, "SUP-AIR-04")
         self.assertNotIn("SUP-CHN-01", [v.supplier_id for v in m.vendors])  # PRIMARY excluded
@@ -70,14 +70,14 @@ class FactoryModelTests(unittest.TestCase):
         bad = {**_SEED_SUPPLIERS[1], "max_available_qty": -5,
                "delay_shock_min_hours": 3.0, "delay_shock_max_hours": 1.0,
                "lead_time_hours": 0, "min_lead_hours": 0}
-        history = [{**h, "reliability_score_pct": 120} if h["supplier_id"] == bad["id"] else h
+        history = [{**h, "on_time_deliveries": 99} if h["supplier_id"] == bad["id"] else h
                    for h in fetch_all("vendor_history")]
         with mock.patch("app.factory_model.get_all_suppliers", return_value=[bad]),                 mock.patch("app.factory_model.fetch_all", return_value=history):
             with self.assertRaises(FactoryDataError) as ctx:
                 load_factory_model()
         msg = str(ctx.exception)
         for field in ("max_available_qty", "delay_shock", "lead_time_hours", "min_lead_hours",
-                      "reliability_score_pct"):
+                      "on_time_deliveries"):
             self.assertIn(field, msg)
 
     def test_row_order_does_not_change_the_model(self):

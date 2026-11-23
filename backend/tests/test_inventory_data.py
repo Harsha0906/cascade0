@@ -116,11 +116,11 @@ class StockItemCodeTests(unittest.TestCase):
 
 
 class HealthzLevelTests(unittest.TestCase):
-    def test_required_level_is_six(self):
+    def test_required_level_is_seven(self):
         from app.main import app
         r = TestClient(app).get("/healthz")
-        self.assertEqual(r.json()["required_migration_level"], 6)
-        self.assertEqual(db.REQUIRED_MIGRATION_LEVEL, 6)
+        self.assertEqual(r.json()["required_migration_level"], 7)
+        self.assertEqual(db.REQUIRED_MIGRATION_LEVEL, 7)
 
 
 if __name__ == "__main__":

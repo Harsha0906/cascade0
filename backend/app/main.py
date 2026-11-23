@@ -13,6 +13,8 @@ CascadeZero — FastAPI server
   POST /api/v1/ingest/sales-order-lines    sales order lines CSV                 [API key]
   POST /api/v1/ingest/live-highway-check   weather check (labelled when offline)
   POST /api/v1/execute-plan                execute a server-computed playbook    [API key]
+  POST /api/v1/deliveries                  record a vendor delivery (learns reliability) [API key]
+  GET  /api/v1/deliveries                  delivery outcomes (?status=PENDING|DELIVERED)
   POST /api/v1/sourcing/start              Sourcing Agent: send vendor enquiries [API key]
   GET  /api/v1/sourcing/{run_id}           enquiry status + confirmed plan
   POST /api/v1/sourcing/{run_id}/vendor-reply  record a vendor reply           [API key]
@@ -44,7 +46,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import importers, run_store
+from app import importers, reliability, run_store
 from app.agents import sourcing
 from app.agents.graph import run_cascade_pipeline
 from app import db
@@ -61,6 +63,7 @@ from app.db import (
 )
 from app.meta_whatsapp import send_whatsapp_interactive_buttons, send_whatsapp_text
 from app.schemas import (
+    DeliveryRecordRequest,
     ErpCsvSyncRequest,
     ExecutePlanRequest,
     ExecutionReceiptResponse,
@@ -214,7 +217,8 @@ def get_factory():
         "name": m.name,
         "vendors": [
             {k: getattr(v, k) for k in ("supplier_id", "name", "sourcing_role", "max_units",
-                                        "unit_cost", "flat_cost", "lead_hours", "reliability_pct")}
+                                        "unit_cost", "flat_cost", "lead_hours", "reliability_pct",
+                                        "prior_total", "outcomes_total")}
             for v in m.vendors
         ],
         "lines": [
@@ -884,6 +888,21 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         for a in playbook["vendor_allocations"]
     ]
     overtime_line_ids = [lid for lid, hrs in (playbook.get("overtime_line_hours") or {}).items() if hrs > 0]
+    # One PENDING delivery outcome per vendor allocation, promised at execution time + the vendor's lead time.
+    # Recorded deliveries later move the vendor's learned reliability (POST /api/v1/deliveries).
+    model = run.get("factory_model")
+    lead_by_vendor = {v.supplier_id: v.lead_hours for v in getattr(model, "vendors", ())}
+    outcome_factory = run.get("factory_id") or settings.DEFAULT_FACTORY_ID
+    executed_at = datetime.fromisoformat(now)
+    outcomes = [
+        {
+            "factory_id": outcome_factory, "supplier_id": a["supplier_id"], "po_number": po_number,
+            "units": a["units_allocated"],
+            "promised_at": (executed_at + timedelta(
+                hours=lead_by_vendor.get(a["supplier_id"], a["lead_time_hours"]))).isoformat(),
+        }
+        for a in playbook["vendor_allocations"] if a["units_allocated"] > 0
+    ]
     agent_log = {
         "run_id": req.run_id, "step_order": 10,
         "agent_name": "Human Approver", "agent_role": "HITL Execution", "badge_color": "emerald",
@@ -924,7 +943,7 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
         db.execute_plan_tx(
             po=po_row, order_id=order_id, order_status=new_order_status,
             supplier_updates=supplier_updates, overtime_line_ids=overtime_line_ids,
-            agent_log=agent_log, root_run_id=root_id, receipt=receipt.model_dump(),
+            agent_log=agent_log, root_run_id=root_id, receipt=receipt.model_dump(), outcomes=outcomes,
         )
     except db.AlreadyExecutedError:
         existing = db.get_receipt(root_id)
@@ -938,6 +957,50 @@ def _execute(req: ExecutePlanRequest) -> ExecutionReceiptResponse:
 def execute_plan(req: ExecutePlanRequest):
     logger.info("Executing %s from run %s (approved_by=%s)", req.playbook_id, req.run_id, req.approved_by)
     return _execute(req)
+
+
+# ─── 7b. Delivery outcomes (vendor reliability is learned from these) ────────
+
+@app.post("/api/v1/deliveries", dependencies=[Depends(require_api_key)])
+def record_delivery(req: DeliveryRecordRequest):
+    """Record that a purchase-order line was delivered. Moves the vendor's learned reliability."""
+    matches = [o for o in db.get_delivery_outcomes(supplier_id=req.supplier_id)
+               if o["po_number"] == req.po_number]
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"No delivery outcome for PO {req.po_number} / supplier {req.supplier_id}")
+    outcome = matches[0]
+    if outcome["status"] == "DELIVERED":
+        raise HTTPException(status_code=409, detail="This delivery was already recorded.")
+    if reliability.implausibly_early(outcome["promised_at"], req.delivered_at):
+        raise HTTPException(
+            status_code=422,
+            detail=f"delivered_at is more than {reliability.MAX_EARLY_DAYS} days before the promised time ({outcome['promised_at']}).",
+        )
+    updated = db.update_rows_where(
+        "delivery_outcomes",
+        {"po_number": req.po_number, "supplier_id": req.supplier_id, "status": "PENDING"},
+        {"status": "DELIVERED", "delivered_at": reliability.parse_timestamp(req.delivered_at).isoformat()},
+    )
+    if not updated:  # lost a race with another recording
+        raise HTTPException(status_code=409, detail="This delivery was already recorded.")
+    row = updated[0]
+    try:
+        vendor = next((v for v in load_factory_model().vendors if v.supplier_id == req.supplier_id), None)
+    except FactoryDataError as exc:
+        raise _factory_503(exc)
+    return {
+        "outcome": row,
+        "on_time": reliability.on_time(row["promised_at"], row["delivered_at"]),
+        "reliability_pct": vendor.reliability_pct if vendor else None,
+    }
+
+
+@app.get("/api/v1/deliveries")
+def list_deliveries(status: Optional[str] = None):
+    """Delivery outcomes, newest facts first by id order; filter with ?status=PENDING or DELIVERED."""
+    if status is not None and status not in ("PENDING", "DELIVERED"):
+        raise HTTPException(status_code=422, detail="status must be PENDING or DELIVERED")
+    return {"outcomes": db.get_delivery_outcomes(status=status)}
 
 
 # ─── 8. Sourcing Agent (confirm vendor offers before approval) ───────────────

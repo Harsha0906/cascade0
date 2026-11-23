@@ -197,6 +197,13 @@ class LiveHighwayCheckRequest(BaseModel):
     city: str
 
 
+class DeliveryRecordRequest(BaseModel):
+    """A vendor delivery that actually happened (naive timestamps are taken as UTC)."""
+    po_number: str = Field(min_length=1, max_length=120)
+    supplier_id: str = Field(min_length=1, max_length=120)
+    delivered_at: datetime
+
+
 class ExecutePlanRequest(BaseModel):
     """
     HITL execution approval. The server executes the playbook it computed for `run_id`;

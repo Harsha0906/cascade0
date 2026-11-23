@@ -339,7 +339,7 @@ def _seed_inbound_shipments(now: datetime | None = None) -> list[dict[str, Any]]
     }]
 
 
-REQUIRED_MIGRATION_LEVEL = 6
+REQUIRED_MIGRATION_LEVEL = 7
 
 # Durable-state tables cleared on reset, with their primary-key column.
 _DURABLE_TABLES: tuple[tuple[str, str], ...] = (
@@ -370,6 +370,7 @@ class InMemoryMirror:
         ]
         self.inbound_shipments: list[dict[str, Any]] = _seed_inbound_shipments(now)
         self.order_lines: list[dict[str, Any]] = copy.deepcopy(_SEED_ORDER_LINES)
+        self.delivery_outcomes: list[dict[str, Any]] = []
         self.disruption_events: list[dict[str, Any]] = []
         self.agent_logs: list[dict[str, Any]] = []
         self.purchase_orders: list[dict[str, Any]] = []
@@ -720,6 +721,7 @@ class AlreadyExecutedError(RuntimeError):
 
 _EXECUTION_TABLES = (
     "execution_receipts", "purchase_orders", "orders", "suppliers", "production_lines", "agent_logs",
+    "delivery_outcomes",
 )
 _execute_lock = threading.Lock()
 _RECEIPTS_CONSTRAINT = "execution_receipts_pkey"
@@ -757,8 +759,11 @@ def execute_plan_tx(
     agent_log: dict[str, Any],
     root_run_id: str,
     receipt: dict[str, Any],
+    outcomes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Execute an approved plan atomically; a repeated root_run_id raises AlreadyExecutedError."""
+    """Execute an approved plan atomically; a repeated root_run_id raises AlreadyExecutedError.
+    `outcomes` are the PENDING delivery_outcomes rows written in the same transaction."""
+    outcomes = outcomes or []
     client = _get_supabase()
     if client is not None:
         return _execute_plan_tx_live({
@@ -770,6 +775,7 @@ def execute_plan_tx(
             "p_agent_log": agent_log,
             "p_root_run_id": root_run_id,
             "p_receipt": receipt,
+            "p_outcomes": outcomes,
         }, root_run_id)
 
     # Offline: all-or-nothing on the mirror, same write order as the SQL function.
@@ -801,11 +807,26 @@ def execute_plan_tx(
             entries = agent_log if isinstance(agent_log, list) else [agent_log] if agent_log else []
             for entry in entries:
                 insert_row("agent_logs", {"created_at": now, **entry})
+            for o in outcomes:
+                _insert_pending_outcome(o, now)
         except BaseException:
             for t, rows in snapshot.items():
                 setattr(mirror, t, rows)
             raise
     return receipt
+
+
+def _insert_pending_outcome(o: dict[str, Any], now: str) -> None:
+    """Offline twin of step 7 of execute_plan_tx; raises like the table's UNIQUE (po_number, supplier_id)."""
+    table = _mirror.delivery_outcomes
+    if any(r["po_number"] == o["po_number"] and r["supplier_id"] == o["supplier_id"] for r in table):
+        raise DatabaseError("insert", "delivery_outcomes")
+    table.append({
+        "id": max((r["id"] for r in table), default=0) + 1,
+        "factory_id": o["factory_id"], "supplier_id": o["supplier_id"], "po_number": o["po_number"],
+        "units": int(o["units"]), "promised_at": o["promised_at"], "delivered_at": None,
+        "status": "PENDING", "recorded_at": now,
+    })
 
 
 def get_receipt(root_run_id: str) -> dict[str, Any] | None:
@@ -942,6 +963,25 @@ def get_vendor_history(supplier_id: str) -> dict[str, Any] | None:
     return None
 
 
+def get_delivery_outcomes(status: str | None = None, supplier_id: str | None = None) -> list[dict[str, Any]]:
+    """Delivery outcomes (optionally one status / one supplier), oldest first."""
+    client = _get_supabase()
+    if client is not None:
+        try:
+            query = client.table("delivery_outcomes").select("*")
+            if status is not None:
+                query = query.eq("status", status)
+            if supplier_id is not None:
+                query = query.eq("supplier_id", supplier_id)
+            return query.order("id").execute().data or []
+        except Exception as exc:
+            raise _fail("get_delivery_outcomes", "delivery_outcomes", exc) from exc
+    rows = [r for r in _mirror.delivery_outcomes
+            if (status is None or r["status"] == status)
+            and (supplier_id is None or r["supplier_id"] == supplier_id)]
+    return copy.deepcopy(sorted(rows, key=lambda r: r["id"]))
+
+
 def get_all_production_lines() -> list[dict[str, Any]]:
     """Fetch all production lines."""
     return fetch_all("production_lines")
@@ -1060,6 +1100,7 @@ def reset_to_seed() -> dict[str, str]:
             logger.warning("Could not clear sourcing_rfqs: %s", exc)
         for tbl, pk in _DURABLE_TABLES:
             client.table(tbl).delete().neq(pk, "___impossible___").execute()
+        client.table("delivery_outcomes").delete().gte("id", 0).execute()  # BIGSERIAL id
 
         for tbl, seed in (
             ("factories", _SEED_FACTORIES),

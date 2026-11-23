@@ -1,7 +1,7 @@
 -- ============================================================================
 -- CASCADEZERO — Complete PostgreSQL Schema, Realtime Setup & Seed Data
 -- Target: Supabase Cloud PostgreSQL (ap-south-1)
--- Fresh install: run this file, then migrations 001, 002, 003, 004, 005, 006 in order.
+-- Fresh install: run this file, then migrations 001, 002, 003, 004, 005, 006, 007 in order.
 -- Factory: Apex Volt EV Battery Plant (Bengaluru Unit-2)
 -- ============================================================================
 
@@ -192,6 +192,23 @@ CREATE POLICY inbound_shipments_read ON inbound_shipments FOR SELECT TO anon, au
 ALTER TABLE order_lines ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS order_lines_read ON order_lines;
 CREATE POLICY order_lines_read ON order_lines FOR SELECT TO anon, authenticated USING (true);
+
+-- Recorded vendor deliveries (Round A): reliability is learned from DELIVERED rows.
+CREATE TABLE IF NOT EXISTS delivery_outcomes (
+    id            BIGSERIAL PRIMARY KEY,
+    factory_id    TEXT NOT NULL,
+    supplier_id   TEXT NOT NULL,
+    po_number     TEXT NOT NULL,
+    units         INT NOT NULL CHECK (units > 0),
+    promised_at   TIMESTAMPTZ NOT NULL,
+    delivered_at  TIMESTAMPTZ,
+    status        TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'DELIVERED')),
+    recorded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (po_number, supplier_id)
+);
+ALTER TABLE delivery_outcomes ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS delivery_outcomes_read ON delivery_outcomes;
+CREATE POLICY delivery_outcomes_read ON delivery_outcomes FOR SELECT TO anon, authenticated USING (true);
 
 -- ============================================================================
 -- TABLE 6: agent_logs (Realtime streamed to Agent Debate Terminal)
