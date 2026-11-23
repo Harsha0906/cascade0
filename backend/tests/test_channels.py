@@ -269,6 +269,21 @@ class SharedFlowTests(_ChannelCase):
                 self.assertEqual(h.sent()[-1]["to"], h.sender)
                 self.assertIn("/link", h.sent()[-1]["text"])
 
+    def test_linked_chat_cannot_approve_another_factory_even_if_user_owns_it(self):
+        for h in self.channels():
+            with self.subTest(channel=h.name), self.active(h):
+                # DEV_OWNER owns Apex; also make them owner of test-plant, but link the chat for Apex.
+                self.link(h, DEV_OWNER, h.sender)
+                owner_id = "00000000-0000-4000-8000-000000000001"
+                db.upsert_row("factory_members", {"user_id": owner_id, "factory_id": TP, "role": "owner",
+                                                  "email": "dev-owner@example.test"},
+                              key_columns=("user_id", "factory_id"))
+                sim = self.tp_run()
+                with mock.patch.object(main, "_execute") as execute:
+                    r = h.button(self.webhook, h.sender, f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}")
+                execute.assert_not_called()
+                self.assertEqual(r.json()["status"], "forbidden")
+
     def test_unlinked_alert_is_not_planned(self):
         for h in self.channels():
             with self.subTest(channel=h.name), self.active(h):
@@ -497,8 +512,16 @@ class WhatsAppFallbackTests(_ChannelCase):
         r = self.h.button(self.webhook, "919800000000", f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}")
         self.assertEqual(r.json().get("action"), "plan_executed")
 
+    def test_non_allowlisted_number_gets_no_status_or_alert(self):
+        with mock.patch.object(main, "_run_pipeline") as pipeline:
+            for text in (ALERT, "status"):
+                r = self.h.text(self.webhook, "919000000001", text)
+                self.assertEqual(r.json()["status"], "unlinked")
+                self.assertIn("/link", self.h.sent()[-1]["text"])
+        pipeline.assert_not_called()
+
     def test_fallback_alerts_run_for_the_default_factory(self):
-        r = self.h.text(self.webhook, "919000000001", ALERT)
+        r = self.h.text(self.webhook, "919800000000", ALERT)
         self.assertEqual(run_store.get_run(r.json()["run_id"])["factory_id"], main.settings.DEFAULT_FACTORY_ID)
 
 

@@ -21,9 +21,11 @@ user's role comes from `factory_members` on every message, so a removed membersh
 at once. An unlinked sender is told how to `/link`.
 
 WhatsApp fallback (documented, transitional): while `user_channels` has NO WhatsApp rows, the
-legacy behaviour stays: any WhatsApp sender may send alerts and status for DEFAULT_FACTORY_ID,
-and numbers in WA_APPROVER_NUMBERS may approve DEFAULT_FACTORY_ID runs only (approved_by
-"whatsapp:<number>"). Linking the first WhatsApp chat switches WhatsApp to linked-only.
+only numbers in WA_APPROVER_NUMBERS get an identity (alerts, status and approval for
+DEFAULT_FACTORY_ID runs only; approved_by "whatsapp:<number>"). Every other unlinked sender gets
+the /link reply (vendor replies are matched before identity and still work). Linking the first
+WhatsApp chat switches WhatsApp to linked-only. A linked chat's actor carries only the linked
+factory's membership.
 """
 
 from __future__ import annotations
@@ -154,13 +156,17 @@ def identify(channel: Channel, sender: str) -> Optional[Identity]:
             logger.warning("%s chat %s is linked to a user without a membership in %s",
                            channel.name, address, link["factory_id"])
             return None
-        actor = Actor("user", link["user_id"], member["email"], db.get_memberships(link["user_id"]))
+        # The chat is scoped to its linked factory: the actor carries ONLY that membership, so a
+        # chat linked for factory A can never act on factory B even if the user also belongs to B.
+        actor = Actor("user", link["user_id"], member["email"], {link["factory_id"]: member["role"]})
         return Identity(actor, link["factory_id"], f"{channel.name}:{member['email']}",
                         member["role"] in WRITE_ROLES, True)
     if channel.name == "whatsapp" and not db.has_user_channels("whatsapp"):
+        if not _is_allowlisted(address):
+            return None   # unlinked and not an approver: no status, no alerts, only /link
         default = settings.DEFAULT_FACTORY_ID
-        roles = {default: "approver"} if _is_allowlisted(address) else {}
-        return Identity(Actor("user", None, None, roles), default, f"whatsapp:{address}", True, False)
+        return Identity(Actor("user", None, None, {default: "approver"}), default,
+                        f"whatsapp:{address}", True, False)
     return None
 
 
