@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 @import '@xyflow/react/dist/style.css';
 
 @tailwind base;
@@ -134,4 +134,40 @@ body {
   to {
     stroke-dashoffset: 0;
   }
+}
+
+/* ─── Simple dashboard shell ─────────────────────────────────────────────── */
+
+.app-root {
+  font-family: 'Figtree', var(--font-inter);
+  background: #EDF0EB;
+  color: #152017;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The Twin canvas and agent stream keep their original sage surface. */
+.advanced-surface {
+  background: linear-gradient(145deg, #9db0a1 0%, #899c8d 45%, #7a8e7e 100%);
+  border-radius: 20px;
+}
+
+:focus-visible {
+  outline: 2px solid #1f3a2b;
+  outline-offset: 2px;
+}
+
+@keyframes drawer-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+.drawer-panel { animation: drawer-in 0.18s ease-out; }
+
+@keyframes status-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.status-dot { animation: status-breathe 2.4s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .drawer-panel, .status-dot { animation: none; }
 }

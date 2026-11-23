@@ -3,9 +3,8 @@ import "./globals.css";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 export const metadata: Metadata = {
-  title: "CascadeZero — AI Crisis Control Tower & 2.5D Digital Twin",
-  description:
-    "Multi-Agent AI Copilot & 2.5D Digital Twin for Compound-Risk Orchestration in Manufacturing",
+  title: "CascadeZero — recover from factory disruptions",
+  description: "Spot orders at risk, compare recovery plans and ask your suppliers, in one calm place.",
 };
 
 export default function RootLayout({

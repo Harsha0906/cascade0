@@ -44,6 +44,10 @@ module.exports = {
           hover: "#ee3848",
           glow: "rgba(255, 71, 87, 0.45)",
         },
+        ground: "#EDF0EB",
+        paper: "#FAFBF8",
+        rule: "#D9DFD6",
+        alert: { DEFAULT: "#B42318", deep: "#8A1A12", soft: "#FBE9E7" },
         forest: {
           DEFAULT: "#1f3a2b",
           light: "#2b4e3a",
@@ -51,6 +55,7 @@ module.exports = {
         },
       },
       fontFamily: {
+        display: ["Figtree", "Inter", "-apple-system", "sans-serif"],
         sans: ["Inter", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "sans-serif"],
         mono: ["'JetBrains Mono'", "SFMono-Regular", "Menlo", "Monaco", "Consolas", "monospace"],
       },

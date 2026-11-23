@@ -54,7 +54,7 @@ function ReplyBox({ rfq }: { rfq: Rfq }) {
             type="button"
             disabled={isSourcingBusy}
             onClick={() => submitVendorReply(rfq.supplier_id, q.text)}
-            className="text-[10px] font-mono font-bold px-2 py-1 rounded-full bg-white border border-charcoal-900/15 hover:bg-charcoal-900/5 disabled:opacity-50"
+            className="text-[10px] font-bold px-2 py-1 rounded-full bg-white border border-charcoal-900/15 hover:bg-charcoal-900/5 disabled:opacity-50"
             title={q.text}
           >
             {q.label}
@@ -74,7 +74,7 @@ function ReplyBox({ rfq }: { rfq: Rfq }) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder='Vendor reply, e.g. "haan 120 pcs @650, 5 ghante"'
-          className="flex-1 min-w-0 text-[11px] font-mono px-2.5 py-1.5 rounded-xl bg-white border border-charcoal-900/15"
+          className="flex-1 min-w-0 text-[11px] px-2.5 py-1.5 rounded-xl bg-white border border-charcoal-900/15"
         />
         <button
           type="submit"
@@ -108,17 +108,17 @@ export function SourcingPanel() {
     return (
       <div className="p-3 rounded-2xl bg-violet-50 border border-violet-200 space-y-2">
         <p className="text-[11px] text-violet-950 leading-relaxed">
-          <strong>Sourcing Agent:</strong> sends enquiries (not orders) to the suppliers in {selectedPlan.id}, reads
+          Sends a question (not an order) to the suppliers in {selectedPlan.id}, reads
           their replies and re-plans if someone can&apos;t deliver.
         </p>
         <button
           type="button"
           onClick={startSourcing}
           disabled={isSourcingBusy}
-          className="w-full py-2.5 rounded-xl bg-violet-700 hover:bg-violet-800 text-white font-mono font-bold text-[11px] flex items-center justify-center gap-2 disabled:opacity-50"
+          className="w-full py-2.5 rounded-xl bg-violet-700 hover:bg-violet-800 text-white font-bold text-[11px] flex items-center justify-center gap-2 disabled:opacity-50"
         >
           {isSourcingBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Handshake className="w-3.5 h-3.5" />}
-          Confirm with suppliers first
+          Ask suppliers first
         </button>
       </div>
     );
@@ -129,9 +129,9 @@ export function SourcingPanel() {
 
   return (
     <div className="p-3 rounded-2xl bg-violet-50 border border-violet-200 space-y-2" aria-live="polite">
-      <div className="flex items-center justify-between text-[10px] font-mono font-bold text-violet-950">
+      <div className="flex items-center justify-between text-[10px] font-bold text-violet-950">
         <span className="flex items-center gap-1.5">
-          <Handshake className="w-3.5 h-3.5" /> SOURCING AGENT · ROUND {sourcing.round}/{sourcing.max_rounds}
+          <Handshake className="w-3.5 h-3.5" /> ASKING SUPPLIERS · ROUND {sourcing.round}/{sourcing.max_rounds}
         </span>
         <span className="uppercase">{sourcing.status.replace(/_/g, " ")}</span>
       </div>
@@ -140,7 +140,7 @@ export function SourcingPanel() {
         <p className="text-[10px] text-violet-900">
           {sourcing.mode === "whatsapp"
             ? `Waiting for WhatsApp replies (timeout ${sourcing.reply_timeout_min} min). Replies received by phone can be entered below.`
-            : "Simulated channel: type each vendor's reply (or use a quick reply)."}
+            : "Nothing is sent in this mode: type each supplier's reply (or use a quick reply)."}
         </p>
       )}
 
@@ -150,13 +150,13 @@ export function SourcingPanel() {
             <div className="flex items-center justify-between gap-2">
               <span className="text-[11px] font-bold text-charcoal-900">
                 {shortName(rfq.supplier_name)}{" "}
-                <span className="font-mono font-normal text-charcoal-500">R{rfq.round}</span>
+                <span className="font-normal text-charcoal-500">R{rfq.round}</span>
               </span>
-              <span className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded-full border ${STATUS_STYLE[rfq.status]}`}>
+              <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full border ${STATUS_STYLE[rfq.status]}`}>
                 {STATUS_LABEL[rfq.status]}
               </span>
             </div>
-            <p className="text-[10px] font-mono text-charcoal-600 mt-0.5">
+            <p className="text-[10px] text-charcoal-600 mt-0.5">
               Asked {rfq.units_requested}u within {rfq.needed_within_hours}h
               {rfq.offered_units != null && rfq.status !== "DECLINED" &&
                 ` → offered ${rfq.offered_units}u @ ₹${(rfq.offered_unit_price_inr ?? 0).toLocaleString("en-IN")} in ${rfq.offered_eta_hours}h`}
@@ -180,7 +180,7 @@ export function SourcingPanel() {
           }`}
         >
           <strong>{sourcing.status === "COMPLETE_UNCONFIRMED" ? "⚠ Partly unconfirmed plan:" : "✅ Confirmed plan:"}</strong>{" "}
-          {winner.id} — {winner.description} (₹{winner.total_mitigation_cost_inr.toLocaleString("en-IN")}, P(on-time){" "}
+          {winner.id} — {winner.description} (₹{winner.total_mitigation_cost_inr.toLocaleString("en-IN")}, on-time chance{" "}
           {winner.confidence_pct}%). Approve below.
         </div>
       )}
