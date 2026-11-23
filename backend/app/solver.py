@@ -407,7 +407,7 @@ def _overtime_cost(model: FactoryModel, overtime_line_hours: Mapping[str, int]) 
 
 def build_shift_broadcast_msg(model: FactoryModel, overtime_line_hours: Dict[str, int], units_target: int,
                               order_id: str, client: str) -> str:
-    """WhatsApp dispatch text for floor supervisors (draft; sending is a separate step)."""
+    """Telegram dispatch text for floor supervisors (draft; sending is a separate step)."""
     hours = {lid: n for lid, n in (overtime_line_hours or {}).items() if n > 0}
     if not hours:
         return (

@@ -148,59 +148,30 @@ class TokenExpiryCacheTests(unittest.TestCase):
         self.assertEqual(self._run(token, [0, 0]), 2)
 
 
-class UnsignedWebhookTests(unittest.TestCase):
-    """Unsigned Meta payloads and the Twilio sandbox work only with offline storage."""
+class RemovedWhatsAppTests(unittest.TestCase):
+    """WhatsApp is gone: its routes do not exist and stale settings are ignored, not fatal."""
 
-    def setUp(self):
-        db.reset_to_seed()
-        self.anon = TestClient(main.app)
-        self.sent = []
-        self._p = [mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: self.sent.append(a) or True)]
-        for p in self._p:
-            p.start()
+    def test_whatsapp_routes_are_gone(self):
+        anon = TestClient(main.app)
+        for method, path in (("get", "/api/v1/webhooks/whatsapp"), ("post", "/api/v1/webhooks/whatsapp"),
+                             ("get", "/api/v1/whatsapp/health")):
+            with self.subTest(path=path, method=method):
+                self.assertIn(getattr(anon, method)(path).status_code, (404, 405))
 
-    def tearDown(self):
-        for p in self._p:
-            p.stop()
-        db.reset_to_seed()
-
-    def _status_payload(self):
-        return json.dumps({"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {
-            "messages": [{"from": "919800000000", "id": "wamid.unsigned-1", "type": "interactive",
-                          "interactive": {"button_reply": {"id": "VIEW_STATUS"}}}]}}]}]}).encode()
-
-    def test_unsigned_meta_accepted_offline_without_secret(self):
-        with mock.patch.object(main.settings, "META_APP_SECRET", ""):
-            r = self.anon.post("/api/v1/webhooks/whatsapp", content=self._status_payload(),
-                               headers={"content-type": "application/json"})
-        self.assertEqual(r.status_code, 200, r.text)
-
-    def test_unsigned_meta_refused_with_live_storage(self):
-        with mock.patch.object(main.settings, "META_APP_SECRET", ""), \
-                mock.patch.object(type(main.settings), "storage_mode", property(lambda s: "supabase")):
-            r = self.anon.post("/api/v1/webhooks/whatsapp", content=self._status_payload(),
-                               headers={"content-type": "application/json"})
-        self.assertEqual(r.status_code, 401)
-        self.assertEqual(self.sent, [])
-
-    def test_twilio_sandbox_only_offline(self):
-        with mock.patch.object(main, "_run_pipeline") as pipeline, \
-                mock.patch.object(type(main.settings), "storage_mode", property(lambda s: "supabase")):
-            r = self.anon.post("/api/v1/webhooks/whatsapp", data={"Body": "Flood, 48h delay", "From": "x"})
-        self.assertEqual(r.status_code, 404)
-        pipeline.assert_not_called()
-        r = self.anon.post("/api/v1/webhooks/whatsapp", data={"Body": "hello", "From": "x"})
-        self.assertEqual(r.status_code, 200)   # offline sandbox still works
-
-    def test_startup_flags_unsigned_webhooks_with_live_storage(self):
-        cfg = Settings()
-        cfg.META_APP_SECRET = ""
-        cfg.SUPABASE_URL, cfg.SUPABASE_SERVICE_ROLE_KEY, cfg.AUTH_MODE = "https://x.supabase.co", "k", "supabase"
-        problems = cfg.security_problems()
-        self.assertTrue(any("META_APP_SECRET" in p and "refused" in p for p in problems), problems)
-        with self.assertLogs("cascadezero.server", level="WARNING") as logs:
-            main._enforce_startup_security(cfg)
-        self.assertTrue(any("META_APP_SECRET" in line for line in logs.output))
+    def test_stale_whatsapp_env_is_ignored_and_sourcing_mode_falls_back(self):
+        import importlib
+        import os
+        from app import config
+        stale = {"META_APP_SECRET": "x", "META_WA_ACCESS_TOKEN": "y", "TWILIO_AUTH_TOKEN": "z",
+                 "WA_APPROVER_NUMBERS": "919800000000", "SOURCING_MODE": "whatsapp"}
+        try:
+            with mock.patch.dict(os.environ, stale):
+                cfg = importlib.reload(config).Settings()
+                self.assertEqual(cfg.SOURCING_MODE, "simulated")
+                self.assertFalse(any("META" in p or "WhatsApp" in p for p in cfg.security_problems()))
+                self.assertFalse(hasattr(cfg, "META_APP_SECRET"))
+        finally:
+            importlib.reload(config)
 
 
 class DocsTests(unittest.TestCase):

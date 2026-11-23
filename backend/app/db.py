@@ -41,7 +41,6 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "weather_risk_pct": 0.0,
         "status": "ON_TIME",
         "delay_hours": 0,
-        "whatsapp_number": "",
         "factory_id": "apex-volt-blr2",
         "sourcing_role": "PRIMARY",
         "lead_time_sigma_hours": 1.0,
@@ -67,7 +66,6 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "weather_risk_pct": 0.0,
         "status": "STANDBY",
         "delay_hours": 0,
-        "whatsapp_number": "",
         "factory_id": "apex-volt-blr2",
         "sourcing_role": "BACKUP",
         "lead_time_sigma_hours": 0.45,
@@ -93,7 +91,6 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "weather_risk_pct": 0.0,
         "status": "STANDBY",
         "delay_hours": 0,
-        "whatsapp_number": "",
         "factory_id": "apex-volt-blr2",
         "sourcing_role": "BACKUP",
         "lead_time_sigma_hours": 1.1,
@@ -119,7 +116,6 @@ _SEED_SUPPLIERS: list[dict[str, Any]] = [
         "weather_risk_pct": 2.0,
         "status": "STANDBY",
         "delay_hours": 0,
-        "whatsapp_number": "",
         "factory_id": "apex-volt-blr2",
         "sourcing_role": "EXPEDITE",
         "lead_time_sigma_hours": 0.25,
@@ -999,18 +995,6 @@ def get_user_channel(channel: str, address: str) -> dict[str, Any] | None:
     """The {channel, address, user_id, factory_id} link of a chat address, or None."""
     rows = fetch_where("user_channels", {"channel": channel, "address": address})
     return rows[0] if rows else None
-
-
-def has_user_channels(channel: str) -> bool:
-    """True when at least one address of `channel` is linked (ends the WhatsApp allowlist fallback)."""
-    client = _get_supabase()
-    if client is not None:
-        try:
-            return bool(client.table("user_channels").select("address").eq("channel", channel)
-                        .limit(1).execute().data)
-        except Exception as exc:
-            raise _fail("has_user_channels", "user_channels", exc) from exc
-    return any(r.get("channel") == channel for r in _mirror.user_channels)
 
 
 def link_user_channel(channel: str, address: str, user_id: str, factory_id: str) -> dict[str, Any]:

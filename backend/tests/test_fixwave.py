@@ -10,16 +10,9 @@ from tests._offline_env import DEV_HEADERS, dev_client  # noqa: F401
 
 from app import db, main, run_store
 from tests.fake_supabase import FailingClient
-from tests.test_persistence import ExecutePlanTxTests, _meta_text
+from tests.test_persistence import LINKED_CHAT, ExecutePlanTxTests, TelegramWebhookCase, _tg_update
 
 KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
-
-
-def _meta_button(sender, button_id, msg_id):
-    return {"object": "whatsapp_business_account",
-            "entry": [{"changes": [{"value": {"messages": [{
-                "from": sender, "type": "interactive", "id": msg_id,
-                "interactive": {"button_reply": {"id": button_id}}}]}}]}]}
 
 
 class _DeleteRecorder:
@@ -45,87 +38,60 @@ class _DeleteRecorder:
         return _Q()
 
 
-class WebhookReleaseTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.client = dev_client(main.app, raise_server_exceptions=False)
-        cls._patches = [
-            mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: True),
-            mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: True),
-        ]
-        for p in cls._patches:
-            p.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        for p in cls._patches:
-            p.stop()
-
-    def setUp(self):
-        self.client.post("/api/v1/reset", headers=KEY)
-
-    def _post(self, body):
-        import hashlib
-        import hmac
-        raw = json.dumps(body).encode()
-        sig = "sha256=" + hmac.new(b"test-app-secret", raw, hashlib.sha256).hexdigest()
-        return self.client.post("/api/v1/webhooks/whatsapp", content=raw,
-                                headers={"content-type": "application/json", "x-hub-signature-256": sig})
-
+class WebhookReleaseTests(TelegramWebhookCase):
     def test_release_webhook_event_offline(self):
-        self.assertTrue(db.record_webhook_event("wamid.R"))
-        db.release_webhook_event("wamid.R")
-        self.assertTrue(db.record_webhook_event("wamid.R"))
+        self.assertTrue(db.record_webhook_event("tg:R"))
+        db.release_webhook_event("tg:R")
+        self.assertTrue(db.record_webhook_event("tg:R"))
         db.release_webhook_event("wamid.unknown")  # no-op
 
     def test_release_webhook_event_live_deletes_by_message_id(self):
         rec = _DeleteRecorder()
         with mock.patch("app.db._get_supabase", return_value=rec):
-            db.release_webhook_event("wamid.R")
+            db.release_webhook_event("tg:R")
         (table, chain), = rec.calls
         self.assertEqual(table, "webhook_events")
         self.assertIn(("delete", ()), chain)
-        self.assertIn(("eq", ("message_id", "wamid.R")), chain)
+        self.assertIn(("eq", ("message_id", "tg:R")), chain)
 
     def test_release_webhook_event_live_failure_raises(self):
         with mock.patch("app.db._get_supabase", return_value=FailingClient()):
             with self.assertRaises(db.DatabaseError):
-                db.release_webhook_event("wamid.R")
+                db.release_webhook_event("tg:R")
 
     def test_approval_database_error_releases_event_and_retry_is_processed(self):
         sim = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 1}, headers=KEY).json()
-        body = _meta_button("919800000000", f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}", "wamid.APR")
+        body = _tg_update(LINKED_CHAT, button=f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}", update_id=601)
         with mock.patch.object(main, "_execute", side_effect=db.DatabaseError("rpc", "execute_plan_tx")):
-            r = self._post(body)
+            r = self.post_update(body)
         self.assertEqual(r.status_code, 503)
         self.assertIsNone(db.get_receipt(sim["run_id"]))
-        r2 = self._post(body)  # Meta's retry
+        r2 = self.post_update(body)  # Telegram's retry
         self.assertEqual(r2.json().get("action"), "plan_executed")
         self.assertIsNotNone(db.get_receipt(sim["run_id"]))
-        self.assertEqual(self._post(body).json()["status"], "duplicate")  # handled -> stays recorded
+        self.assertEqual(self.post_update(body).json()["status"], "duplicate")  # handled -> stays recorded
 
     def test_unexpected_exception_releases_event_and_reraises(self):
-        body = _meta_text("919800000009", "ok 100 units at 500", msg_id="wamid.BOOM")
-        with mock.patch.object(main.sourcing, "find_open_rfq_by_number", side_effect=RuntimeError("kaboom")):
-            r = self._post(body)
+        body = _tg_update("7000009", "ok 100 units at 500", update_id=602)
+        with mock.patch.object(main.sourcing, "find_open_rfq_by_address", side_effect=RuntimeError("kaboom")):
+            r = self.post_update(body)
         self.assertEqual(r.status_code, 500)
-        retry = self._post(_meta_text("919800000009", "status", msg_id="wamid.BOOM"))
+        retry = self.post_update(_tg_update("7000009", "status", update_id=602))
         self.assertNotEqual(retry.json()["status"], "duplicate")
 
     def test_release_failure_is_swallowed_original_error_surfaces(self):
-        body = _meta_text("919800000009", "ok 1", msg_id="wamid.REL")
-        with mock.patch.object(main.sourcing, "find_open_rfq_by_number",
-                               side_effect=db.DatabaseError("fetch_all", "sourcing_sessions")), \
-                mock.patch.object(db, "release_webhook_event",
+        body = _tg_update("7000009", "ok 1", update_id=603)
+        with mock.patch.object(main.sourcing, "find_open_rfq_by_address",
+                               side_effect=db.DatabaseError("fetch_all", "sourcing_sessions")),                 mock.patch.object(db, "release_webhook_event",
                                   side_effect=db.DatabaseError("delete", "webhook_events")):
-            r = self._post(body)
+            r = self.post_update(body)
         self.assertEqual(r.status_code, 503)
         self.assertIn("fetch_all", r.json()["detail"])
 
     def test_successful_message_redelivery_is_duplicate(self):
-        body = _meta_text("919800000001", "status", msg_id="wamid.OK")
-        self.assertNotEqual(self._post(body).json()["status"], "duplicate")
-        self.assertEqual(self._post(body).json()["status"], "duplicate")
+        body = _tg_update(LINKED_CHAT, "status", update_id=604)
+        self.assertNotEqual(self.post_update(body).json()["status"], "duplicate")
+        self.assertEqual(self.post_update(body).json()["status"], "duplicate")
 
     def test_find_open_rfq_runs_in_threadpool(self):
         # The shared inbound flow (app/inbound.py) does the vendor lookup off the event loop.
@@ -137,7 +103,7 @@ class WebhookReleaseTests(unittest.TestCase):
             seen.append(getattr(fn, "__name__", ""))
             return await real(fn, *a, **k)
         with mock.patch.object(inbound, "run_in_threadpool", spy):
-            self._post(_meta_text("919800000001", "status", msg_id="wamid.TP"))
+            self.post_update(_tg_update(LINKED_CHAT, "status", update_id=605))
         self.assertIn("find_open_rfq_by_address", seen)
 
 

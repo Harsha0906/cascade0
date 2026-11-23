@@ -237,8 +237,8 @@ class ClientAgentTests(unittest.TestCase):
     # ── Human sign-off ──
     def test_no_outbound_message_before_approval(self):
         sent = mock.Mock(return_value=True)
-        with mock.patch.object(client_agent, "send_whatsapp_text", sent), \
-                mock.patch.object(settings, "SOURCING_MODE", "whatsapp"):
+        with mock.patch.object(client_agent.sourcing, "outbound_channel", return_value=mock.Mock(send_text=sent)), \
+                mock.patch.object(settings, "SOURCING_MODE", "telegram"):
             sim = self._simulate(1)
             run_id = sim["run_id"]
             client_agent.draft_extension(run_id, 24)
@@ -246,7 +246,7 @@ class ClientAgentTests(unittest.TestCase):
             self.assertEqual(client_agent.view(run_id)["extension_hours"], 36)
             sent.assert_not_called()
             self.assertEqual(client_agent.view(run_id)["outbox"], [])
-            # WhatsApp mode needs the client's number on the order.
+            # Telegram mode needs the client's chat id on the order.
             with self.assertRaises(client_agent.ClientAgentError) as cm:
                 client_agent.approve_extension(run_id, "ops-lead")
             self.assertEqual(cm.exception.status_code, 409)
@@ -256,18 +256,18 @@ class ClientAgentTests(unittest.TestCase):
             with self.assertRaises(client_agent.ClientAgentError) as cm:
                 client_agent.approve_extension(run_id, "  ")
             self.assertEqual(cm.exception.status_code, 422)
-            db.update_rows("orders", "order_id", "EV-402", {"client_whatsapp_number": "+91 98450 11111"})
+            db.update_rows("orders", "order_id", "EV-402", {"client_contact": "telegram:8800001"})
             c = client_agent.approve_extension(run_id, "ops-lead")
             self.assertEqual(c["status"], "SENT")
             sent.assert_called_once()
-            self.assertEqual(sent.call_args[0][0], "919845011111")
+            self.assertEqual(sent.call_args[0][0], "8800001")
             self.assertIn("EV-402", sent.call_args[0][1])
 
-    def test_whatsapp_send_failure_keeps_draft(self):
-        with mock.patch.object(client_agent, "send_whatsapp_text", lambda *a, **k: False), \
-                mock.patch.object(settings, "SOURCING_MODE", "whatsapp"):
+    def test_telegram_send_failure_keeps_draft(self):
+        with mock.patch.object(client_agent.sourcing, "outbound_channel", return_value=mock.Mock(send_text=lambda *a, **k: False)), \
+                mock.patch.object(settings, "SOURCING_MODE", "telegram"):
             sim = self._simulate(1)
-            db.update_rows("orders", "order_id", "EV-402", {"client_whatsapp_number": "919845011111"})
+            db.update_rows("orders", "order_id", "EV-402", {"client_contact": "telegram:8800001"})
             client_agent.draft_extension(sim["run_id"], 24)
             with self.assertRaises(client_agent.ClientAgentError) as cm:
                 client_agent.approve_extension(sim["run_id"], "ops-lead")
@@ -403,10 +403,10 @@ class ClientAgentTests(unittest.TestCase):
     def test_send_exception_reverts_to_draft(self):
         def boom(*a, **k):
             raise RuntimeError("socket closed")
-        with mock.patch.object(client_agent, "send_whatsapp_text", boom), \
-                mock.patch.object(settings, "SOURCING_MODE", "whatsapp"):
+        with mock.patch.object(client_agent.sourcing, "outbound_channel", return_value=mock.Mock(send_text=boom)), \
+                mock.patch.object(settings, "SOURCING_MODE", "telegram"):
             sim = self._simulate(1)
-            db.update_rows("orders", "order_id", "EV-402", {"client_whatsapp_number": "919845011111"})
+            db.update_rows("orders", "order_id", "EV-402", {"client_contact": "telegram:8800001"})
             client_agent.draft_extension(sim["run_id"], 24)
             with self.assertRaises(client_agent.ClientAgentError) as cm:
                 client_agent.approve_extension(sim["run_id"], "ops-lead")

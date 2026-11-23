@@ -20,7 +20,7 @@ export function ExecutionModal({
   onClose: () => void;
 }) {
   const { executionReceipt, playbooks, productionLines } = useFactoryStore();
-  const [activeTab, setActiveTab] = useState<"tally" | "whatsapp" | "sla">("tally");
+  const [activeTab, setActiveTab] = useState<"tally" | "broadcast" | "sla">("tally");
   const [copiedType, setCopiedType] = useState<string | null>(null);
 
   // Only real, server-generated receipts are shown — no canned fallback.
@@ -107,15 +107,15 @@ export function ExecutionModal({
           </button>
 
           <button
-            onClick={() => setActiveTab("whatsapp")}
+            onClick={() => setActiveTab("broadcast")}
             className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-full transition-all ${
-              activeTab === "whatsapp"
+              activeTab === "broadcast"
                 ? "bg-white text-charcoal-900 font-extrabold shadow-sm border border-white/80"
                 : "text-charcoal-700 hover:text-charcoal-950 font-medium"
             }`}
           >
             <MessageSquare className="w-3.5 h-3.5 text-forest" />
-            <span>2. WhatsApp Shift Broadcast</span>
+            <span>2. Shift Broadcast</span>
           </button>
 
           <button
@@ -166,23 +166,23 @@ export function ExecutionModal({
             </div>
           )}
 
-          {/* TAB 2: WhatsApp Shift Broadcast */}
-          {activeTab === "whatsapp" && (
+          {/* TAB 2: Shift Broadcast */}
+          {activeTab === "broadcast" && (
             <div className="space-y-3 font-mono text-xs">
               <div className="flex items-center justify-between">
                 <span className="text-charcoal-600 text-[11px] font-medium">
                   {shiftNoticeHeading}
                 </span>
                 <button
-                  onClick={() => copyText(receipt.shift_broadcast_msg, "whatsapp")}
+                  onClick={() => copyText(receipt.shift_broadcast_msg, "broadcast")}
                   className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-white/60 hover:bg-white text-charcoal-900 border border-white/80 transition-all text-[11px] font-bold shadow-sm"
                 >
-                  {copiedType === "whatsapp" ? (
+                  {copiedType === "broadcast" ? (
                     <Check className="w-3.5 h-3.5 text-forest" />
                   ) : (
                     <Copy className="w-3.5 h-3.5" />
                   )}
-                  <span>{copiedType === "whatsapp" ? "Copied!" : "Copy Broadcast"}</span>
+                  <span>{copiedType === "broadcast" ? "Copied!" : "Copy Broadcast"}</span>
                 </button>
               </div>
 

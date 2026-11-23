@@ -94,7 +94,7 @@ export function SourcingPanel() {
     useFactoryStore();
   const selectedPlan = playbooks.find((p) => p.id === selectedPlaybookId);
 
-  // Poll while enquiries are open (replies may arrive over WhatsApp; timeouts are applied server-side).
+  // Poll while enquiries are open (replies may arrive over Telegram; timeouts are applied server-side).
   useEffect(() => {
     if (sourcing?.status !== "ACTIVE") return;
     const t = setInterval(refreshSourcing, 4000);
@@ -138,8 +138,8 @@ export function SourcingPanel() {
 
       {!done && (
         <p className="text-[10px] text-violet-900">
-          {sourcing.mode === "whatsapp"
-            ? `Waiting for WhatsApp replies (timeout ${sourcing.reply_timeout_min} min). Replies received by phone can be entered below.`
+          {sourcing.mode === "telegram"
+            ? `Waiting for Telegram replies (timeout ${sourcing.reply_timeout_min} min). Replies received elsewhere can be entered below.`
             : "Nothing is sent in this mode: type each supplier's reply (or use a quick reply)."}
         </p>
       )}

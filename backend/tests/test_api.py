@@ -1,8 +1,6 @@
-"""API tests (offline: in-memory DB mirror, no LLM, outbound WhatsApp stubbed)."""
+"""API tests (offline: in-memory DB mirror, no LLM, no outbound messages)."""
 
 import copy
-import hashlib
-import hmac
 import json
 import unittest
 from unittest import mock
@@ -19,38 +17,10 @@ from app.factory_model import FactoryDataError
 KEY = DEV_HEADERS  # dev-owner@example.test (AUTH_MODE=dev)
 
 
-def _signed(body: dict):
-    raw = json.dumps(body).encode()
-    sig = "sha256=" + hmac.new(b"test-app-secret", raw, hashlib.sha256).hexdigest()
-    return raw, {"content-type": "application/json", "x-hub-signature-256": sig}
-
-
-def _button_payload(sender: str, button_id: str) -> dict:
-    return {
-        "object": "whatsapp_business_account",
-        "entry": [{"changes": [{"value": {"messages": [{
-            "from": sender, "type": "interactive",
-            "interactive": {"button_reply": {"id": button_id}},
-        }]}}]}],
-    }
-
-
 class ApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.client = dev_client(main.app)
-        cls.sent = []
-        cls._patches = [
-            mock.patch.object(main, "send_whatsapp_text", lambda *a, **k: cls.sent.append(a) or True),
-            mock.patch.object(main, "send_whatsapp_interactive_buttons", lambda *a, **k: cls.sent.append(a) or True),
-        ]
-        for p in cls._patches:
-            p.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        for p in cls._patches:
-            p.stop()
 
     def setUp(self):
         self.client.post("/api/v1/reset", headers=KEY)
@@ -90,11 +60,6 @@ class ApiTests(unittest.TestCase):
         self.assertNotEqual(lines["LINE-2"], "OVERTIME_SCHEDULED")
 
     # ── factory-data error handling ──
-    def _meta_text(self, sender, text):
-        raw, headers = _signed({"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {
-            "messages": [{"from": sender, "type": "text", "text": {"body": text}}]}}]}]})
-        return self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers)
-
     def test_factory_endpoint_503_on_invalid_data(self):
         with mock.patch.object(main, "load_factory_model", side_effect=FactoryDataError("bad lines")):
             r = self.client.get("/api/v1/factory")
@@ -112,34 +77,6 @@ class ApiTests(unittest.TestCase):
                                  json={"run_id": sim["run_id"], "playbook_id": sim["recommended_plan_id"]}, headers=KEY)
         self.assertEqual(r.status_code, 503, r.text)
         self.assertIn("Factory data invalid: bad vendors", r.json()["detail"])
-
-    def test_meta_pipeline_factory_error_is_not_500(self):
-        before = len(self.sent)
-        with mock.patch("app.agents.graph.load_factory_model", side_effect=FactoryDataError("bad data")):
-            r = self._meta_text("919800000000", "Flood on NH48, 48h delay, 150 casings short")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "error")
-        self.assertIn("Factory data invalid", r.json()["detail"])
-        self.assertGreater(len(self.sent), before)
-        sender, text = self.sent[-1][:2]
-        self.assertEqual(sender, "919800000000")
-        self.assertIn("misconfigured", text)
-        self.assertNotIn("bad data", text)  # no internal detail goes to WhatsApp senders
-
-    def test_meta_vendor_reply_factory_error_is_not_500(self):
-        with mock.patch.object(main.sourcing, "find_open_rfq_by_number", return_value=("run-x", "SUP-X")),              mock.patch.object(main.sourcing, "record_reply", side_effect=FactoryDataError("bad data")):
-            r = self._meta_text("919000000002", "ok 100 units at 500")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "error")
-        self.assertEqual(r.json()["run_id"], "run-x")
-
-    def test_twilio_pipeline_factory_error_is_not_500(self):
-        with mock.patch("app.agents.graph.load_factory_model", side_effect=FactoryDataError("bad data")):
-            r = self.client.post("/api/v1/webhooks/whatsapp",
-                                 data={"Body": "Flood on NH48, 48h delay", "From": "whatsapp:+1"})
-        self.assertEqual(r.status_code, 200)
-        self.assertIn("misconfigured", r.text)
-        self.assertNotIn("bad data", r.text)  # no internal detail goes to WhatsApp senders
 
     # ── auth ──
     def test_mutating_endpoints_require_credentials(self):
@@ -202,30 +139,6 @@ class ApiTests(unittest.TestCase):
                              json={"run_id": sim["run_id"], "playbook_id": "PLAN_B"}, headers=KEY)
         self.assertEqual(r.status_code, 409)
 
-    # ── webhook security ──
-    def test_webhook_rejects_bad_signature(self):
-        raw = json.dumps(_button_payload("919800000000", "VIEW_STATUS")).encode()
-        r = self.client.post("/api/v1/webhooks/whatsapp", content=raw,
-                             headers={"content-type": "application/json", "x-hub-signature-256": "sha256=bad"})
-        self.assertEqual(r.status_code, 401)
-
-    def test_view_status_button_works(self):
-        raw, headers = _signed(_button_payload("919800000000", "VIEW_STATUS"))
-        r = self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers)
-        self.assertEqual(r.json().get("action"), "status_sent")
-
-    def test_whatsapp_approval_requires_allowlisted_number(self):
-        sim = self._simulate(1)
-        button = f"APPROVE:{sim['run_id']}:{sim['recommended_plan_id']}"
-        raw, headers = _signed(_button_payload("911111111111", button))
-        self.assertEqual(self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers).json()["status"],
-                         "forbidden")
-        self.assertIsNone(db.get_receipt(sim["run_id"]))
-        raw, headers = _signed(_button_payload("919800000000", button))
-        self.assertEqual(self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers).json()["action"],
-                         "plan_executed")
-        self.assertEqual(db.get_receipt(sim["run_id"])["approved_by"], "whatsapp:919800000000")
-
     # ── atomic / idempotent execution ──
     def test_execution_is_atomic(self):
         sim = self._simulate(1)
@@ -264,14 +177,6 @@ class ApiTests(unittest.TestCase):
         stored = db.get_receipt(sim["run_id"])
         self.assertEqual(stored["run_id"], sim["run_id"])
         self.assertEqual(stored["playbook_id"], sim["recommended_plan_id"])
-
-    def test_verify_handshake(self):
-        ok = self.client.get("/api/v1/webhooks/whatsapp",
-                             params={"hub.mode": "subscribe", "hub.verify_token": "test-verify-token", "hub.challenge": "42"})
-        self.assertEqual((ok.status_code, ok.text), (200, "42"))
-        bad = self.client.get("/api/v1/webhooks/whatsapp",
-                              params={"hub.mode": "subscribe", "hub.verify_token": "nope", "hub.challenge": "42"})
-        self.assertEqual(bad.status_code, 403)
 
     # ── ERP import ──
     def test_csv_inserts_new_orders_and_reports_bad_rows(self):
@@ -362,13 +267,6 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 422)
         self.assertIn("scenario_id or raw_message", r.json()["detail"])
 
-    def test_twilio_hello_has_no_demo_names(self):
-        r = self.client.post("/api/v1/webhooks/whatsapp", data={"Body": "hello", "From": "x"})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertIn("connected", r.text)
-        self.assertNotIn("EV-402", r.text)
-        self.assertNotIn("Line 2", r.text)
-
     def test_line_speed_override_validation(self):
         r = self.client.post("/api/v1/simulate-crisis", json={"scenario_id": 1,
                              "override_line_speeds": {"LINE-1": 120}}, headers=KEY)
@@ -385,16 +283,6 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(p["line_impacts"][0]["speed_pct"], 60)
         # EV-402 has inventory data: the computed shortfall wins; the alert's 120 is reported, not used.
         self.assertEqual((p["shortfall_source"], p["alert_stated_shortfall"]), ("inventory", 120))
-
-    def test_webhook_unresolvable_message_replies_with_reason(self):
-        self.sent.clear()
-        payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {"messages": [{
-            "from": "919800000000", "id": "wamid.GENERIC1", "type": "text",
-            "text": {"body": "flood on the highway"}}]}}]}]}
-        raw, headers = _signed(payload)
-        r = self.client.post("/api/v1/webhooks/whatsapp", content=raw, headers=headers)
-        self.assertEqual(r.status_code, 200)
-        self.assertIn("not stated", self.sent[-1][1])
 
     def test_plc_requires_known_line(self):
         r = self.client.post("/api/v1/ingest/plc-telemetry", json={"speed_pct": 50}, headers=KEY)

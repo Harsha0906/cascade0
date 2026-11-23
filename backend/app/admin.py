@@ -2,8 +2,8 @@
 CascadeZero — operator CLI for factory memberships.
 
     python -m app.admin add-member --email E --factory F --role owner|approver|viewer
-    python -m app.admin set-vendor-contact --supplier S --channel telegram|whatsapp --address A
-    python -m app.admin set-client-contact --order O --channel telegram|whatsapp --address A
+    python -m app.admin set-vendor-contact --supplier S --channel telegram --address A
+    python -m app.admin set-client-contact --order O --channel telegram --address A
 
 The user must already exist in Supabase Auth (they sign up on the dashboard first); this looks
 them up with the admin API and upserts their row in `factory_members`. Needs the live Supabase
@@ -75,21 +75,16 @@ def add_member(email: str, factory_id: str, role: str) -> dict[str, Any]:
     return db.upsert_row("factory_members", row, key_columns=("user_id", "factory_id"))
 
 
-CONTACT_CHANNELS = ("telegram", "whatsapp")
+CONTACT_CHANNELS = ("telegram",)
 
 
 def _clean_address(channel: str, address: str) -> str:
-    """A Telegram chat id (an integer) or a WhatsApp number (digits, country code, no '+')."""
+    """A Telegram chat id (an integer)."""
     address = (address or "").strip()
-    if channel == "telegram":
-        if not re.fullmatch(r"-?\d{1,20}", address):
-            raise AdminError("A Telegram address is the numeric chat id (the person starts the bot, "
-                             "then send /start and read the id from the bot's getUpdates)")
-        return address
-    digits = re.sub(r"\D", "", address)
-    if not 8 <= len(digits) <= 15:
-        raise AdminError("A WhatsApp address is the number with country code, e.g. 919845011111")
-    return digits
+    if not re.fullmatch(r"-?\d{1,20}", address):
+        raise AdminError("A Telegram address is the numeric chat id (the person starts the bot, "
+                         "then send /start and read the id from the bot's getUpdates)")
+    return address
 
 
 def set_vendor_contact(supplier_id: str, channel: str, address: str) -> str:
@@ -98,8 +93,7 @@ def set_vendor_contact(supplier_id: str, channel: str, address: str) -> str:
     if db.get_supplier(supplier_id) is None:
         raise AdminError(f"Unknown supplier {supplier_id!r}")
     address = _clean_address(channel, address)
-    column = "telegram_chat_id" if channel == "telegram" else "whatsapp_number"
-    db.update_rows("suppliers", "id", supplier_id, {column: address})
+    db.update_rows("suppliers", "id", supplier_id, {"telegram_chat_id": address})
     return address
 
 

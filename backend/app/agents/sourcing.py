@@ -4,7 +4,7 @@ CascadeZero — Sourcing Agent
 The planner's vendor numbers (capacity, price, lead time) are assumptions. The Sourcing Agent
 replaces them with what vendors actually say, and re-plans when reality differs:
 
-    perceive  → vendor replies (WhatsApp, or entered by an operator / simulated vendor)
+    perceive  → vendor replies (Telegram, or entered by an operator / simulated vendor)
     decide    → who to ask, for how many units; whether to re-plan, ask someone else, or stop
     act       → send enquiries (RFQs), update the plan with confirmed offers, hand back a
                 confirmed plan for human approval
@@ -50,7 +50,6 @@ from app.agents import sourcing_store
 from app.config import settings
 from app.db import get_all_suppliers, get_supplier, log_agent_step, upsert_row
 from app.factory_model import FactoryModel, Vendor, load_factory_model
-from app.meta_whatsapp import send_whatsapp_template, send_whatsapp_text
 from app.solver import generate_playbooks
 
 logger = logging.getLogger("cascadezero.sourcing")
@@ -291,15 +290,12 @@ def parse_vendor_reply(text: str, rfq: RFQ, item: str = "units") -> Tuple[Vendor
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _digits(number: str) -> str:
-    return re.sub(r"\D", "", number or "")
-
 
 def outbound_channel(name: str):
     """The channel adapter for outbound vendor/client messages, resolved from app.main at call
     time (the same factories the webhooks use, so tests patching them cover both directions)."""
     from app import main
-    return main._whatsapp_channel() if name == "whatsapp" else main._telegram_channel()
+    return main._telegram_channel()
 
 
 def _now() -> datetime:
@@ -367,27 +363,7 @@ def _send_rfq(session: SourcingSession, supplier_id: str, units: int) -> RFQ:
     rfq.message = _rfq_text(model, rfq)
 
     mode = settings.SOURCING_MODE
-    if mode == "whatsapp":
-        number = _digits((get_supplier(supplier_id) or {}).get("whatsapp_number", ""))
-        if not number:
-            rfq.status = "SEND_FAILED"
-            rfq.reply_text = "No WhatsApp number on file for this vendor."
-        else:
-            if settings.SOURCING_RFQ_TEMPLATE:
-                price = (f"Rs {vendor.flat_cost:,} total" if _is_charter(vendor)
-                         else f"Rs {rfq.expected_unit_price_inr}/unit")
-                sent = send_whatsapp_template(
-                    number, settings.SOURCING_RFQ_TEMPLATE,
-                    [vendor.name.split(" (")[0], str(units), f"{rfq.needed_within_hours:g}", price, rfq.id],
-                    settings.SOURCING_RFQ_TEMPLATE_LANG,
-                )
-            else:
-                sent = outbound_channel("whatsapp").send_text(number, rfq.message)
-            if not sent:
-                rfq.status = "SEND_FAILED"
-                rfq.reply_text = ("WhatsApp send failed (check the token; without an approved template, "
-                                  "free text only reaches vendors who messaged us in the last 24h).")
-    elif mode == "telegram":
+    if mode == "telegram":
         chat_id = str((get_supplier(supplier_id) or {}).get("telegram_chat_id") or "").strip()
         if not chat_id:
             rfq.status = "SEND_FAILED"
@@ -591,7 +567,7 @@ def start_sourcing(run_id: str, playbook_id: Optional[str] = None) -> Dict[str, 
         names = ", ".join(f"{r.supplier_name.split(' (')[0]} ({r.units_requested}u)" for r in sent)
         _log(session, f"Round 1 ({settings.SOURCING_MODE}): enquiries sent to {names}",
              f"📨 Checking {pid} with suppliers before approval. Enquiries sent to {names} "
-             f"({'via ' + ('WhatsApp' if settings.SOURCING_MODE == 'whatsapp' else 'Telegram') if settings.SOURCING_MODE in ('whatsapp', 'telegram') else 'simulated channel — enter replies on the dashboard'}).",
+             f"({'via Telegram' if settings.SOURCING_MODE == 'telegram' else 'simulated channel — enter replies on the dashboard'}).",
              "send_rfq()")
         if any(r.status == "SEND_FAILED" for r in sent):
             _advance(session)
@@ -734,13 +710,11 @@ def _apply_restart(session: SourcingSession, playbook: Dict[str, Any], reason: s
         _advance(session)
 
 
-_ADDRESS_COLUMN = {"whatsapp": "whatsapp_number", "telegram": "telegram_chat_id"}
+_ADDRESS_COLUMN = {"telegram": "telegram_chat_id"}
 _REF_RE = re.compile(r"RFQ-[A-Z0-9]{6}", re.IGNORECASE)
 
 
 def _same_address(channel: str, stored: Any, wanted: str) -> bool:
-    if channel == "whatsapp":
-        return bool(_digits(stored)) and _digits(stored) == _digits(wanted)
     return bool(str(stored or "").strip()) and str(stored).strip() == str(wanted or "").strip()
 
 
@@ -771,17 +745,9 @@ def match_open_rfq(matches: List[Tuple[str, str, str]], text: str = "") -> Optio
     return chosen[0] if len(chosen) == 1 else None
 
 
-def find_open_rfq_by_number(number: str, text: str = "") -> Optional[Tuple[str, str]]:
-    """Map an inbound WhatsApp sender to (run_id, supplier_id) when exactly one enquiry is open."""
-    m = match_open_rfq(find_open_rfqs("whatsapp", number), text)
-    return (m[0], m[1]) if m else None
-
-
 def find_open_rfq_by_address(channel: str, address: str, text: str = "") -> Optional[Tuple[str, str]]:
     """Map an inbound chat sender to (run_id, supplier_id) with an open enquiry. Never guesses
     between several: with more than one open it needs the reply to quote the RFQ ref."""
-    if channel == "whatsapp":
-        return find_open_rfq_by_number(address, text)
     m = match_open_rfq(find_open_rfqs(channel, address), text)
     return (m[0], m[1]) if m else None
 
