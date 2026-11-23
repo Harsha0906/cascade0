@@ -1,0 +1,41 @@
+# Render blueprint for the CascadeZero backend (free web service).
+# Secrets are NOT stored here: set them in the Render dashboard (Environment tab).
+services:
+  - type: web
+    name: cascadezero-backend
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: CASCADE_ENV
+        value: production
+      - key: AUTH_MODE
+        value: supabase
+      - key: SOURCING_MODE
+        value: simulated
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite
+      # Set these in the dashboard (sync: false = you type the value there):
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_USERNAME
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: CASCADE_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
