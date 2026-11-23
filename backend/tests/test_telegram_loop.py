@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests import _offline_env  # noqa: F401  (must precede app imports)
-from tests._offline_env import DEV_OWNER
+from tests._offline_env import DEV_OWNER, OTHER_OWNER, dev_client
 
 from app import admin, db, main, telegram_poll
 from app.agents import client as client_agent
@@ -89,6 +89,46 @@ class ParityFlowTests(_ChannelCase):
             self.assertIsNone(sourcing.find_open_rfq_by_address("telegram", "7000002"))
             self.assertIsNone(sourcing.find_open_rfq_by_address("telegram", ""))
             self.assertIsNone(sourcing.find_open_rfq_by_address("whatsapp", "7000001"))
+
+class SharedVendorAddressTests(_ChannelCase):
+    """One vendor address serving two factories: a reply never lands in the wrong one."""
+
+    def test_reply_needs_the_ref_when_two_enquiries_are_open(self):
+        for h in (TelegramHarness(), WhatsAppHarness()):
+            with self.subTest(channel=h.name), self.active(h),                     mock.patch.object(settings, "SOURCING_MODE", h.name):
+                addr = VENDOR_ADDRESS[h.name]
+                col = VENDOR_COLUMN[h.name]
+                db.update_rows("suppliers", "id", "SUP-PNY-02", {col: addr})
+                for sid in ("V1", "V2", "V3"):
+                    db.update_rows("suppliers", "id", sid, {col: addr})
+                apex = self.apex_run()["run_id"]
+                self.owner.post("/api/v1/sourcing/start", json={"run_id": apex})
+                tp = self.tp_run()
+                r = dev_client(main.app, user=OTHER_OWNER).post("/api/v1/sourcing/start", json={"run_id": tp["run_id"]})
+                self.assertEqual(r.status_code, 200, r.text)
+                matches = sourcing.find_open_rfqs(h.name, addr)
+                self.assertEqual({m[0] for m in matches}, {apex, tp["run_id"]})
+                self.assertIsNone(sourcing.find_open_rfq_by_address(h.name, addr))   # never guesses
+
+                before = len(h.sent())
+                r = h.text(self.webhook, addr, "YES 100 @600 in 4h")
+                self.assertEqual(r.json()["status"], "ambiguous", r.text)
+                reply = h.sent()[before]
+                self.assertEqual(reply["to"], addr)
+                for m in matches:
+                    self.assertIn(m[2], reply["text"])
+                for run_id in (apex, tp["run_id"]):
+                    self.assertTrue(all(x["status"] == "SENT" for x in sourcing.view(run_id)["rfqs"]
+                                        if x["supplier_id"] in ("SUP-PNY-02", "V1", "V2", "V3")))
+
+                pick = next(m for m in matches if m[0] == tp["run_id"])
+                r = h.text(self.webhook, addr, f"Ref: {pick[2]} YES 100 @600 in 4h")
+                self.assertEqual(r.json().get("action"), "vendor_reply_recorded", r.text)
+                self.assertEqual(r.json()["run_id"], tp["run_id"])
+                self.assertTrue(all(x["status"] == "SENT" for x in sourcing.view(apex)["rfqs"]))
+
+                # a ref belonging to someone else's enquiry is never honoured
+                self.assertIsNone(sourcing.match_open_rfq(matches, "Ref: RFQ-ZZZZZZ"))
 
 
 class ClientTelegramTests(_ChannelCase):

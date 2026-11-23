@@ -734,45 +734,56 @@ def _apply_restart(session: SourcingSession, playbook: Dict[str, Any], reason: s
         _advance(session)
 
 
-def find_open_rfq_by_number(number: str) -> Optional[Tuple[str, str]]:
-    """Map an inbound WhatsApp sender to (run_id, supplier_id) with an open enquiry, if any."""
-    digits = _digits(number)
-    if not digits:
-        return None
-    supplier_ids = {
-        s["id"] for s in get_all_suppliers()
-        if _digits(s.get("whatsapp_number", "")) and _digits(s.get("whatsapp_number", "")) == digits
-    }
-    if not supplier_ids:
-        return None
-    for session in sourcing_store.active():
-        for rfq in reversed(session.rfqs):
-            if rfq.supplier_id in supplier_ids and rfq.status == "SENT":
-                return session.run_id, rfq.supplier_id
-    return None
-
-
 _ADDRESS_COLUMN = {"whatsapp": "whatsapp_number", "telegram": "telegram_chat_id"}
+_REF_RE = re.compile(r"RFQ-[A-Z0-9]{6}", re.IGNORECASE)
 
 
-def find_open_rfq_by_address(channel: str, address: str) -> Optional[Tuple[str, str]]:
-    """Map an inbound chat sender on `channel` to (run_id, supplier_id) with an open enquiry.
-    WhatsApp compares digits (suppliers.whatsapp_number); Telegram compares the chat id
-    (suppliers.telegram_chat_id)."""
+def _same_address(channel: str, stored: Any, wanted: str) -> bool:
     if channel == "whatsapp":
-        return find_open_rfq_by_number(address)
+        return bool(_digits(stored)) and _digits(stored) == _digits(wanted)
+    return bool(str(stored or "").strip()) and str(stored).strip() == str(wanted or "").strip()
+
+
+def find_open_rfqs(channel: str, address: str) -> List[Tuple[str, str, str]]:
+    """Every open enquiry (run_id, supplier_id, rfq_id) addressed to this chat on `channel`,
+    across all factories (a vendor may supply several plants from one number)."""
     column = _ADDRESS_COLUMN.get(channel)
-    wanted = str(address or "").strip()
-    if column is None or not wanted:
-        return None
-    supplier_ids = {s["id"] for s in get_all_suppliers() if str(s.get(column) or "").strip() == wanted}
+    if column is None or not str(address or "").strip():
+        return []
+    supplier_ids = {s["id"] for s in get_all_suppliers() if _same_address(channel, s.get(column), address)}
     if not supplier_ids:
-        return None
+        return []
+    found = []
     for session in sourcing_store.active():
         for rfq in reversed(session.rfqs):
             if rfq.supplier_id in supplier_ids and rfq.status == "SENT":
-                return session.run_id, rfq.supplier_id
-    return None
+                found.append((session.run_id, rfq.supplier_id, rfq.id))
+    return found
+
+
+def match_open_rfq(matches: List[Tuple[str, str, str]], text: str = "") -> Optional[Tuple[str, str, str]]:
+    """The one enquiry a reply belongs to: the only open one, or the one whose `Ref: RFQ-XXXXXX`
+    the reply quotes (only among this vendor's own open enquiries). None when ambiguous."""
+    if len(matches) == 1:
+        return matches[0]
+    refs = {r.upper() for r in _REF_RE.findall(text or "")}
+    chosen = [m for m in matches if m[2].upper() in refs]
+    return chosen[0] if len(chosen) == 1 else None
+
+
+def find_open_rfq_by_number(number: str, text: str = "") -> Optional[Tuple[str, str]]:
+    """Map an inbound WhatsApp sender to (run_id, supplier_id) when exactly one enquiry is open."""
+    m = match_open_rfq(find_open_rfqs("whatsapp", number), text)
+    return (m[0], m[1]) if m else None
+
+
+def find_open_rfq_by_address(channel: str, address: str, text: str = "") -> Optional[Tuple[str, str]]:
+    """Map an inbound chat sender to (run_id, supplier_id) with an open enquiry. Never guesses
+    between several: with more than one open it needs the reply to quote the RFQ ref."""
+    if channel == "whatsapp":
+        return find_open_rfq_by_number(address, text)
+    m = match_open_rfq(find_open_rfqs(channel, address), text)
+    return (m[0], m[1]) if m else None
 
 
 def view(run_id: str) -> Dict[str, Any]:

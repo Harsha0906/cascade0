@@ -229,9 +229,19 @@ async def _process(channel: Channel, msg: InboundMessage) -> Dict[str, Any]:
         await _reply(channel, sender, HELP_TEXT)
         return {"status": "success", "action": "help_sent"}
 
-    open_rfq = await run_in_threadpool(sourcing.find_open_rfq_by_address, channel.name, _address(channel, sender))
+    address = _address(channel, sender)
+    open_rfq = await run_in_threadpool(sourcing.find_open_rfq_by_address, channel.name, address, text)
     if open_rfq:
         return await _vendor_reply(channel, sender, text, open_rfq)
+    matches = await run_in_threadpool(sourcing.find_open_rfqs, channel.name, address) if open_rfq is None else []
+    if len(matches) > 1:
+        # Several open enquiries for this vendor address (e.g. one vendor, two plants) and the reply
+        # quotes no valid ref: never guess; ask for it so a reply cannot land in the wrong factory.
+        refs = ", ".join(sorted({m[2] for m in matches}))
+        await _reply(channel, sender,
+                     f"We have more than one open enquiry for you ({refs}). Please reply again and "
+                     f"include the reference, e.g. \"Ref: {matches[0][2]} YES 150 @600 in 4h\".")
+        return {"status": "ambiguous", "action": "vendor_ref_needed"}
 
     identity = await run_in_threadpool(identify, channel, sender)
     if identity is None:
