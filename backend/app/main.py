@@ -1067,9 +1067,9 @@ def get_client(run_id: str, actor: Actor = Depends(user_actor)):
 def reset_factory(req: Optional[ResetRequest] = None, actor: Actor = Depends(user_actor)):
     """Reset ONE factory (the body's factory_id, default the caller's) to its demo seed. Needs
     the owner role in that factory; a factory without demo seed data is a 409."""
+    # Safe in production too: only an owner of the demo factory can reset, and only the demo
+    # factory (which has seed data) can be reset — a real factory is a 409 below.
     factory_id = actor.authorize(req.factory_id if req else None, *OWNER_ONLY)
-    if settings.is_production:
-        raise HTTPException(status_code=403, detail="Reset is disabled in production")
     if factory_id != db.DEMO_FACTORY_ID:
         raise HTTPException(status_code=409, detail="no demo seed for this factory")
     return reset_to_seed(factory_id)
